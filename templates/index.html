@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Multi-Agent Story Generation Pipeline — AI-powered long-form narrative creation with memory and consistency">
+    <title>Story Teller — AI Story Generation</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖊️</text></svg>">
+</head>
+<body>
+    <div class="toast-container" id="toastContainer"></div>
+
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="app-logo">
+                <span class="app-logo-icon">🖊️</span>
+                <div>
+                    <h1>Story Teller</h1>
+                    <span>Multi-Agent Narrative Engine</span>
+                </div>
+            </div>
+            <div class="header-actions">
+                <select class="form-select" id="modelSelect" onchange="switchModel(this.value)" title="Local AI model" style="width:auto;font-size:0.8rem;padding:4px 8px">
+                    <option>Loading models...</option>
+                </select>
+                <button class="btn btn-sm" id="btnRefresh" onclick="loadProjects()" title="Refresh">🔄 Refresh</button>
+            </div>
+        </header>
+
+        <!-- Navigation -->
+        <nav class="nav-tabs" id="navTabs">
+            <button class="nav-tab active" data-view="dashboard" onclick="switchView('dashboard')">📚 Projects</button>
+            <button class="nav-tab" data-view="create" onclick="switchView('create')">✨ New Story</button>
+            <button class="nav-tab hidden" data-view="generate" onclick="switchView('generate')" id="tabGenerate">⚡ Generate</button>
+            <button class="nav-tab hidden" data-view="reader" onclick="switchView('reader')" id="tabReader">📖 Reader</button>
+            <button class="nav-tab hidden" data-view="logs" onclick="switchView('logs')" id="tabLogs">📋 Logs</button>
+            <button class="nav-tab hidden" data-view="state" onclick="switchView('state')" id="tabState">🧠 State</button>
+        </nav>
+
+        <!-- Dashboard View -->
+        <div class="view active" id="viewDashboard">
+            <div class="projects-grid" id="projectsGrid">
+                <div class="empty-state">
+                    <span class="icon">📚</span>
+                    <h3>No stories yet</h3>
+                    <p>Create your first story project to get started.</p>
+                    <button class="btn btn-primary" onclick="switchView('create')">✨ Create Story</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Create Project View -->
+        <div class="view" id="viewCreate">
+            <div class="create-form">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">✨</span> New Story Project</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Title</label>
+                        <input class="form-input" id="createTitle" placeholder="The Crimson Thread" required>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Genre</label>
+                        <select class="form-select" id="createGenre">
+                            <option value="dark fantasy">Dark Fantasy</option>
+                            <option value="romance">Romance</option>
+                            <option value="thriller">Thriller</option>
+                            <option value="sci-fi">Sci-Fi</option>
+                            <option value="horror">Horror</option>
+                            <option value="erotica">Erotica</option>
+                            <option value="urban fantasy">Urban Fantasy</option>
+                            <option value="mystery">Mystery</option>
+                            <option value="literary fiction">Literary Fiction</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Premise</label>
+                        <textarea class="form-textarea" id="createPremise" rows="3"
+                            placeholder="Describe the core idea of your story..."></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Setting</label>
+                        <input class="form-input" id="createSetting" placeholder="Victorian London, 1888">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Themes (comma-separated)</label>
+                        <input class="form-input" id="createThemes" placeholder="betrayal, redemption, power">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Characters</label>
+                        <div class="character-list" id="characterList"></div>
+                        <div class="flex gap-2">
+                            <input class="form-input" id="charName" placeholder="Name" style="flex:1">
+                            <input class="form-input" id="charDesc" placeholder="Description" style="flex:2">
+                            <input class="form-input" id="charTraits" placeholder="Traits (comma-sep)" style="flex:1.5">
+                            <button class="btn btn-sm" onclick="addCharacter()">+ Add</button>
+                        </div>
+                    </div>
+
+                    <div class="mt-4">
+                        <button class="btn btn-primary" onclick="createProject()" id="btnCreateProject">
+                            🚀 Create Project
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Generate View -->
+        <div class="view" id="viewGenerate">
+            <div class="gen-container">
+                <!-- Main Output -->
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title" id="genTitle"><span class="icon">✍️</span> Generation Output</span>
+                        <div class="flex gap-2">
+                            <select class="form-select" id="genPacing" style="width:auto">
+                                <option value="slow">🐌 Slow</option>
+                                <option value="moderate" selected>⚖️ Moderate</option>
+                                <option value="fast">⚡ Fast</option>
+                                <option value="climactic">🔥 Climactic</option>
+                            </select>
+                            <select class="form-select" id="genChapterCount" style="width:auto" title="Number of chapters to generate">
+                                <option value="1">1 Chapter</option>
+                                <option value="2">2 Chapters</option>
+                                <option value="3">3 Chapters</option>
+                                <option value="5">5 Chapters</option>
+                                <option value="10">10 Chapters</option>
+                            </select>
+                            <button class="btn btn-primary" onclick="startGeneration()" id="btnGenerate">
+                                ▶ Generate
+                            </button>
+                            <button class="btn btn-danger hidden" onclick="cancelGeneration()" id="btnCancel">
+                                ⏹ Cancel
+                            </button>
+                        </div>
+                    </div>
+                    <div class="gen-output" id="genOutput">
+                        <div class="empty-state">
+                            <span class="icon">✍️</span>
+                            <h3>Ready to generate</h3>
+                            <p>Click "Generate Chapter" to start the pipeline.</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Sidebar -->
+                <div class="gen-sidebar">
+                    <!-- Pipeline Monitor -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title"><span class="icon">⚙️</span> Pipeline</span>
+                        </div>
+                        <div id="pipelineStages">
+                            <div class="pipeline-stage idle" data-stage="retriever">
+                                <span class="stage-icon">🔍</span> Retriever
+                            </div>
+                            <div class="pipeline-stage idle" data-stage="architect">
+                                <span class="stage-icon">🏗️</span> Architect
+                            </div>
+                            <div class="pipeline-stage idle" data-stage="planner">
+                                <span class="stage-icon">📋</span> Scene Planner
+                            </div>
+                            <div class="pipeline-stage idle" data-stage="writer">
+                                <span class="stage-icon">✍️</span> Scene Writer
+                            </div>
+                            <div class="pipeline-stage idle" data-stage="consistency">
+                                <span class="stage-icon">🛡️</span> Consistency
+                            </div>
+                            <div class="pipeline-stage idle" data-stage="editor">
+                                <span class="stage-icon">✏️</span> Editor
+                            </div>
+                            <div class="pipeline-stage idle" data-stage="storage">
+                                <span class="stage-icon">💾</span> Storage
+                            </div>
+                        </div>
+                        <div class="scene-progress mt-2" id="sceneProgress"></div>
+                    </div>
+
+                    <!-- Stats -->
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title"><span class="icon">📊</span> Stats</span>
+                        </div>
+                        <div class="text-sm" id="genStats">
+                            <p>Words: <span id="statWords">0</span></p>
+                            <p>Scenes: <span id="statScenes">0/0</span></p>
+                            <p>Provider: <span id="statProvider">—</span></p>
+                            <p class="mt-2 text-dim" id="statStatus">Idle</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Reader View -->
+        <div class="view" id="viewReader">
+            <div class="reader-container">
+                <div class="card" style="padding:16px">
+                    <div class="card-title mb-4"><span class="icon">📖</span> Chapters</div>
+                    <div class="chapter-list" id="chapterList"></div>
+                </div>
+                <div class="card">
+                    <div class="reader-content" id="readerContent">
+                        <div class="empty-state">
+                            <span class="icon">📖</span>
+                            <h3>Select a chapter</h3>
+                            <p>Choose a chapter from the sidebar to read.</p>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- State Inspector View -->
+        <div class="view" id="viewState">
+            <div class="card">
+                <div class="card-header">
+                    <span class="card-title"><span class="icon">🧠</span> Story State Inspector</span>
+                    <button class="btn btn-sm" onclick="refreshState()">🔄 Refresh</button>
+                </div>
+                <pre class="state-json" id="stateJson">Loading...</pre>
+            </div>
+        </div>
+
+        <!-- Live Logs View -->
+        <div class="view" id="viewLogs">
+            <div class="card" style="height: calc(100vh - 200px)">
+                <div class="card-header">
+                    <span class="card-title"><span class="icon">📋</span> Live Pipeline Logs</span>
+                    <div class="flex gap-2">
+                        <label class="flex items-center gap-2 text-sm" style="cursor:pointer">
+                            <input type="checkbox" id="logAutoScroll" checked style="accent-color:var(--accent-primary)"> Auto-scroll
+                        </label>
+                        <button class="btn btn-sm" onclick="clearLogs()">🗑️ Clear</button>
+                    </div>
+                </div>
+                <div class="log-terminal" id="logTerminal">
+                    <div class="log-entry log-info">
+                        <span class="log-time">--:--:--.---</span>
+                        <span class="log-badge log-badge-info">SYS</span>
+                        <span class="log-msg">Waiting for generation to start...</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Status Bar -->
+    <div class="status-bar">
+        <div class="status-indicator">
+            <span class="status-dot" id="statusDot"></span>
+            <span id="statusText">Ready</span>
+        </div>
+        <div class="flex gap-4 text-sm">
+            <span id="activeProject">No project selected</span>
+        </div>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>

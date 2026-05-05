@@ -1,0 +1,9 @@
+openai>=1.0.0
+llama-cpp-python>=0.2.90
+faiss-cpu>=1.7.0
+sentence-transformers>=2.2.0
+numpy>=1.24.0
+flask>=3.0.0
+python-dotenv>=1.0.0
+rich>=13.0.0
+tiktoken>=0.5.0

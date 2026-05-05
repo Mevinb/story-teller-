@@ -1,0 +1,94 @@
+"""
+Central configuration for the multi-agent story generation pipeline.
+All tunable parameters live here.
+"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+# ─── Model Configuration ────────────────────────────────────────────
+PROJECT_ROOT = os.path.dirname(__file__)
+LLAMA_MODELS_DIR = os.path.abspath(
+    os.getenv("LLAMA_MODELS_DIR", os.path.join(PROJECT_ROOT, "models"))
+)
+LLAMA_MODEL_PATH = os.getenv(
+    "LLAMA_MODEL_PATH",
+    os.path.join(LLAMA_MODELS_DIR, "mistral-7b-instruct-v0.2.Q4_K_M.gguf"),
+)
+LLAMA_PROMPT_TEMPLATE = os.getenv("LLAMA_PROMPT_TEMPLATE", "mistral").lower()
+LLAMA_CPP_PARAMS = {
+    "n_gpu_layers": int(os.getenv("LLAMA_N_GPU_LAYERS", "20")),
+    "n_batch": int(os.getenv("LLAMA_N_BATCH", "512")),
+    "n_threads": int(os.getenv("LLAMA_N_THREADS", str(max(1, (os.cpu_count() or 8) // 2)))),
+    "f16_kv": os.getenv("LLAMA_F16_KV", "true").lower() in ("1", "true", "yes", "on"),
+}
+
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+USE_CLOUD_MODEL = os.getenv("USE_CLOUD_MODEL", "false").lower() in ("1", "true", "yes", "on")
+
+# ─── Generation Parameters ──────────────────────────────────────────
+LOCAL_MODEL_PARAMS = {
+    "num_ctx": int(os.getenv("LOCAL_NUM_CTX", "4096")),
+    "temperature": float(os.getenv("LOCAL_TEMPERATURE", "0.7")),
+    "top_p": float(os.getenv("LOCAL_TOP_P", "0.9")),
+    "max_tokens": int(os.getenv("LOCAL_MAX_TOKENS", "1024")),
+    "structured_max_tokens": int(os.getenv("LOCAL_STRUCTURED_MAX_TOKENS", "900")),
+}
+
+CLOUD_MODEL_PARAMS = {
+    "temperature": 0.8,
+    "top_p": 0.9,
+    "max_tokens": 2048,
+}
+
+# Per-agent determinism/creativity profile
+AGENT_TEMPERATURES = {
+    "planner": 0.2,      # architect + scene planner
+    "writer": 0.7,
+    "critic": 0.1,       # consistency engine
+    "editor": 0.2,
+}
+
+# ─── Scene / Chapter Defaults ───────────────────────────────────────
+SCENES_PER_CHAPTER_MIN = 2
+SCENES_PER_CHAPTER_MAX = 6
+WORDS_PER_SCENE_MIN = 400
+WORDS_PER_SCENE_MAX = 800
+
+# ─── Embedding / Retrieval ──────────────────────────────────────────
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+CHUNK_SIZE = 400          # tokens per chunk
+CHUNK_OVERLAP = 50        # token overlap between chunks
+TOP_K_RETRIEVAL = 4       # number of chunks to retrieve
+CONTEXT_TOKEN_BUDGET = 2048  # max tokens for assembled context
+
+# ─── Quality Thresholds ─────────────────────────────────────────────
+MIN_SCENE_WORDS = 400
+MAX_REPETITION_RATIO = 0.40   # n-gram overlap threshold
+MAX_CONSISTENCY_RETRIES = 2
+MAX_GENERATION_RETRIES = 3
+
+# ─── Pipeline Control ─────────────────────────────────────────────────
+MAX_SCENE_ITERATIONS = 5
+MAX_PIPELINE_STEPS = 300
+MAX_TOKEN_BUDGET = 24000
+
+# ─── Drift Prevention ───────────────────────────────────────────────
+REANCHOR_EVERY_N_CHAPTERS = 3
+
+# ─── Retry Configuration ────────────────────────────────────────────
+RETRY_BASE_DELAY = 1.0        # seconds
+RETRY_MAX_DELAY = 30.0        # seconds
+RETRY_BACKOFF_FACTOR = 2.0
+
+# ─── Storage ─────────────────────────────────────────────────────────
+PROJECTS_DIR = os.path.join(PROJECT_ROOT, "projects")
+
+# ─── Web UI ──────────────────────────────────────────────────────────
+FLASK_HOST = "127.0.0.1"
+FLASK_PORT = 5000
+FLASK_DEBUG = True
+SSE_QUEUE_MAXSIZE = 1000
