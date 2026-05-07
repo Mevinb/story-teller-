@@ -23,35 +23,6 @@ def _normalize_list(value) -> list:
     return []
 
 
-_EVENT_TOKEN_RE = re.compile(r"[a-z0-9']+")
-_EVENT_STOPWORDS = {
-    "then", "after", "before", "during", "while", "they", "them", "with",
-    "from", "into", "onto", "this", "that", "their", "there", "about",
-    "scene", "event", "chapter", "moment", "meets", "meet", "talks", "talk",
-}
-
-
-def _event_token_set(text: str) -> set[str]:
-    return {
-        token for token in _EVENT_TOKEN_RE.findall(str(text or "").lower())
-        if len(token) > 3 and token not in _EVENT_STOPWORDS
-    }
-
-
-def _event_matches_expected(candidate: str, expected: str) -> bool:
-    cand = re.sub(r"\s+", " ", str(candidate or "").strip().lower())
-    exp = re.sub(r"\s+", " ", str(expected or "").strip().lower())
-    if not cand or not exp:
-        return False
-    if cand in exp or exp in cand:
-        return True
-    cand_tokens = _event_token_set(cand)
-    exp_tokens = _event_token_set(exp)
-    if not cand_tokens or not exp_tokens:
-        return False
-    return len(cand_tokens & exp_tokens) >= 2
-
-
 def _coerce_scene_plan(
     parsed,
     chapter_plan: dict,
@@ -210,7 +181,6 @@ You may introduce a new named supporting character when the story needs one.
 
 Each scene should flow naturally into the next.
 Respect the STORY CONTEXT as hard continuity. If a scene location differs from where the previous scene/chapter ended, include a transition scene or make the transition explicit in that scene's summary/key_events.
-Each scene must show its required key events on-page. Do not skip straight to aftermath of a key event before depicting it.
 Scene types: "setup", "build_tension", "peak", "resolution", "transition"
 Do not assume "intimate" means explicit sex. Include graphic sexual acts only when key events explicitly require them.
 Include intimacy_level for each scene: none|romantic|sensual|explicit. Only use explicit when on-page sex acts are intended.
@@ -253,7 +223,6 @@ Context:
 
 Rules:
 - One scene per key event, no filler.
-- Show each scene's key event on-page; do not skip directly to aftermath.
 - Keep continuity and explicit transitions for location changes.
 - Do not put a character in messages/calls/private scenes before the chapter plan has introduced them on-page.
 - Scene types: setup, build_tension, peak, resolution, transition.
@@ -405,17 +374,6 @@ class ScenePlanner(AgentContract):
             scene["key_events"] = _normalize_list(scene.get("key_events"))
             if not scene["key_events"] and i < len(key_events):
                 scene["key_events"] = [key_events[i]]
-            if i < len(key_events):
-                expected_event = str(key_events[i]).strip()
-                if expected_event and not any(
-                    _event_matches_expected(event, expected_event)
-                    for event in scene["key_events"]
-                ):
-                    deduped = [
-                        event for event in scene["key_events"]
-                        if str(event).strip().lower() != expected_event.lower()
-                    ]
-                    scene["key_events"] = [expected_event] + deduped
             scene.setdefault("dialogue_notes", "")
             scene.setdefault("sensory_details", "")
             scene["intimacy_level"] = _normalize_intimacy_level(

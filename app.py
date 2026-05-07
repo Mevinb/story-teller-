@@ -9,6 +9,7 @@ import threading
 import queue
 import logging
 import re
+import time
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -302,7 +303,32 @@ def create_app():
             pipeline.load_project()
             info = pipeline.get_project_info()
             state = pipeline.get_state()
-            return jsonify({"info": info, "state": state})
+            
+            combine_data = None
+            project_dir = os.path.join(config.PROJECTS_DIR, name)
+            polished_path = os.path.join(project_dir, "combined_polished.md")
+            analysis_path = os.path.join(project_dir, "story_analysis.md")
+            original_path = os.path.join(project_dir, "combined_original.md")
+            
+            if os.path.exists(polished_path) and os.path.exists(analysis_path):
+                try:
+                    with open(polished_path, "r", encoding="utf-8") as f:
+                        polished_text = f.read()
+                    with open(analysis_path, "r", encoding="utf-8") as f:
+                        analysis_text = f.read()
+                    original_chars = os.path.getsize(original_path) if os.path.exists(original_path) else 0
+                    
+                    combine_data = {
+                        "analysis": analysis_text,
+                        "revised": polished_text,
+                        "original_chars": original_chars,
+                        "revised_chars": len(polished_text),
+                        "model": "Previously Combined"
+                    }
+                except Exception as e:
+                    logger.warning("Could not read combine data for %s: %s", name, e)
+
+            return jsonify({"info": info, "state": state, "combine_data": combine_data})
         except Exception as e:
             return jsonify({"error": str(e)}), 404
 
@@ -807,6 +833,19 @@ def create_app():
                 state = pipeline.get_state()
                 metadata = state.get("metadata", {})
                 chapters_dir = os.path.join(config.PROJECTS_DIR, name, "chapters")
+                output_dir = os.path.join(config.PROJECTS_DIR, name)
+
+                # Archive old files
+                try:
+                    timestamp = int(time.time())
+                    for fname in ["combined_original.md", "combined_polished.md", "story_analysis.md"]:
+                        path = os.path.join(output_dir, fname)
+                        if os.path.exists(path):
+                            base, ext = os.path.splitext(fname)
+                            archive_path = os.path.join(output_dir, f"{base}_{timestamp}{ext}")
+                            os.rename(path, archive_path)
+                except Exception as e:
+                    logger.warning("Could not archive old combine files: %s", e)
 
                 # Step 1: Combine chapters
                 _queue_event(eq, _normalize_event("combine_status", {
@@ -815,7 +854,6 @@ def create_app():
                 combined = combine_chapters(chapters_dir, metadata)
 
                 # Save original combined file
-                output_dir = os.path.join(config.PROJECTS_DIR, name)
                 original_path = os.path.join(output_dir, "combined_original.md")
                 with open(original_path, "w", encoding="utf-8") as f:
                     f.write(combined)
@@ -846,6 +884,7 @@ def create_app():
 
                 _queue_event(eq, _normalize_event("combine_done", {
                     "analysis": result["analysis"],
+                    "revised": result["revised"],
                     "model": result["model"],
                     "original_chars": len(combined),
                     "revised_chars": len(result["revised"]),
@@ -927,6 +966,31 @@ def create_app():
                 "Content-Disposition": f"attachment; filename={filename}",
             },
         )
+
+    @app.route("/api/project/<name>/combine/delete", methods=["POST"])
+    def delete_combined(name):
+        """Delete the combined story files (original, polished, analysis) including all old archived versions."""
+        name = normalize_project_name(name)
+        project_dir = os.path.join(config.PROJECTS_DIR, name)
+        
+        prefixes = [
+            "combined_original",
+            "combined_polished",
+            "story_analysis"
+        ]
+        
+        deleted = False
+        try:
+            if os.path.exists(project_dir):
+                for fname in os.listdir(project_dir):
+                    if any(fname.startswith(prefix) for prefix in prefixes) and fname.endswith(".md"):
+                        path = os.path.join(project_dir, fname)
+                        os.remove(path)
+                        deleted = True
+            
+            return jsonify({"status": "ok", "deleted": deleted})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
 
     # ─── API: Project Management ──────────────────────────────────
     @app.route("/api/project/<name>/delete", methods=["POST"])

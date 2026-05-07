@@ -90,36 +90,39 @@ def analyze_and_polish(
     _emit(f"Initializing Gemini client ({model_name})...")
     client = genai.Client(api_key=api_key)
 
-    prompt = f"""You are a developmental editor specializing in multi-chapter narratives.
+    prompt = f"""You are an elite developmental editor and narrative continuity expert specializing in multi-chapter stories.
 
-Analyze this story for:
+Your objective is to take the following collection of chapters and fuse them into a seamless, high-quality story. The primary issues you must fix are abrupt scene shifts and lack of persistent character context between chapters.
 
-1. **Character Consistency Issues**
-   - Does each character maintain consistent motivations and personality?
-   - Are there unexplained behavior shifts?
-   - Do physical descriptions remain consistent?
+Analyze and heavily revise the story with extreme focus on the following core areas:
 
-2. **Continuity Errors**
-   - Timeline inconsistencies
-   - Events that contradict earlier chapters
-   - Character whereabouts/relationships that don't align
-   - Emotional arcs that don't flow logically
+1. **Character Context & Continuity (CRITICAL)**
+   - Maintain deep context about each person across chapters. Do not let characters "reset" their emotional state, relationships, or physical descriptions between scenes.
+   - Weave in relevant past context where needed to remind the reader of characters' ongoing internal struggles, motivations, and evolving dynamics.
+   - Fix any unexplained behavior shifts. Characters must act consistently based on everything that happened to them previously.
 
-3. **Narrative Flow**
-   - Are transitions smooth between chapters?
-   - Do cliffhangers resolve appropriately?
-   - Is pacing consistent?
-   - Are there plot holes?
+2. **Scene Shifts & Transitions (CRITICAL)**
+   - Eliminate abrupt jumps in time or location. 
+   - When a scene shifts to another place or time, explicitly define the transition. Add necessary descriptive prose, bridging paragraphs, and environmental context so the reader feels the movement from one location to the next.
+   - Ensure the new location is painted vividly before characters begin interacting.
+
+3. **Narrative Flow & Polish**
+   - Ensure transitions between the chapters are perfectly smooth.
+   - Resolve any timeline inconsistencies, plot holes, or contradictions.
+   - Enhance the prose to be engaging, atmospheric, and highly immersive.
+
+4. **Explicit Content Preservation (CRITICAL)**
+   - You MUST keep ALL explicit content, adult themes, and mature scenes fully intact.
+   - Do NOT censor, tone down, fade-to-black, or reduce the explicitness of any scene under any circumstances.
+   - You may enhance the prose and flow of explicit scenes, but you must retain their full length, detail, and adult nature.
 
 Then provide:
-- A brief summary of issues found
-- A revised version of the story with fixes applied
-- Keep ALL explicit content intact
-- Maintain the narrative voice and tense
-- Keep the same chapter structure
-- Do NOT summarize or condense — output the FULL revised story
+- A brief summary of the major continuity issues and scene shifts you fixed.
+- A heavily revised, polished version of the story with all fixes and expanded transitions applied.
+- Maintain the narrative voice and tense.
+- Do NOT summarize or condense — you must output the FULL revised story, taking care to flesh out under-defined scenes rather than shrinking them.
 
-Format your response as:
+Format your response exactly as:
 ---ANALYSIS---
 [Your analysis here]
 

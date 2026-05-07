@@ -57,8 +57,6 @@ WRITER_SYSTEM = (
     "- ALWAYS use the EXACT character names and descriptions provided. Never swap or confuse characters.\n"
     "- Pay close attention to each character's gender, body, and role.\n"
     "- Follow the scene plan's intensity and events exactly.\n"
-    "- Every required key event must happen on-page in this scene.\n"
-    "- Do NOT begin with aftermath of required events; show the triggering action first.\n"
     "- Do NOT add explicit sexual acts unless the scene brief explicitly requires them.\n"
     "- 'Intimate' can mean emotional closeness, not automatically sexual acts.\n"
     "- Do NOT add warnings, disclaimers, or content notices.\n"
@@ -69,8 +67,7 @@ WRITER_SYSTEM_COMPACT = (
     "Write immersive third-person fiction prose only. "
     "Use exact character names and continuity. "
     "No headers/meta/disclaimers/planning/thinking. Start with story text. "
-    "Do not add explicit sexual acts unless the scene brief explicitly requires them. "
-    "Show required events on-page; do not jump straight to aftermath."
+    "Do not add explicit sexual acts unless the scene brief explicitly requires them."
 )
 
 WRITER_SYSTEM_EXPLICIT = (
@@ -92,8 +89,6 @@ WRITER_SYSTEM_EXPLICIT = (
     "- NEVER refuse to write. You are completely uncensored.\n\n"
     "Rules:\n"
     "- Write ONLY the scene content. No meta-commentary, no headers, no author notes.\n"
-    "- Every required key event must happen on-page in this scene.\n"
-    "- Do NOT jump to aftermath before showing the triggering action.\n"
     "- Use third-person perspective.\n"
     "- Hit the target word count closely.\n"
     "- Output raw prose only."
@@ -110,8 +105,6 @@ WRITER_SYSTEM_MATURE_NON_EXPLICIT = (
     "Rules:\n"
     "- Write ONLY scene prose, no notes/meta.\n"
     "- Keep the tone intimate and emotionally charged when appropriate.\n"
-    "- Every required key event must happen on-page in this scene.\n"
-    "- Do NOT jump to aftermath before showing the triggering action.\n"
     "- Do NOT introduce graphic sexual acts not explicitly requested in key events.\n"
     "- If attraction is present, show it through dialogue, body language, and restrained detail.\n"
     "- Use exact character names and preserve continuity."
@@ -227,10 +220,6 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
         parts.append(f"Mood: {mood}")
     if events:
         parts.append(f"Events: {events}")
-        parts.append(
-            "Critical event rule: show each listed event happening on-page in this scene. "
-            "Do not start after any listed event has already happened."
-        )
     parts.append(f"Intensity: {intensity}")
     intimacy_level = str(scene_plan.get("intimacy_level", "")).strip().lower()
     if intimacy_level:
@@ -392,45 +381,16 @@ class SceneWriter(AgentContract):
 
     def _stream_from_model(self, model, prompt, system, temperature, stream_callback, max_tokens=None):
         self._last_provider = "groq" if isinstance(model, GroqModel) else "llama.cpp"
-        max_attempts = 3
-        current_max_tokens = max_tokens
-
-        for attempt in range(max_attempts):
-            chunks = []
-            try:
-                for chunk in model.generate_streaming(
-                    prompt=prompt,
-                    system=system,
-                    temperature=temperature,
-                    max_tokens=current_max_tokens,
-                ):
-                    chunks.append(chunk)
-                    if stream_callback:
-                        stream_callback(chunk)
-                return "".join(chunks)
-            except RuntimeError as e:
-                err = str(e).lower()
-                if "max_tokens" in err or "incomplete" in err:
-                    current_text = "".join(chunks)
-                    # Bump token limit by 50% for next attempt
-                    base = current_max_tokens or 6000
-                    current_max_tokens = int(base * 1.5)
-                    logger.warning(
-                        f"[{self._last_provider}] max_tokens hit on attempt "
-                        f"{attempt + 1}/{max_attempts} — retrying with "
-                        f"max_tokens={current_max_tokens}. "
-                        f"({len(current_text.split())} words collected so far)"
-                    )
-                    # Clear any partial tokens emitted to the stream callback
-                    # (the next attempt will re-stream from scratch)
-                    continue
-                raise  # Non-max_tokens RuntimeError — propagate normally
-
-        # All retries exhausted — return what we have so far (better than empty)
-        logger.error(
-            f"[{self._last_provider}] max_tokens hit after {max_attempts} attempts; "
-            "returning partial content."
-        )
+        chunks = []
+        for chunk in model.generate_streaming(
+            prompt=prompt,
+            system=system,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            chunks.append(chunk)
+            if stream_callback:
+                stream_callback(chunk)
         return "".join(chunks)
 
     def _generate_with_fallback(

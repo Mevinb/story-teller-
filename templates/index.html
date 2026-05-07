@@ -355,6 +355,9 @@
                         <button class="btn btn-gemini" onclick="startCombine()" id="btnCombine">
                             <span class="gemini-icon">🔮</span> Combine & Polish
                         </button>
+                        <button class="btn btn-danger hidden" onclick="deleteCombineData()" id="btnDeleteCombine">
+                            🗑️ Delete Polished Version
+                        </button>
                     </div>
 
                     <!-- Progress -->
@@ -368,9 +371,18 @@
                 <div class="card hidden" id="combineAnalysisCard">
                     <div class="card-header">
                         <span class="card-title"><span class="icon">🔍</span> Continuity Analysis</span>
-                        <button class="btn btn-sm" onclick="toggleAnalysis()" id="btnToggleAnalysis">▼ Collapse</button>
+                        <button class="btn btn-sm" onclick="toggleCombineSection('combineAnalysis', 'btnToggleAnalysis')" id="btnToggleAnalysis">▼ Collapse</button>
                     </div>
                     <div class="combine-analysis" id="combineAnalysis"></div>
+                </div>
+
+                <!-- Polished Story Result -->
+                <div class="card hidden" id="combinePolishedCard">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">📖</span> Polished Story</span>
+                        <button class="btn btn-sm" onclick="toggleCombineSection('combinePolished', 'btnTogglePolished')" id="btnTogglePolished">▼ Collapse</button>
+                    </div>
+                    <div class="combine-analysis" id="combinePolished"></div>
                 </div>
 
                 <!-- Download Section -->

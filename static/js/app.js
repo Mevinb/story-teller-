@@ -191,6 +191,20 @@ async function selectProject(name) {
         const data = await res.json();
         document.getElementById('genTitle').innerHTML =
             `<span class="icon">✍️</span> ${escHtml(data.info.title)}`;
+            
+        // Restore Combine view state if data exists
+        if (data.combine_data) {
+            populateCombineUI(data.combine_data);
+        } else {
+            // Reset combine view
+            document.getElementById('combineAnalysisCard').classList.add('hidden');
+            document.getElementById('combinePolishedCard').classList.add('hidden');
+            document.getElementById('combineDownloadCard').classList.add('hidden');
+            document.getElementById('btnDeleteCombine').classList.add('hidden');
+            document.getElementById('btnCombine').disabled = false;
+            document.getElementById('btnCombine').innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
+        }
+
         switchView('generate');
     } catch (e) {
         showToast('Failed to load project', 'error');
@@ -1243,36 +1257,7 @@ function handleCombineSSE(event) {
             break;
 
         case 'combine_done': {
-            const analysisCard = document.getElementById('combineAnalysisCard');
-            const downloadCard = document.getElementById('combineDownloadCard');
-            const analysisEl = document.getElementById('combineAnalysis');
-            const statsEl = document.getElementById('combineStats');
-
-            // Show analysis
-            if (data.analysis) {
-                analysisEl.innerHTML = markdownToHtml(data.analysis);
-                analysisCard.classList.remove('hidden');
-            }
-
-            // Show download section
-            statsEl.innerHTML = `
-                <div class="combine-stats-grid">
-                    <div class="combine-stat">
-                        <span class="combine-stat-label">Original</span>
-                        <span class="combine-stat-value">${(data.original_chars || 0).toLocaleString()} chars</span>
-                    </div>
-                    <div class="combine-stat">
-                        <span class="combine-stat-label">Polished</span>
-                        <span class="combine-stat-value">${(data.revised_chars || 0).toLocaleString()} chars</span>
-                    </div>
-                    <div class="combine-stat">
-                        <span class="combine-stat-label">Model</span>
-                        <span class="combine-stat-value">${escHtml(data.model || 'unknown')}</span>
-                    </div>
-                </div>
-            `;
-            downloadCard.classList.remove('hidden');
-
+            populateCombineUI(data);
             stopCombine();
             showToast('Story combined and polished successfully!', 'success');
             break;
@@ -1307,15 +1292,94 @@ function downloadCombined(type) {
     showToast(`Downloading ${type} file...`, 'info');
 }
 
-function toggleAnalysis() {
-    const el = document.getElementById('combineAnalysis');
-    const btn = document.getElementById('btnToggleAnalysis');
+function populateCombineUI(data) {
+    const analysisCard = document.getElementById('combineAnalysisCard');
+    const polishedCard = document.getElementById('combinePolishedCard');
+    const downloadCard = document.getElementById('combineDownloadCard');
+    const analysisEl = document.getElementById('combineAnalysis');
+    const polishedEl = document.getElementById('combinePolished');
+    const statsEl = document.getElementById('combineStats');
+
+    if (data.analysis) {
+        analysisEl.innerHTML = markdownToHtml(data.analysis);
+        analysisCard.classList.remove('hidden');
+    }
+
+    if (data.revised) {
+        polishedEl.innerHTML = markdownToHtml(data.revised);
+        polishedCard.classList.remove('hidden');
+    }
+
+    statsEl.innerHTML = `
+        <div class="combine-stats-grid">
+            <div class="combine-stat">
+                <span class="combine-stat-label">Original</span>
+                <span class="combine-stat-value">${(data.original_chars || 0).toLocaleString()} chars</span>
+            </div>
+            <div class="combine-stat">
+                <span class="combine-stat-label">Polished</span>
+                <span class="combine-stat-value">${(data.revised_chars || 0).toLocaleString()} chars</span>
+            </div>
+            <div class="combine-stat">
+                <span class="combine-stat-label">Model</span>
+                <span class="combine-stat-value">${escHtml(data.model || 'unknown')}</span>
+            </div>
+        </div>
+    `;
+    downloadCard.classList.remove('hidden');
+    
+    // Change button text to indicate recombination is possible
+    const btn = document.getElementById('btnCombine');
+    if (btn) {
+        btn.innerHTML = '<span class="gemini-icon">🔮</span> Re-Combine & Polish';
+    }
+    const btnDel = document.getElementById('btnDeleteCombine');
+    if (btnDel) {
+        btnDel.classList.remove('hidden');
+    }
+}
+
+function toggleCombineSection(elId, btnId) {
+    const el = document.getElementById(elId);
+    const btn = document.getElementById(btnId);
+    if (!el || !btn) return;
+    
     if (el.style.display === 'none') {
         el.style.display = '';
         btn.textContent = '▼ Collapse';
     } else {
         el.style.display = 'none';
         btn.textContent = '▶ Expand';
+    }
+}
+
+async function deleteCombineData() {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    if (!confirm('Are you sure you want to delete the polished version and analysis? This cannot be undone.')) return;
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/delete`, { method: 'POST' });
+        const data = await res.json();
+        
+        if (res.ok && data.status === 'ok') {
+            showToast('Polished version deleted.', 'success');
+            
+            // Reset combine view
+            document.getElementById('combineAnalysisCard').classList.add('hidden');
+            document.getElementById('combinePolishedCard').classList.add('hidden');
+            document.getElementById('combineDownloadCard').classList.add('hidden');
+            document.getElementById('btnDeleteCombine').classList.add('hidden');
+            
+            const btn = document.getElementById('btnCombine');
+            if (btn) {
+                btn.disabled = false;
+                btn.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
+            }
+        } else {
+            showToast(data.error || 'Failed to delete polished version', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to delete polished version', 'error');
     }
 }
 
