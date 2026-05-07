@@ -11,6 +11,7 @@ Story Teller is a multi-agent story generation pipeline with both a web UI and a
 - Structured memory (JSON state) plus semantic retrieval (FAISS vector index).
 - Immutable state transitions with versioned state snapshots and change history.
 - Web UI with live generation updates (SSE), logs, reader, and state inspector.
+- Manual chapter mode in the Web UI (set chapter heading + scene briefs, then AI-enhance each scene brief before generation).
 - CLI for project creation, generation, status, and reading.
 - Project export, reset, and delete tools.
 
@@ -100,6 +101,12 @@ Read chapters:
 python main.py read <project_name> [chapter_number]
 ```
 
+Delete chapter N and everything after it (also syncs state, WIP, logs, vectors):
+
+```bash
+python main.py delete-chapters <project_name> <from_chapter> --yes
+```
+
 List projects:
 
 ```bash
@@ -112,7 +119,7 @@ Environment variables are loaded from .env via python-dotenv. Key options:
 
 - GROQ_API_KEY: enables Groq cloud model usage when set
 - USE_CLOUD_MODEL: set to true to prefer Groq (fallback to local on failure)
-- GROQ_MODEL: default llama-3.3-70b-versatile
+- GROQ_MODEL: default qwen/qwen3-32b
 - LLAMA_MODELS_DIR: directory scanned for `.gguf` files
 - LLAMA_MODEL_PATH: active `.gguf` model path
 - LLAMA_PROMPT_TEMPLATE: `mistral` or `llama3`
@@ -151,7 +158,9 @@ Projects are stored under the projects/ directory:
 - PUT /api/project/<name>/state: update state
 - GET /api/project/<name>/chapters: list chapters
 - GET /api/project/<name>/chapter/<num>: read a chapter
+- POST /api/project/<name>/chapters/delete: delete chapter N+ and sync state/WIP/memory
 - POST /api/project/<name>/generate: start generation
+- POST /api/project/<name>/generate/manual: start generation from manual chapter heading + scene briefs
 - GET /api/project/<name>/generate/stream: SSE stream for live updates
 - POST /api/project/<name>/generate/cancel: cancel generation
 - POST /api/project/<name>/delete: delete project

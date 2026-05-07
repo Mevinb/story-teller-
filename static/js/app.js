@@ -14,6 +14,28 @@ let totalScenes = 0;
 let streamSceneNodes = new Map();
 let plannedChapters = 1;
 let completedChapters = 0;
+const GROQ_MODEL_OPTION = '__groq_api__';
+
+// Manual interactive session state
+let manualSessionActive = false;
+let manualScenesCompleted = 0;
+let manualChapterNum = 0;
+let manualIsGeneratingScene = false;
+
+function isGroqProvider(provider) {
+    return String(provider || '').toLowerCase().includes('groq');
+}
+
+function providerBadge(provider) {
+    return isGroqProvider(provider) ? '☁️ Groq' : '💻 llama.cpp';
+}
+
+function modelOptionLabel(modelId, groqModelName) {
+    if (modelId === GROQ_MODEL_OPTION) {
+        return `☁️ Groq API (${groqModelName || 'default'})`;
+    }
+    return `💻 ${modelId}`;
+}
 
 // ─── Navigation ──────────────────────────────────────────────────
 function switchView(viewName) {
@@ -29,13 +51,90 @@ function switchView(viewName) {
     if (viewName === 'reader' && currentProject) loadChapters();
     if (viewName === 'state' && currentProject) refreshState();
     if (viewName === 'dashboard') loadProjects();
+    if (viewName === 'manual' && currentProject) {
+        // Fetch the current manual session status to restore UI state
+        fetch(`/api/project/${currentProject}/generate/manual/status`)
+            .then(res => res.json())
+            .then(data => {
+                if (data.active) {
+                    manualSessionActive = true;
+                    manualScenesCompleted = data.scenes_completed;
+                    document.getElementById('manualStartCard')?.classList.add('hidden');
+                    document.getElementById('manualSceneCard')?.classList.remove('hidden');
+                    document.getElementById('manualSessionTitle').innerHTML = `<span class="icon">✍️</span> Chapter ${data.chapter_num}: ${escHtml(data.chapter_title)}`;
+                    document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+                    document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
+                    if (data.completed_scenes) {
+                        renderManualScenes(data.completed_scenes);
+                    }
+                    if (manualScenesCompleted > 0) {
+                        document.getElementById('btnManualFinish').classList.remove('hidden');
+                    } else {
+                        document.getElementById('btnManualFinish').classList.add('hidden');
+                    }
+                } else {
+                    manualSessionActive = false;
+                    document.getElementById('manualStartCard')?.classList.remove('hidden');
+                    document.getElementById('manualSceneCard')?.classList.add('hidden');
+                }
+            })
+            .catch(() => showToast('Failed to sync manual session state', 'error'));
+    }
+}
+
+function renderManualScenes(scenes) {
+    const completedDiv = document.getElementById('manualCompletedScenes');
+    completedDiv.innerHTML = '';
+    if (scenes && scenes.length > 0) {
+        scenes.forEach((scene, idx) => {
+            // Handle both simple strings (from DB fallback) and dicts (from generate_manual_scene)
+            const sceneText = typeof scene === 'string' ? scene : scene.text;
+            const enhancedSummary = typeof scene === 'string' ? '' : (scene.enhanced_summary || '');
+            const words = typeof scene === 'string' ? '' : (scene.words || '');
+            
+            const sceneHtml = `
+                <div class="manual-scene-result" style="position:relative; margin-bottom:16px;padding:16px;background:var(--surface-2);border-radius:8px;border-left:3px solid var(--accent-primary)">
+                    <button class="btn btn-sm btn-danger" style="position:absolute;top:12px;right:12px;z-index:10;font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${idx})" title="Delete this scene">🗑️</button>
+                    <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:40px">Scene ${idx + 1}</div>
+                    ${enhancedSummary ? `<div class="text-dim text-sm" style="margin-bottom:6px">Enhanced: ${escHtml(enhancedSummary)}</div>` : ''}
+                    <div style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif;font-size:0.92rem;max-height:300px;overflow-y:auto">${escHtml(sceneText || '')}</div>
+                    ${words ? `<div class="text-dim text-sm" style="margin-top:8px">${words} words</div>` : ''}
+                </div>
+            `;
+            completedDiv.insertAdjacentHTML('beforeend', sceneHtml);
+        });
+    }
+    completedDiv.scrollTop = completedDiv.scrollHeight;
+}
+
+async function deleteManualScene(index) {
+    if (!confirm('Are you sure you want to delete this scene?')) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${index}`, { method: 'DELETE' });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to delete scene');
+        
+        manualScenesCompleted = data.scenes_completed;
+        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
+        renderManualScenes(data.completed_scenes);
+        
+        if (manualScenesCompleted === 0) {
+            document.getElementById('btnManualFinish').classList.add('hidden');
+        }
+        showToast('Scene deleted', 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
 }
 
 function showProjectTabs() {
     document.getElementById('tabGenerate').classList.remove('hidden');
+    document.getElementById('tabManual').classList.remove('hidden');
     document.getElementById('tabReader').classList.remove('hidden');
     document.getElementById('tabLogs').classList.remove('hidden');
     document.getElementById('tabState').classList.remove('hidden');
+    document.getElementById('tabCombine').classList.remove('hidden');
 }
 
 // ─── Projects ────────────────────────────────────────────────────
@@ -189,6 +288,255 @@ async function createProject() {
 }
 
 // ─── Generation ──────────────────────────────────────────────────
+
+// Old batch manual helpers (kept for backwards compat but unused in new flow)
+function syncManualSceneInputs() { /* no-op in interactive mode */ }
+
+// ─── Interactive Manual Generation ───────────────────────────────
+async function startManualChapter() {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    if (isGenerating || manualSessionActive) return;
+
+    const chapterTitle = document.getElementById('manualChapterTitle')?.value.trim() || '';
+    const pacing = document.getElementById('manualPacing')?.value || 'moderate';
+    const selectedModel = document.getElementById('modelSelect')?.value || '';
+
+    if (!chapterTitle) {
+        showToast('Enter a chapter heading', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('btnManualStart');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting...'; }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chapter_title: chapterTitle, pacing, model: selectedModel }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to start manual session');
+        }
+
+        // Session started successfully
+        manualSessionActive = true;
+        manualScenesCompleted = 0;
+        manualChapterNum = data.chapter_num || 0;
+        manualIsGeneratingScene = false;
+
+        // Connect SSE for live streaming
+        eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
+        eventSource.onmessage = handleSSE;
+        eventSource.onerror = () => {
+            // SSE errors in manual mode are recoverable — don't kill the session
+            if (eventSource) { eventSource.close(); eventSource = null; }
+        };
+
+        // Switch UI to scene input phase
+        document.getElementById('manualStartCard').classList.add('hidden');
+        document.getElementById('manualSceneCard').classList.remove('hidden');
+        document.getElementById('manualSessionTitle').innerHTML =
+            `<span class="icon">✍️</span> Chapter ${data.chapter_num}: ${escHtml(data.chapter_title)}`;
+        document.getElementById('manualSceneCounter').textContent = '0 scenes completed';
+        document.getElementById('manualCompletedScenes').innerHTML = '';
+        document.getElementById('manualSceneLabel').textContent = 'Scene 1 — Describe what should happen';
+        document.getElementById('manualSceneBrief').value = '';
+        document.getElementById('btnManualFinish').classList.add('hidden');
+        document.getElementById('btnManualCancel').classList.remove('hidden');
+
+        setStatus('online', 'Manual session active');
+        showToast(`Chapter ${data.chapter_num} session started!`, 'success');
+
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🚀 Start Chapter'; }
+    }
+}
+
+async function generateNextScene() {
+    if (!currentProject || !manualSessionActive || manualIsGeneratingScene) return;
+
+    const brief = document.getElementById('manualSceneBrief')?.value.trim() || '';
+    if (!brief) {
+        showToast('Enter a scene description', 'error');
+        return;
+    }
+
+    manualIsGeneratingScene = true;
+    const btn = document.getElementById('btnManualScene');
+    const stopBtn = document.getElementById('btnManualStopScene');
+    const finishBtn = document.getElementById('btnManualFinish');
+    const statusEl = document.getElementById('manualSceneStatus');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Generating...'; }
+    if (stopBtn) stopBtn.classList.remove('hidden');
+    if (finishBtn) finishBtn.classList.add('hidden');
+    if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Enhancing and writing scene...'; }
+
+    // Show streaming area
+    document.getElementById('manualStreamArea').classList.remove('hidden');
+    document.getElementById('manualStreamOutput').textContent = '';
+    streamSceneNodes = new Map();
+
+    // Reconnect SSE if needed
+    if (!eventSource) {
+        eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
+        eventSource.onmessage = handleSSE;
+        eventSource.onerror = () => {
+            if (eventSource) { eventSource.close(); eventSource = null; }
+        };
+    }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scene_brief: brief }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to start scene generation');
+        }
+        // Scene generation is now running in background — SSE will deliver tokens + completion
+    } catch (e) {
+        manualIsGeneratingScene = false;
+        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
+        if (statusEl) statusEl.classList.add('hidden');
+        if (stopBtn) stopBtn.classList.add('hidden');
+        showToast(e.message, 'error');
+    }
+}
+
+async function stopManualScene() {
+    if (!currentProject || !manualSessionActive || !manualIsGeneratingScene) return;
+
+    try {
+        await fetch(`/api/project/${currentProject}/generate/manual/cancel_scene`, {
+            method: 'POST',
+        });
+        showToast('Stopping scene generation...', 'info');
+        // onManualSceneDone will be called by SSE with status='cancelled'
+    } catch (e) {
+        showToast('Failed to stop scene', 'error');
+    }
+}
+
+function onManualSceneDone(data) {
+    manualIsGeneratingScene = false;
+    
+    const btn = document.getElementById('btnManualScene');
+    const stopBtn = document.getElementById('btnManualStopScene');
+    const finishBtn = document.getElementById('btnManualFinish');
+    const statusEl = document.getElementById('manualSceneStatus');
+
+    if (stopBtn) stopBtn.classList.add('hidden');
+
+    if (data.status === 'cancelled') {
+        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
+        if (statusEl) statusEl.classList.add('hidden');
+        document.getElementById('manualStreamArea').classList.add('hidden');
+        if (manualScenesCompleted > 0 && finishBtn) finishBtn.classList.remove('hidden');
+        showToast('Scene generation stopped.', 'info');
+        return;
+    }
+
+    manualScenesCompleted = data.scene_number || (manualScenesCompleted + 1);
+
+    // Add completed scene to the display
+    const completedDiv = document.getElementById('manualCompletedScenes');
+    const sceneHtml = `
+        <div class="manual-scene-result" style="position:relative; margin-bottom:16px;padding:16px;background:var(--surface-2);border-radius:8px;border-left:3px solid var(--accent-primary)">
+            <button class="btn btn-sm btn-danger" style="position:absolute;top:12px;right:12px;z-index:10;font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${manualScenesCompleted - 1})" title="Delete this scene">🗑️</button>
+            <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:40px">Scene ${manualScenesCompleted}</div>
+            <div class="text-dim text-sm" style="margin-bottom:6px">Enhanced: ${escHtml(data.enhanced_summary || '')}</div>
+            <div style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif;font-size:0.92rem;max-height:300px;overflow-y:auto">${escHtml(data.scene_text || '')}</div>
+            <div class="text-dim text-sm" style="margin-top:8px">${data.words || 0} words</div>
+        </div>
+    `;
+    completedDiv.insertAdjacentHTML('beforeend', sceneHtml);
+    completedDiv.scrollTop = completedDiv.scrollHeight;
+
+    // Reset input for next scene
+    document.getElementById('manualSceneBrief').value = '';
+    document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
+    document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+
+    // Show finish button after first scene
+    if (finishBtn) finishBtn.classList.remove('hidden');
+    document.getElementById('manualStreamArea').classList.add('hidden');
+
+    if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
+    if (statusEl) statusEl.classList.add('hidden');
+
+    showToast(`Scene ${manualScenesCompleted} complete! (${data.words || 0} words)`, 'success');
+}
+
+async function finishManualChapter() {
+    if (!currentProject || !manualSessionActive || manualIsGeneratingScene) return;
+
+    if (manualScenesCompleted < 1) {
+        showToast('Generate at least one scene first', 'error');
+        return;
+    }
+
+    if (!confirm(`Finalize this chapter with ${manualScenesCompleted} scene(s)?\nThis will save it permanently.`)) {
+        return;
+    }
+
+    const btn = document.getElementById('btnManualFinish');
+    const sceneBtn = document.getElementById('btnManualScene');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Finalizing...'; }
+    if (sceneBtn) sceneBtn.disabled = true;
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/finish`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to finalize chapter');
+        }
+        // The SSE stream will send the 'done' event which calls resetManualSession
+    } catch (e) {
+        showToast(e.message, 'error');
+        if (btn) { btn.disabled = false; btn.textContent = '✅ Finish Chapter'; }
+        if (sceneBtn) sceneBtn.disabled = false;
+    }
+}
+
+async function cancelManualSession() {
+    if (!currentProject) return;
+    if (!confirm('Cancel this manual session? Unsaved progress will be lost.')) return;
+
+    // Cancel any active generation
+    if (manualIsGeneratingScene) {
+        try {
+            await fetch(`/api/project/${currentProject}/generate/cancel`, { method: 'POST' });
+        } catch (e) { /* ignore */ }
+    }
+
+    resetManualSession();
+    showToast('Manual session cancelled', 'info');
+}
+
+function resetManualSession() {
+    manualSessionActive = false;
+    manualScenesCompleted = 0;
+    manualChapterNum = 0;
+    manualIsGeneratingScene = false;
+
+    if (eventSource) { eventSource.close(); eventSource = null; }
+
+    // Restore UI to start phase
+    document.getElementById('manualStartCard').classList.remove('hidden');
+    document.getElementById('manualSceneCard').classList.add('hidden');
+    document.getElementById('manualStreamArea')?.classList.add('hidden');
+    setStatus('online', 'Ready');
+}
+
 async function startGeneration() {
     if (!currentProject) { showToast('Select a project first', 'error'); return; }
     if (isGenerating) return;
@@ -238,6 +586,12 @@ async function startGeneration() {
     }
 }
 
+// Old batch manual generation (kept for API backwards compat)
+async function startManualGeneration() {
+    showToast('Please use the interactive scene-by-scene flow instead', 'info');
+    switchView('manual');
+}
+
 function handleSSE(event) {
     const msg = JSON.parse(event.data);
     const evt = msg.event || msg.type;
@@ -275,10 +629,23 @@ function handleSSE(event) {
             break;
 
         case 'token':
-            appendToken(data.scene || 'current', data.content || '');
+            if (manualSessionActive && manualIsGeneratingScene) {
+                // Stream tokens into the manual stream area
+                const streamOut = document.getElementById('manualStreamOutput');
+                if (streamOut && data.content) {
+                    streamOut.appendChild(document.createTextNode(data.content));
+                    const streamArea = document.getElementById('manualStreamArea');
+                    if (streamArea) {
+                        const scrollParent = streamArea.querySelector('.card') || streamArea;
+                        scrollParent.scrollTop = scrollParent.scrollHeight;
+                    }
+                }
+            } else {
+                appendToken(data.scene || 'current', data.content || '');
+            }
             if (data.provider) {
                 updateStats({
-                    provider: data.provider === 'groq' ? '☁️ Groq' : '💻 llama.cpp',
+                    provider: providerBadge(data.provider),
                 });
             }
             break;
@@ -287,7 +654,7 @@ function handleSSE(event) {
             totalWords += data.words;
             updateStats({
                 words: totalWords,
-                provider: data.provider === 'groq' ? '☁️ Groq' : '💻 llama.cpp',
+                provider: providerBadge(data.provider),
             });
             break;
 
@@ -337,7 +704,15 @@ function handleSSE(event) {
             stopGeneration();
             break;
 
+        case 'manual_scene_done':
+            onManualSceneDone(data);
+            break;
+
         case 'done':
+            if (manualSessionActive) {
+                resetManualSession();
+                showToast('Chapter finalized successfully!', 'success');
+            }
             stopGeneration();
             break;
 
@@ -371,7 +746,8 @@ function stopGeneration() {
     document.getElementById('btnGenerate').classList.remove('hidden');
     document.getElementById('btnCancel').classList.add('hidden');
     setStatus('online', 'Ready');
-    if (eventSource) { eventSource.close(); eventSource = null; }
+    // Only close SSE if not in manual session (manual session manages its own SSE)
+    if (!manualSessionActive && eventSource) { eventSource.close(); eventSource = null; }
 }
 
 // ─── Pipeline Stages ─────────────────────────────────────────────
@@ -441,17 +817,21 @@ function renderChapterList(chapters) {
         return;
     }
     list.innerHTML = chapters.map(ch => `
-        <div class="chapter-item" onclick="readChapter(${ch.number})">
+        <div class="chapter-item" onclick="readChapter(${ch.number}, this)">
             <div><span class="ch-num">Chapter ${ch.number}</span></div>
-            <div class="ch-words">${ch.words} words</div>
+            <div class="flex gap-2 items-center">
+                <div class="ch-words">${ch.words} words</div>
+                <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();resumeChapter(${ch.number})" title="Edit this chapter (warning: deletes later chapters)">✎ Edit</button>
+                <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteChaptersFrom(${ch.number})" title="Delete this chapter and all later chapters">Delete+</button>
+            </div>
         </div>
     `).join('');
 }
 
-async function readChapter(num) {
+async function readChapter(num, el = null) {
     // Highlight active
     document.querySelectorAll('.chapter-item').forEach(i => i.classList.remove('active'));
-    event.currentTarget?.classList.add('active');
+    if (el) el.classList.add('active');
 
     try {
         const res = await fetch(`/api/project/${currentProject}/chapter/${num}`);
@@ -461,6 +841,140 @@ async function readChapter(num) {
         }
     } catch (e) {
         showToast('Failed to load chapter', 'error');
+    }
+}
+
+async function resumeChapter(num) {
+    if (!confirm(`Are you sure you want to edit Chapter ${num}? WARNING: This will permanently DELETE all chapters after Chapter ${num}.`)) {
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/chapter/${num}/resume`, {
+            method: 'POST'
+        });
+        const data = await res.json();
+        
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to resume chapter');
+        }
+
+        // Switch to manual tab
+        switchView('manual');
+        
+        // Restore manual session state
+        manualSessionActive = true;
+        manualScenesCompleted = data.scenes_completed || data.completed_scenes.length;
+        
+        document.getElementById('manualStartCard').classList.add('hidden');
+        document.getElementById('manualSceneCard').classList.remove('hidden');
+        document.getElementById('manualSessionTitle').innerHTML = `<span class="icon">✍️</span> Editing Chapter ${num}: ${escHtml(data.chapter_title)}`;
+        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+        
+        // Render completed scenes
+        if (data.completed_scenes) {
+            renderManualScenes(data.completed_scenes);
+        }
+        
+        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen next`;
+        document.getElementById('manualSceneBrief').value = '';
+        
+        document.getElementById('btnManualFinish').classList.remove('hidden');
+        document.getElementById('btnManualScene').disabled = false;
+        document.getElementById('btnManualScene').textContent = '▶ Generate Scene';
+        
+        showToast(`Resumed Chapter ${num}`, 'success');
+        
+        // Reconnect SSE
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+        }
+        eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
+        eventSource.onmessage = handleSSE;
+        eventSource.onerror = () => {
+            if (eventSource) { eventSource.close(); eventSource = null; }
+        };
+        
+        loadProjects(); // refresh stats
+        loadChapters(); // refresh chapter list
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function deleteChaptersFromUi() {
+    const input = document.getElementById('deleteFromChapter');
+    const from = parseInt(input?.value, 10);
+    if (!from || from < 1) {
+        showToast('Enter a valid chapter number (>= 1)', 'error');
+        return;
+    }
+    await deleteChaptersFrom(from);
+}
+
+async function deleteChaptersFrom(fromChapter) {
+    if (!currentProject) {
+        showToast('Select a project first', 'error');
+        return;
+    }
+    if (!confirm(`Delete chapter ${fromChapter} and all later chapters?\n\nThis will also rewind state, WIP, and vector memory.`)) {
+        return;
+    }
+
+    const button = document.getElementById('btnDeleteChapters');
+    if (button) {
+        button.disabled = true;
+        button.textContent = '⏳ Deleting...';
+    }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/chapters/delete`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ from_chapter: fromChapter }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+            showToast(data.error || 'Delete failed', 'error');
+            return;
+        }
+
+        if (Array.isArray(data.deleted_chapters) && data.deleted_chapters.length) {
+            showToast(`Deleted chapters: ${data.deleted_chapters.join(', ')}`, 'success');
+        } else {
+            showToast(`No chapters found from ${fromChapter}`, 'info');
+        }
+        document.getElementById('readerContent').innerHTML = `<div class="empty-state">
+            <span class="icon">📖</span>
+            <h3>Select a chapter</h3>
+            <p>Choose a chapter from the sidebar to read.</p>
+        </div>`;
+        await reloadCurrentProjectInfo();
+        await loadChapters();
+        await refreshState();
+    } catch (e) {
+        showToast('Failed to delete chapters', 'error');
+    } finally {
+        if (button) {
+            button.disabled = false;
+            button.textContent = '🗑️ Delete from';
+        }
+    }
+}
+
+async function reloadCurrentProjectInfo() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}`);
+        const data = await res.json();
+        if (data?.info?.title) {
+            document.getElementById('genTitle').innerHTML =
+                `<span class="icon">✍️</span> ${escHtml(data.info.title)}`;
+        }
+        document.getElementById('activeProject').textContent = currentProject;
+    } catch (e) {
+        // no-op; caller handles user feedback
     }
 }
 
@@ -538,19 +1052,35 @@ function escHtml(str) {
 }
 
 function markdownToHtml(md) {
-    return md
-        .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-        .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-        .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+    return String(md || '')
+        .split(/\n{2,}/)
+        .map(block => renderMarkdownBlock(block.trim()))
+        .filter(Boolean)
+        .join('');
+}
+
+function renderMarkdownBlock(block) {
+    if (!block) return '';
+    if (/^\* \* \*$/.test(block)) {
+        return '<hr style="border:none;border-top:1px solid var(--border);margin:24px 0">';
+    }
+
+    const h3 = block.match(/^###\s+(.+)$/s);
+    if (h3) return `<h3>${inlineMarkdown(h3[1])}</h3>`;
+
+    const h2 = block.match(/^##\s+(.+)$/s);
+    if (h2) return `<h2>${inlineMarkdown(h2[1])}</h2>`;
+
+    const h1 = block.match(/^#\s+(.+)$/s);
+    if (h1) return `<h1>${inlineMarkdown(h1[1])}</h1>`;
+
+    return `<p>${inlineMarkdown(block).replace(/\n/g, '<br>')}</p>`;
+}
+
+function inlineMarkdown(text) {
+    return escHtml(text)
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\*(.+?)\*/g, '<em>$1</em>')
-        .replace(/^\* \* \*$/gm, '<hr style="border:none;border-top:1px solid var(--border);margin:24px 0">')
-        .replace(/\n\n/g, '</p><p>')
-        .replace(/^(?!<[h|p|hr])/gm, '')
-        .replace(/^(.+)$/gm, (match) => {
-            if (match.startsWith('<')) return match;
-            return `<p>${match}</p>`;
-        });
+        .replace(/\*(.+?)\*/g, '<em>$1</em>');
 }
 
 function syntaxHighlightJson(json) {
@@ -655,6 +1185,140 @@ function exportStory(name) {
     showToast('Exporting story...', 'info');
 }
 
+// ─── Combine & Polish (Gemini) ───────────────────────────────────
+let combineEventSource = null;
+let isCombining = false;
+
+async function startCombine() {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    if (isCombining) { showToast('Combine already in progress', 'info'); return; }
+
+    isCombining = true;
+    const btn = document.getElementById('btnCombine');
+    const progress = document.getElementById('combineProgress');
+    const analysisCard = document.getElementById('combineAnalysisCard');
+    const downloadCard = document.getElementById('combineDownloadCard');
+
+    btn.disabled = true;
+    btn.innerHTML = '<span class="gemini-icon">⏳</span> Processing...';
+    progress.classList.remove('hidden');
+    analysisCard.classList.add('hidden');
+    downloadCard.classList.add('hidden');
+    document.getElementById('combineStatusText').textContent = 'Starting combine pipeline...';
+    setStatus('working', 'Combining with Gemini...');
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+        });
+
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            throw new Error(data.error || 'Failed to start combine');
+        }
+
+        // Connect SSE
+        combineEventSource = new EventSource(`/api/project/${currentProject}/combine/stream`);
+        combineEventSource.onmessage = handleCombineSSE;
+        combineEventSource.onerror = () => {
+            stopCombine();
+            showToast('Connection lost during combine', 'error');
+        };
+    } catch (e) {
+        stopCombine();
+        showToast(e.message, 'error');
+    }
+}
+
+function handleCombineSSE(event) {
+    const msg = JSON.parse(event.data);
+    const evt = msg.event || msg.type;
+    const data = msg.data ?? msg.payload ?? {};
+
+    switch (evt) {
+        case 'combine_status':
+            document.getElementById('combineStatusText').textContent =
+                (typeof data === 'string') ? data : (data.step || 'Processing...');
+            break;
+
+        case 'combine_done': {
+            const analysisCard = document.getElementById('combineAnalysisCard');
+            const downloadCard = document.getElementById('combineDownloadCard');
+            const analysisEl = document.getElementById('combineAnalysis');
+            const statsEl = document.getElementById('combineStats');
+
+            // Show analysis
+            if (data.analysis) {
+                analysisEl.innerHTML = markdownToHtml(data.analysis);
+                analysisCard.classList.remove('hidden');
+            }
+
+            // Show download section
+            statsEl.innerHTML = `
+                <div class="combine-stats-grid">
+                    <div class="combine-stat">
+                        <span class="combine-stat-label">Original</span>
+                        <span class="combine-stat-value">${(data.original_chars || 0).toLocaleString()} chars</span>
+                    </div>
+                    <div class="combine-stat">
+                        <span class="combine-stat-label">Polished</span>
+                        <span class="combine-stat-value">${(data.revised_chars || 0).toLocaleString()} chars</span>
+                    </div>
+                    <div class="combine-stat">
+                        <span class="combine-stat-label">Model</span>
+                        <span class="combine-stat-value">${escHtml(data.model || 'unknown')}</span>
+                    </div>
+                </div>
+            `;
+            downloadCard.classList.remove('hidden');
+
+            stopCombine();
+            showToast('Story combined and polished successfully!', 'success');
+            break;
+        }
+
+        case 'combine_error':
+            stopCombine();
+            showToast(data.error || 'Combine failed', 'error');
+            break;
+
+        case 'heartbeat':
+            break;
+    }
+}
+
+function stopCombine() {
+    isCombining = false;
+    const btn = document.getElementById('btnCombine');
+    const progress = document.getElementById('combineProgress');
+    if (btn) {
+        btn.disabled = false;
+        btn.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
+    }
+    if (progress) progress.classList.add('hidden');
+    setStatus('online', 'Ready');
+    if (combineEventSource) { combineEventSource.close(); combineEventSource = null; }
+}
+
+function downloadCombined(type) {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    window.open(`/api/project/${currentProject}/combine/download/${type}`, '_blank');
+    showToast(`Downloading ${type} file...`, 'info');
+}
+
+function toggleAnalysis() {
+    const el = document.getElementById('combineAnalysis');
+    const btn = document.getElementById('btnToggleAnalysis');
+    if (el.style.display === 'none') {
+        el.style.display = '';
+        btn.textContent = '▼ Collapse';
+    } else {
+        el.style.display = 'none';
+        btn.textContent = '▶ Expand';
+    }
+}
+
 // ─── Keyboard Shortcuts ──────────────────────────────────────────
 document.addEventListener('keydown', (e) => {
     // Enter in character inputs → add character
@@ -671,11 +1335,11 @@ async function loadModels() {
         const res = await fetch('/api/models');
         const data = await res.json();
         if (!data.models.length) {
-            select.innerHTML = '<option value="">No GGUF models found</option>';
+            select.innerHTML = '<option value="">No models available</option>';
             return;
         }
         select.innerHTML = data.models.map(m =>
-            `<option value="${escHtml(m)}" ${m === data.active ? 'selected' : ''}>${escHtml(m)}</option>`
+            `<option value="${escHtml(m)}" ${m === data.active ? 'selected' : ''}>${escHtml(modelOptionLabel(m, data.groq_model))}</option>`
         ).join('');
     } catch (e) {
         select.innerHTML = '<option>Error loading models</option>';
@@ -691,7 +1355,11 @@ async function switchModel(model) {
         });
         const data = await res.json();
         if (data.status === 'ok') {
-            showToast(`Switched to ${data.active || model}`, 'success');
+            if ((data.active || model) === GROQ_MODEL_OPTION) {
+                showToast(`Switched to Groq API (${data.groq_model || 'default'})`, 'success');
+            } else {
+                showToast(`Switched to ${data.active || model}`, 'success');
+            }
         } else {
             showToast(data.error || 'Switch failed', 'error');
             loadModels();

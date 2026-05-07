@@ -3,10 +3,10 @@ Story Architect — High-level narrative planner.
 Defines plot direction, character arcs, and constraints for each chapter.
 Runs on the local llama.cpp model for low-cost planning.
 """
-import json
+
 import logging
 import re
-from typing import Optional
+
 
 from models.base import LLMInterface
 from memory.state_manager import StateManager
@@ -27,6 +27,30 @@ def _dedupe_names(names) -> list:
             seen.add(key)
             result.append(name)
     return result
+
+
+def _canonical_name_key(name: str) -> str:
+    base = re.sub(r"\([^)]*\)", "", str(name or "")).strip().lower()
+    return re.sub(r"[^a-z0-9]+", "", base)
+
+
+def _normalize_character_arcs(arcs: dict, exact_names: list, defaults: dict) -> dict:
+    if not isinstance(arcs, dict):
+        return defaults
+
+    alias_map = {}
+    for exact in exact_names:
+        alias_map[str(exact).lower()] = exact
+        alias_map[_canonical_name_key(exact)] = exact
+
+    normalized = {}
+    for name, arc in arcs.items():
+        exact = alias_map.get(str(name).lower()) or alias_map.get(_canonical_name_key(name))
+        chosen = exact or str(name).strip()
+        if chosen:
+            normalized[chosen] = str(arc).strip() or defaults.get(chosen, "")
+
+    return normalized or defaults
 
 
 def _clip(text: str, limit: int) -> str:
@@ -104,9 +128,11 @@ def _coerce_plan(
     if not key_events:
         key_events = fallback_events or [plot_direction]
 
-    character_arcs = plan.get("character_arcs")
-    if not isinstance(character_arcs, dict) or not character_arcs:
-        character_arcs = default_arcs
+    character_arcs = _normalize_character_arcs(
+        plan.get("character_arcs"),
+        character_names,
+        default_arcs,
+    )
 
     constraints = _normalize_list(plan.get("constraints"))
     unresolved = _normalize_list(plan.get("unresolved_threads_to_address"))
@@ -149,13 +175,18 @@ All content types are permitted. Do not self-censor or add disclaimers.
 
 ALWAYS respond with ONLY valid JSON. No extra text."""
 
+ARCHITECT_SYSTEM_COMPACT = (
+    "You are a story architect. Plan chapter beats only (no prose). "
+    "Keep continuity and use exact character names. Output JSON only."
+)
+
 # ─── Chapter 1: Start the story from the beginning of the premise ──
 PLAN_CHAPTER_SEED = """Plan Chapter 1 for the story.
 
 === FULL STORY PREMISE ===
 {premise}
 
-=== CHARACTERS (USE THESE EXACT NAMES) ===
+=== MAIN CAST / KNOWN CHARACTERS ===
 {character_names}
 
 === STORY CONTEXT ===
@@ -169,7 +200,10 @@ Do NOT skip ahead to later events. Build the foundation first.
 Rules:
 - Start from the VERY BEGINNING of the premise (introductions, setup, first encounters)
 - Do NOT jump to climactic or explicit events — those come in later chapters
-- Use the EXACT character names listed above
+- The listed characters are the main cast/known characters; use exact names when they appear
+- Do NOT force every listed character into every scene or chapter beat
+- Keep the protagonist or active main character involved in the chapter
+- You may introduce a new named supporting character if the story needs one
 - Establish characters, relationships, and setting
 - Pacing: {pacing}
 
@@ -189,6 +223,24 @@ Respond with this exact JSON structure:
     "new_threads_to_introduce": ["Setup threads for future chapters"]
 }}"""
 
+PLAN_CHAPTER_SEED_COMPACT = """Plan chapter 1.
+
+Premise:
+{premise}
+
+Characters:
+{character_names}
+
+Context:
+{context}
+
+Rules:
+- Cover only the first premise steps; do not skip ahead.
+- Keep continuity and pacing: {pacing}.
+- Use exact character names.
+
+Return JSON fields: chapter_number, chapter_title, plot_direction, character_arcs, key_events, constraints, tone, estimated_scenes, unresolved_threads_to_address, new_threads_to_introduce."""
+
 # ─── Chapter 2+: AI continues the story autonomously ──────────────
 PLAN_CHAPTER_CONTINUE = """Plan Chapter {chapter_num} for the story.
 
@@ -198,7 +250,7 @@ PLAN_CHAPTER_CONTINUE = """Plan Chapter {chapter_num} for the story.
 === WHAT HAS HAPPENED SO FAR ===
 {chapter_summaries}
 
-=== CHARACTERS ===
+=== MAIN CAST / KNOWN CHARACTERS ===
 {character_names}
 
 === UNRESOLVED THREADS ===
@@ -218,7 +270,13 @@ Rules:
 - Plan this chapter to cover the NEXT 1-2 steps from the premise
 - Do NOT repeat any events from previous chapters
 - Do NOT skip ahead — follow the premise's order
-- Use the EXACT character names listed above
+- Treat the LAST WRITTEN ENDING in story context, if present, as hard continuity.
+- Do NOT assume an event happened off-page just because it appears later in the premise.
+- If the next premise step requires a location change, include that transition as a key event.
+- The listed characters are the main cast/known characters; use exact names when they appear
+- Do NOT force every listed character into every scene or chapter beat
+- Keep the protagonist or active main character involved in the chapter
+- You may introduce a new named supporting character if the story needs one
 - If the premise steps are exhausted, continue the story naturally with consequences and escalation
 - Pacing: {pacing}
 
@@ -237,6 +295,33 @@ Respond with this exact JSON structure:
     "unresolved_threads_to_address": ["Thread to resolve or advance"],
     "new_threads_to_introduce": ["New plot thread or complication"]
 }}"""
+
+PLAN_CHAPTER_CONTINUE_COMPACT = """Plan chapter {chapter_num}.
+
+Premise:
+{premise}
+
+Covered so far:
+{chapter_summaries}
+
+Characters:
+{character_names}
+
+Unresolved threads:
+{unresolved_threads}
+
+Context:
+{context}
+
+Rules:
+- Continue from next uncovered premise steps in order.
+- No repetition of prior chapter events.
+- Keep continuity with latest ending.
+- Use only characters already introduced on-page unless this chapter explicitly introduces/meets them first.
+- Do not let characters text/chat/call/flirt/coordinate before they have met or been introduced.
+- Pacing: {pacing}.
+
+Return JSON fields: chapter_number, chapter_title, plot_direction, character_arcs, key_events, constraints, tone, estimated_scenes, unresolved_threads_to_address, new_threads_to_introduce."""
 
 REANCHOR_PROMPT = """Review the story so far and create a comprehensive summary
 for narrative re-anchoring.
@@ -267,6 +352,16 @@ Respond with this JSON structure:
     "story_trajectory": "Where the story is heading next"
 }}"""
 
+REANCHOR_PROMPT_COMPACT = """Re-anchor continuity.
+
+State:
+{state_json}
+
+Chapter summaries:
+{summaries}
+
+Return JSON fields: narrative_summary, character_updates, active_threads, resolved_threads, story_trajectory."""
+
 
 class StoryArchitect(AgentContract):
     """
@@ -278,6 +373,10 @@ class StoryArchitect(AgentContract):
         self.name = "planner"
         self.model = model
         self.state = state_manager
+        self._compact_mode = False
+
+    def set_compact_mode(self, enabled: bool):
+        self._compact_mode = bool(enabled)
 
     def run(self, state: dict) -> dict:
         plan = self.plan_chapter(
@@ -318,13 +417,16 @@ class StoryArchitect(AgentContract):
         premise = meta.get("premise", "No premise provided")
         character_names = _dedupe_names(self.state.get_characters().keys())
         char_names = ", ".join(character_names) or "No characters defined"
+        prompt_context = _clip(context, 1400) if self._compact_mode else context
+        prompt_premise = _clip(premise, 1300) if self._compact_mode else premise
 
         if chapter_num <= 1:
             # ─── Seed Mode: follow premise exactly ────────────
-            prompt = PLAN_CHAPTER_SEED.format(
-                premise=premise,
+            template = PLAN_CHAPTER_SEED_COMPACT if self._compact_mode else PLAN_CHAPTER_SEED
+            prompt = template.format(
+                premise=prompt_premise,
                 character_names=char_names,
-                context=context,
+                context=prompt_context,
                 pacing=pacing,
                 scene_count=scene_count,
             )
@@ -332,20 +434,24 @@ class StoryArchitect(AgentContract):
             # ─── Continuation Mode: AI advances the story ─────
             plot = self.state.get_plot()
             summaries = plot.get("chapter_summaries", [])
+            summary_limit = 180 if self._compact_mode else 450
+            max_summaries = 4 if self._compact_mode else len(summaries)
             summary_text = "\n".join(
-                f"Chapter {s['chapter']}: {_clip(s['summary'], 450)}"
-                for s in summaries
+                f"Chapter {s['chapter']}: {_clip(s['summary'], summary_limit)}"
+                for s in summaries[-max_summaries:]
             ) or "No previous chapters yet."
             threads = plot.get("unresolved_threads", [])
-            threads_text = ", ".join(dict.fromkeys(threads[:8])) if threads else "None yet."
+            max_threads = 4 if self._compact_mode else 8
+            threads_text = ", ".join(dict.fromkeys(threads[:max_threads])) if threads else "None yet."
 
-            prompt = PLAN_CHAPTER_CONTINUE.format(
+            template = PLAN_CHAPTER_CONTINUE_COMPACT if self._compact_mode else PLAN_CHAPTER_CONTINUE
+            prompt = template.format(
                 chapter_num=chapter_num,
-                premise=premise,
+                premise=prompt_premise,
                 chapter_summaries=summary_text,
                 character_names=char_names,
                 unresolved_threads=threads_text,
-                context=context,
+                context=prompt_context,
                 pacing=pacing,
                 scene_count=scene_count,
             )
@@ -372,9 +478,10 @@ class StoryArchitect(AgentContract):
 
         response = self.model.generate_with_retry(
             prompt=prompt,
-            system=ARCHITECT_SYSTEM,
+            system=ARCHITECT_SYSTEM_COMPACT if self._compact_mode else ARCHITECT_SYSTEM,
             schema=schema,
             temperature=config.AGENT_TEMPERATURES["planner"],
+            max_tokens=1200 if self._compact_mode else None,
         )
 
         plan = response.as_json()
@@ -407,13 +514,15 @@ class StoryArchitect(AgentContract):
             logger.info("No chapters to re-anchor from.")
             return {}
 
+        max_reanchor_summaries = 6 if self._compact_mode else len(summaries)
         summaries_text = "\n".join(
-            f"Chapter {s['chapter']}: {s['summary']}"
-            for s in summaries
+            f"Chapter {s['chapter']}: {_clip(s['summary'], 220 if self._compact_mode else 600)}"
+            for s in summaries[-max_reanchor_summaries:]
         )
 
-        prompt = REANCHOR_PROMPT.format(
-            state_json=self.state.to_json(),
+        template = REANCHOR_PROMPT_COMPACT if self._compact_mode else REANCHOR_PROMPT
+        prompt = template.format(
+            state_json=_clip(self.state.to_json(), 3800) if self._compact_mode else self.state.to_json(),
             summaries=summaries_text,
         )
 
@@ -431,9 +540,10 @@ class StoryArchitect(AgentContract):
 
         response = self.model.generate_with_retry(
             prompt=prompt,
-            system=ARCHITECT_SYSTEM,
+            system=ARCHITECT_SYSTEM_COMPACT if self._compact_mode else ARCHITECT_SYSTEM,
             schema=schema,
             temperature=config.AGENT_TEMPERATURES["planner"],
+            max_tokens=1200 if self._compact_mode else None,
         )
 
         result = response.as_json()
@@ -450,8 +560,15 @@ class StoryArchitect(AgentContract):
 
         # Apply character updates
         if "character_updates" in result:
-            for name, updates in result["character_updates"].items():
-                self.state.update_character(name, updates)
+            char_updates = result.get("character_updates")
+            if isinstance(char_updates, dict):
+                for name, updates in char_updates.items():
+                    self.state.update_character(name, updates)
+            else:
+                logger.warning(
+                    "Re-anchoring produced invalid character_updates type: %s",
+                    type(char_updates).__name__,
+                )
 
         # Update thread tracking
         if "resolved_threads" in result:

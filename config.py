@@ -25,9 +25,12 @@ LLAMA_CPP_PARAMS = {
 }
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 USE_CLOUD_MODEL = os.getenv("USE_CLOUD_MODEL", "false").lower() in ("1", "true", "yes", "on")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
 # ─── Generation Parameters ──────────────────────────────────────────
 LOCAL_MODEL_PARAMS = {
@@ -41,7 +44,7 @@ LOCAL_MODEL_PARAMS = {
 CLOUD_MODEL_PARAMS = {
     "temperature": 0.8,
     "top_p": 0.9,
-    "max_tokens": 2048,
+    "max_tokens": 6000,
 }
 
 # Per-agent determinism/creativity profile
@@ -67,7 +70,7 @@ CONTEXT_TOKEN_BUDGET = 2048  # max tokens for assembled context
 
 # ─── Quality Thresholds ─────────────────────────────────────────────
 MIN_SCENE_WORDS = 400
-MAX_REPETITION_RATIO = 0.40   # n-gram overlap threshold
+MAX_REPETITION_RATIO = 0.12   # n-gram overlap threshold
 MAX_CONSISTENCY_RETRIES = 2
 MAX_GENERATION_RETRIES = 3
 

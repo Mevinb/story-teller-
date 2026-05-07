@@ -31,9 +31,16 @@ CONSISTENCY_SYSTEM = (
     "ALWAYS respond with ONLY valid JSON."
 )
 
+CONSISTENCY_SYSTEM_COMPACT = (
+    "You are a strict continuity validator. Compare scene vs plan/state and report only factual contradictions. "
+    "Do not flag style choices. Mutable emotional/relationship shifts are valid if shown in-scene. "
+    "Output JSON only."
+)
+
 VALIDATE_PROMPT = (
     "Validate this scene against the established story state.\n\n"
     "=== GENERATED SCENE TEXT ===\n{scene_text}\n\n"
+    "=== REQUIRED SCENE PLAN ===\n{scene_plan}\n\n"
     "=== ESTABLISHED STATE ===\n{state_context}\n\n"
     "=== INSTRUCTIONS ===\n"
     "Check for:\n"
@@ -43,6 +50,10 @@ VALIDATE_PROMPT = (
     "4. Timeline conflicts (events out of order)\n"
     "5. Missing or contradicted facts\n"
     "6. Character evolution and personality/emotion shifts that are justified in-scene\n\n"
+    "The scene plan is the intended next beat. The established state is the continuity before the scene.\n"
+    "If the scene plan requires a new location or situation, accept it only when the generated scene shows\n"
+    "a plausible transition from the established state. Flag the scene if it ignores the required plan.\n"
+    "If required key events are missing on-page (the text jumps to aftermath instead), mark that as a blocking logic_error.\n\n"
     "When a character changes emotional tone, personality expression, or sexual status due to events\n"
     "shown in the scene, treat that as a VALID state transition and capture it in state_updates.\n"
     "Do not mark those as blocking contradictions.\n\n"
@@ -71,6 +82,17 @@ VALIDATE_PROMPT = (
     '}}'
 )
 
+VALIDATE_PROMPT_COMPACT = (
+    "Validate scene continuity.\n\n"
+    "SCENE:\n{scene_text}\n\n"
+    "PLAN:\n{scene_plan}\n\n"
+    "STATE:\n{state_context}\n\n"
+    "Check: character, relationship, location, timeline, logic contradictions. "
+    "Required key events must happen on-page; aftermath-only scenes for required events are blocking logic errors. "
+    "If emotional/personality/sexual status changes are shown in-scene, treat as state_updates (non-blocking). "
+    "Return JSON: is_consistent, issues[{{type,detail,severity,blocking,suggestion}}], state_updates."
+)
+
 
 class ConsistencyEngine(AgentContract):
     """
@@ -81,6 +103,7 @@ class ConsistencyEngine(AgentContract):
     def __init__(self, model: LLMInterface):
         self.name = "critic"
         self.model = model
+        self._compact_mode = False
         self._transition_markers = {
             "emotion", "aroused", "arousal", "predatory", "hungry", "possessive",
             "satisfied", "personality", "state shift", "state change", "character development",
@@ -92,11 +115,25 @@ class ConsistencyEngine(AgentContract):
             "wrong location", "different location", "identity mismatch", "name mismatch",
             "gender mismatch",
         }
+        self._state_hygiene_markers = {
+            "listed as both",
+            "described as both",
+            "in her traits",
+            "in his traits",
+            "in their traits",
+            "in the character state",
+            "in the established state",
+            "mutually exclusive",
+        }
+
+    def set_compact_mode(self, enabled: bool):
+        self._compact_mode = bool(enabled)
 
     def run(self, state: dict) -> dict:
         report = self.validate(
             scene_text=state["scene_text"],
             state_context=state["state_context"],
+            scene_plan=state.get("scene_plan", {}),
         )
         has_blocking = self.has_blocking_issues(report)
         confidence = 0.95 if report.get("is_consistent", True) else 0.4
@@ -106,7 +143,7 @@ class ConsistencyEngine(AgentContract):
             "next_action": "decision" if has_blocking else "editor",
         }
 
-    def validate(self, scene_text: str, state_context: str) -> dict:
+    def validate(self, scene_text: str, state_context: str, scene_plan: dict = None) -> dict:
         """
         Validate a scene against the current state.
 
@@ -117,9 +154,14 @@ class ConsistencyEngine(AgentContract):
         Returns:
             Validation report dict with is_consistent, issues, state_updates
         """
-        prompt = VALIDATE_PROMPT.format(
-            scene_text=scene_text[:3000],  # Limit to fit context window
-            state_context=state_context[:2000],
+        scene_text_limit = 1600 if self._compact_mode else 3000
+        scene_plan_limit = 650 if self._compact_mode else 1200
+        state_context_limit = 900 if self._compact_mode else 2000
+        template = VALIDATE_PROMPT_COMPACT if self._compact_mode else VALIDATE_PROMPT
+        prompt = template.format(
+            scene_text=scene_text[:scene_text_limit],
+            scene_plan=self._format_scene_plan(scene_plan or {})[:scene_plan_limit],
+            state_context=state_context[:state_context_limit],
         )
 
         schema = {
@@ -147,9 +189,10 @@ class ConsistencyEngine(AgentContract):
 
         response = self.model.generate_with_retry(
             prompt=prompt,
-            system=CONSISTENCY_SYSTEM,
+            system=CONSISTENCY_SYSTEM_COMPACT if self._compact_mode else CONSISTENCY_SYSTEM,
             schema=schema,
             temperature=config.AGENT_TEMPERATURES["critic"],
+            max_tokens=700 if self._compact_mode else None,
         )
 
         result = response.as_json()
@@ -245,6 +288,13 @@ class ConsistencyEngine(AgentContract):
                 normalized["severity"] = "medium"
             return normalized
 
+        if self._looks_like_state_hygiene_issue(normalized):
+            normalized["type"] = "state_hygiene"
+            normalized["blocking"] = False
+            if normalized["severity"] == "high":
+                normalized["severity"] = "medium"
+            return normalized
+
         hard_types = {
             "timeline_error",
             "location_error",
@@ -300,15 +350,25 @@ class ConsistencyEngine(AgentContract):
             return False
         if self._looks_like_state_transition(issue):
             return False
-
-        if isinstance(issue.get("blocking"), bool):
-            return issue["blocking"]
+        if self._looks_like_state_hygiene_issue(issue):
+            return False
 
         issue_type = str(issue.get("type", "")).lower()
         severity = str(issue.get("severity", "low")).lower()
+        detail_blob = " ".join(
+            [
+                str(issue.get("detail", "")).lower(),
+                str(issue.get("suggestion", "")).lower(),
+            ]
+        )
 
         if issue_type in {"timeline_error", "location_error", "relationship_error", "logic_error", "character_contradiction"}:
+            if any(marker in detail_blob for marker in self._hard_contradiction_markers):
+                return True
             return severity in {"high", "medium"}
+
+        if isinstance(issue.get("blocking"), bool):
+            return issue["blocking"]
 
         return severity == "high"
 
@@ -330,3 +390,35 @@ class ConsistencyEngine(AgentContract):
             return True
 
         return any(marker in detail_blob for marker in self._transition_markers)
+
+    def _looks_like_state_hygiene_issue(self, issue: dict) -> bool:
+        detail_blob = " ".join(
+            [
+                str(issue.get("detail", "")).lower(),
+                str(issue.get("suggestion", "")).lower(),
+            ]
+        )
+        if any(marker in detail_blob for marker in self._hard_contradiction_markers):
+            return False
+        if any(marker in detail_blob for marker in self._state_hygiene_markers):
+            return True
+
+        # Common stale-trait contradiction pattern in stored state.
+        has_virgin = "virgin" in detail_blob
+        has_experienced = "experienced" in detail_blob or "post-virginity" in detail_blob
+        return has_virgin and has_experienced and (
+            "listed as both" in detail_blob or "described as both" in detail_blob
+        )
+
+    @staticmethod
+    def _format_scene_plan(scene_plan: dict) -> str:
+        if not isinstance(scene_plan, dict) or not scene_plan:
+            return "No scene plan provided."
+        fields = [
+            ("Summary", scene_plan.get("summary", "")),
+            ("Required setting", scene_plan.get("location", "")),
+            ("Required characters", ", ".join(scene_plan.get("characters_present", []))),
+            ("Required events", "; ".join(scene_plan.get("key_events", []))),
+            ("Mood", scene_plan.get("mood", "")),
+        ]
+        return "\n".join(f"{label}: {value}" for label, value in fields if value)

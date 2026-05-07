@@ -5,7 +5,7 @@ Runs on local model for cheap refinement.
 """
 import logging
 import re
-from typing import Optional
+
 
 from models.base import LLMInterface
 from .contract import AgentContract
@@ -17,6 +17,11 @@ _REASONING_BLOCK_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _REASONING_TAG_RE = re.compile(r"</?(?:think|analysis|reasoning)>", flags=re.IGNORECASE)
+_META_OUTPUT_RE = re.compile(
+    r"(?im)^\s*(?:thinking process|analysis|step[- ]by[- ]step|analyze the request|"
+    r"professional fiction editor|task:|goals:|constraints:|output:|"
+    r"\d+\.\s+\*\*analyze|\*\s+\*\*role:)"
+)
 
 EDITOR_SYSTEM = (
     "You are a professional fiction editor. Your job is to polish prose:\n"
@@ -34,12 +39,20 @@ EDITOR_SYSTEM = (
     "- Output ONLY the polished prose text, nothing else"
 )
 
+EDITOR_SYSTEM_COMPACT = (
+    "You are a fiction copy editor. Fix grammar/flow/format only. "
+    "Do not change plot/events/meaning. Do not censor explicit content. "
+    "Output polished prose only."
+)
+
 EDIT_PROMPT = (
     "Polish the following fiction scene. Fix grammar, improve flow, "
     "and ensure proper formatting. Do NOT change the content or censor anything. "
     "Output only the polished text.\n\n"
     "=== SCENE TEXT ===\n{text}"
 )
+
+EDIT_PROMPT_COMPACT = "Copy-edit this scene. Keep meaning identical. Output only polished prose.\n\n{text}"
 
 
 class Editor(AgentContract):
@@ -52,6 +65,10 @@ class Editor(AgentContract):
         self.name = "editor"
         self.model = model
         self._genre = ""
+        self._compact_mode = False
+
+    def set_compact_mode(self, enabled: bool):
+        self._compact_mode = bool(enabled)
 
     def run(self, state: dict) -> dict:
         edited = self.edit(state["scene_text"])
@@ -85,22 +102,25 @@ class Editor(AgentContract):
         is_explicit = any(w in genre_lower for w in ["erotic", "adult", "smut", "nsfw"])
 
         if is_explicit:
+            base_system = EDITOR_SYSTEM_COMPACT if self._compact_mode else EDITOR_SYSTEM
             system = (
-                EDITOR_SYSTEM + "\n\n"
+                base_system + "\n\n"
                 "CRITICAL: This is explicit adult content. Do NOT censor, soften, or remove "
                 "any sexual content, explicit language, or graphic descriptions. "
                 "Your job is ONLY to fix grammar and improve flow."
             )
         else:
-            system = EDITOR_SYSTEM
+            system = EDITOR_SYSTEM_COMPACT if self._compact_mode else EDITOR_SYSTEM
 
-        prompt = EDIT_PROMPT.format(text=text)
+        prompt_template = EDIT_PROMPT_COMPACT if self._compact_mode else EDIT_PROMPT
+        prompt = prompt_template.format(text=text)
 
         try:
             response = self.model.generate_with_retry(
                 prompt=prompt,
                 system=system,
                 temperature=config.AGENT_TEMPERATURES["editor"],
+                max_tokens=900 if self._compact_mode else None,
                 max_retries=2,
             )
 
@@ -109,6 +129,10 @@ class Editor(AgentContract):
             # Sanity check — editor shouldn't drastically change length
             original_words = len(text.split())
             edited_words = len(edited.split())
+
+            if self._looks_like_meta_output(edited):
+                logger.warning("Editor returned meta/reasoning text. Keeping original scene.")
+                return text
 
             if edited_words < original_words * 0.5:
                 logger.warning(
@@ -141,3 +165,7 @@ class Editor(AgentContract):
         cleaned = _REASONING_TAG_RE.sub("", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
+
+    @staticmethod
+    def _looks_like_meta_output(text: str) -> bool:
+        return bool(_META_OUTPUT_RE.search(text or ""))

@@ -22,7 +22,7 @@
                 </div>
             </div>
             <div class="header-actions">
-                <select class="form-select" id="modelSelect" onchange="switchModel(this.value)" title="Local AI model" style="width:auto;font-size:0.8rem;padding:4px 8px">
+                <select class="form-select" id="modelSelect" onchange="switchModel(this.value)" title="AI backend/model" style="width:auto;font-size:0.8rem;padding:4px 8px">
                     <option>Loading models...</option>
                 </select>
                 <button class="btn btn-sm" id="btnRefresh" onclick="loadProjects()" title="Refresh">🔄 Refresh</button>
@@ -34,9 +34,11 @@
             <button class="nav-tab active" data-view="dashboard" onclick="switchView('dashboard')">📚 Projects</button>
             <button class="nav-tab" data-view="create" onclick="switchView('create')">✨ New Story</button>
             <button class="nav-tab hidden" data-view="generate" onclick="switchView('generate')" id="tabGenerate">⚡ Generate</button>
+            <button class="nav-tab hidden" data-view="manual" onclick="switchView('manual')" id="tabManual">🧩 Manual Page</button>
             <button class="nav-tab hidden" data-view="reader" onclick="switchView('reader')" id="tabReader">📖 Reader</button>
             <button class="nav-tab hidden" data-view="logs" onclick="switchView('logs')" id="tabLogs">📋 Logs</button>
             <button class="nav-tab hidden" data-view="state" onclick="switchView('state')" id="tabState">🧠 State</button>
+            <button class="nav-tab hidden" data-view="combine" onclick="switchView('combine')" id="tabCombine">📦 Combine</button>
         </nav>
 
         <!-- Dashboard View -->
@@ -202,11 +204,93 @@
             </div>
         </div>
 
+        <!-- Manual Plan View (Interactive Scene-by-Scene) -->
+        <div class="view" id="viewManual">
+            <div class="manual-container">
+                <!-- Phase 1: Start Chapter -->
+                <div class="card" id="manualStartCard">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">🧩</span> Interactive Manual Generation</span>
+                    </div>
+                    <p class="text-dim text-sm" style="margin-bottom:16px">
+                        Generate your chapter scene by scene. Enter a chapter title to start, then add scenes one at a time.
+                    </p>
+
+                    <div class="form-group">
+                        <label class="form-label">Chapter heading</label>
+                        <input class="form-input" id="manualChapterTitle" placeholder="Chapter title / heading">
+                    </div>
+
+                    <div class="flex gap-2 items-center">
+                        <select class="form-select" id="manualPacing" style="width:auto">
+                            <option value="slow">🐌 Slow</option>
+                            <option value="moderate" selected>⚖️ Moderate</option>
+                            <option value="fast">⚡ Fast</option>
+                            <option value="climactic">🔥 Climactic</option>
+                        </select>
+                        <button class="btn btn-primary" onclick="startManualChapter()" id="btnManualStart">
+                            🚀 Start Chapter
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Phase 2: Scene-by-Scene Generation (hidden until chapter started) -->
+                <div class="card hidden" id="manualSceneCard">
+                    <div class="card-header">
+                        <span class="card-title" id="manualSessionTitle"><span class="icon">✍️</span> Chapter in Progress</span>
+                        <div class="flex gap-2 items-center">
+                            <span class="text-dim text-sm" id="manualSceneCounter">Scene 0 completed</span>
+                            <button class="btn btn-sm btn-danger hidden" onclick="cancelManualSession()" id="btnManualCancel">✕ Cancel</button>
+                        </div>
+                    </div>
+
+                    <!-- Completed scenes display -->
+                    <div class="manual-completed-scenes" id="manualCompletedScenes"></div>
+
+                    <!-- Scene input area -->
+                    <div id="manualSceneInputArea">
+                        <div class="form-group" style="margin-bottom:8px">
+                            <label class="form-label" id="manualSceneLabel">Scene 1 — Describe what should happen</label>
+                            <textarea class="form-textarea" id="manualSceneBrief" rows="3"
+                                placeholder="Enter the theme/prompt for this scene... (e.g. 'The protagonist discovers a hidden letter in the attic')"></textarea>
+                        </div>
+                        <div class="flex gap-2 items-center">
+                            <button class="btn btn-primary" onclick="generateNextScene()" id="btnManualScene">
+                                ▶ Generate Scene
+                            </button>
+                            <button class="btn btn-danger hidden" onclick="stopManualScene()" id="btnManualStopScene">
+                                🛑 Stop Scene
+                            </button>
+                            <button class="btn hidden" onclick="finishManualChapter()" id="btnManualFinish"
+                                style="background:var(--success);color:#fff">
+                                ✅ Finish Chapter
+                            </button>
+                            <span class="text-dim text-sm hidden" id="manualSceneStatus"></span>
+                        </div>
+                    </div>
+
+                    <!-- Live streaming output for current scene -->
+                    <div class="hidden" id="manualStreamArea" style="margin-top:16px">
+                        <div class="card" style="background:var(--surface-2);padding:16px;max-height:400px;overflow-y:auto">
+                            <div class="text-sm text-dim" style="margin-bottom:8px">✍️ Writing scene...</div>
+                            <div id="manualStreamOutput" style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Reader View -->
         <div class="view" id="viewReader">
             <div class="reader-container">
                 <div class="card" style="padding:16px">
                     <div class="card-title mb-4"><span class="icon">📖</span> Chapters</div>
+                    <div class="flex gap-2 mb-4">
+                        <input class="form-input" id="deleteFromChapter" type="number" min="1" placeholder="Delete from chapter #" style="flex:1">
+                        <button class="btn btn-danger" id="btnDeleteChapters" onclick="deleteChaptersFromUi()">
+                            🗑️ Delete from
+                        </button>
+                    </div>
                     <div class="chapter-list" id="chapterList"></div>
                 </div>
                 <div class="card">
@@ -253,6 +337,62 @@
                 </div>
             </div>
         </div>
+
+        <!-- Combine & Polish View -->
+        <div class="view" id="viewCombine">
+            <div class="combine-container">
+                <div class="card combine-hero">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">📦</span> Combine & Polish with Gemini</span>
+                    </div>
+                    <p class="combine-desc">
+                        Concatenate all chapters into a single document and send it to <strong>Google Gemini</strong>
+                        for continuity analysis, character consistency checks, and narrative polish.
+                        The large context window processes your entire story in one pass.
+                    </p>
+
+                    <div class="combine-actions" id="combineActions">
+                        <button class="btn btn-gemini" onclick="startCombine()" id="btnCombine">
+                            <span class="gemini-icon">🔮</span> Combine & Polish
+                        </button>
+                    </div>
+
+                    <!-- Progress -->
+                    <div class="combine-progress hidden" id="combineProgress">
+                        <div class="combine-spinner"></div>
+                        <div class="combine-status" id="combineStatusText">Initializing...</div>
+                    </div>
+                </div>
+
+                <!-- Analysis Result -->
+                <div class="card hidden" id="combineAnalysisCard">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">🔍</span> Continuity Analysis</span>
+                        <button class="btn btn-sm" onclick="toggleAnalysis()" id="btnToggleAnalysis">▼ Collapse</button>
+                    </div>
+                    <div class="combine-analysis" id="combineAnalysis"></div>
+                </div>
+
+                <!-- Download Section -->
+                <div class="card hidden" id="combineDownloadCard">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">📥</span> Download</span>
+                    </div>
+                    <div class="combine-stats" id="combineStats"></div>
+                    <div class="combine-downloads">
+                        <button class="btn btn-download" onclick="downloadCombined('original')">
+                            📄 Download Original
+                        </button>
+                        <button class="btn btn-download btn-download-primary" onclick="downloadCombined('polished')">
+                            ✨ Download Polished
+                        </button>
+                        <button class="btn btn-download" onclick="downloadCombined('analysis')">
+                            🔍 Download Analysis
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Status Bar -->
@@ -266,6 +406,6 @@
         </div>
     </div>
 
-    <script src="/static/js/app.js"></script>
+    <script src="/static/js/app.js?v=2"></script>
 </body>
 </html>

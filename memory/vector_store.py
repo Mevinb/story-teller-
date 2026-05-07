@@ -6,7 +6,7 @@ Uses sentence-transformers for lightweight CPU-based embedding.
 import os
 import json
 import logging
-from typing import List, Tuple, Optional
+from typing import List, Optional
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -27,6 +27,9 @@ class ChunkMetadata:
     location: str = ""
     memory_type: str = "plot"
     chunk_index: int = 0
+    emotional_context: str = ""
+    event_types: list = field(default_factory=list)
+    timeline_position: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -36,6 +39,9 @@ class ChunkMetadata:
             "location": self.location,
             "memory_type": self.memory_type,
             "chunk_index": self.chunk_index,
+            "emotional_context": self.emotional_context,
+            "event_types": self.event_types,
+            "timeline_position": self.timeline_position,
         }
 
     @classmethod
@@ -89,7 +95,20 @@ class VectorStore:
         if self._index is None:
             if os.path.exists(self.index_path):
                 self._index = faiss.read_index(self.index_path)
+                self._dimension = self._index.d
                 self._load_metadata()
+                if self._index.ntotal != len(self._texts) or len(self._texts) != len(self._metadata):
+                    logger.warning(
+                        "Vector index metadata mismatch "
+                        "(vectors=%s, texts=%s, metadata=%s). Rebuilding empty index.",
+                        self._index.ntotal,
+                        len(self._texts),
+                        len(self._metadata),
+                    )
+                    self._index = faiss.IndexFlatIP(self._dimension)
+                    self._texts = []
+                    self._metadata = []
+                    self._save()
                 logger.info(
                     f"Loaded FAISS index: {self._index.ntotal} vectors"
                 )
@@ -252,6 +271,51 @@ class VectorStore:
             "dimension": self._dimension,
             "index_file_exists": os.path.exists(self.index_path),
         }
+
+    def prune_chapters(self, max_chapter: int) -> int:
+        """
+        Keep only vector chunks whose metadata chapter <= max_chapter.
+        Returns number of chunks removed.
+        """
+        max_chapter = int(max_chapter)
+        # Force-load any persisted index/metadata before pruning
+        _ = self.index
+
+        keep_indices = []
+        for idx, meta_dict in enumerate(self._metadata):
+            try:
+                meta = ChunkMetadata.from_dict(meta_dict)
+            except Exception:
+                continue
+            if int(meta.chapter) <= max_chapter:
+                keep_indices.append(idx)
+
+        removed = len(self._metadata) - len(keep_indices)
+        if removed <= 0:
+            return 0
+
+        kept_texts = [self._texts[i] for i in keep_indices]
+        kept_metadata = [self._metadata[i] for i in keep_indices]
+
+        self._texts = kept_texts
+        self._metadata = kept_metadata
+        self._embedding_cache.clear()
+
+        # Rebuild FAISS index from remaining texts
+        self._index = faiss.IndexFlatIP(self._dimension)
+        if self._texts:
+            embeddings = self.model.encode(
+                self._texts,
+                convert_to_numpy=True,
+                batch_size=32,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            ).astype("float32")
+            self._index.add(embeddings)
+
+        self._save()
+        logger.info("Pruned %s vector chunks for chapters > %s", removed, max_chapter)
+        return removed
 
     # ─── Persistence ──────────────────────────────────────────────────
 

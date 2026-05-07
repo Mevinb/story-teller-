@@ -8,22 +8,22 @@ import os
 import json
 import argparse
 import logging
-from pathlib import Path
+
 
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.syntax import Syntax
 from rich.markdown import Markdown
-from rich import print as rprint
+
 
 import config
-from pipeline.orchestrator import PipelineOrchestrator
+from pipeline.orchestrator import PipelineOrchestrator, normalize_project_name
 
 console = Console()
 
@@ -135,7 +135,7 @@ def cmd_new(args):
         console.print(f"    [green]✓ Added {name}[/green]")
 
     # Create project
-    project_name = title.lower().replace(" ", "_")
+    project_name = normalize_project_name(title)
     try:
         pipeline = PipelineOrchestrator(project_name, progress_handler)
         pipeline.create_project(
@@ -246,6 +246,40 @@ def cmd_read(args):
         sys.exit(1)
 
 
+def cmd_delete_chapters(args):
+    """Delete chapter N and all later chapters, then sync state/memory."""
+    print_banner()
+    project = args.project
+    from_chapter = args.from_chapter
+    try:
+        pipeline = PipelineOrchestrator(project, lambda **kw: None)
+        pipeline.load_project()
+        if not args.yes:
+            if not Confirm.ask(
+                f"[yellow]Delete chapter {from_chapter} and all later chapters for '{project}'?[/yellow]"
+            ):
+                console.print("[dim]Cancelled.[/dim]")
+                return
+        result = pipeline.delete_chapters_from(from_chapter)
+        deleted = result.get("deleted_chapters", [])
+        if deleted:
+            console.print(Panel(
+                f"[bold green]Deleted chapters:[/bold green] {', '.join(str(c) for c in deleted)}\n"
+                f"Current chapter: {result.get('current_chapter', 0)}\n"
+                f"Total scenes: {result.get('total_scenes_written', 0)}\n"
+                f"Removed WIP files: {result.get('deleted_wip', 0)}\n"
+                f"Removed logs: {result.get('deleted_logs', 0)}\n"
+                f"Pruned vector chunks: {result.get('deleted_vector_chunks', 0)}",
+                title="🧹 Chapters deleted",
+                border_style="green",
+            ))
+        else:
+            console.print(f"[yellow]No chapters found from {from_chapter} onward.[/yellow]")
+    except Exception as e:
+        console.print(f"[bold red]Error:[/bold red] {e}")
+        sys.exit(1)
+
+
 def cmd_serve(args):
     """Launch the web UI."""
     print_banner()
@@ -285,8 +319,11 @@ def cmd_list(args):
     for name in sorted(os.listdir(projects_dir)):
         state_path = os.path.join(projects_dir, name, "state.json")
         if os.path.exists(state_path):
-            with open(state_path) as f:
-                state = json.load(f)
+            try:
+                with open(state_path, encoding="utf-8") as f:
+                    state = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
             meta = state.get("metadata", {})
             table.add_row(
                 name,
@@ -331,6 +368,20 @@ def main():
     sub_read.add_argument("project", help="Project name")
     sub_read.add_argument("chapter", type=int, nargs="?", default=None)
     sub_read.set_defaults(func=cmd_read)
+
+    # delete-chapters
+    sub_delete_chapters = subparsers.add_parser(
+        "delete-chapters",
+        help="Delete chapter N and all later chapters, then sync state/WIP",
+    )
+    sub_delete_chapters.add_argument("project", help="Project name")
+    sub_delete_chapters.add_argument("from_chapter", type=int, help="Delete from this chapter number (inclusive)")
+    sub_delete_chapters.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Skip confirmation prompt",
+    )
+    sub_delete_chapters.set_defaults(func=cmd_delete_chapters)
 
     # list
     sub_list = subparsers.add_parser("list", help="List all projects")
