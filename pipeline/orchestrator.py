@@ -41,6 +41,11 @@ _GENERIC_CHARACTER_LABELS = {
     "class", "classmates", "students", "group", "crowd", "passengers",
     "people", "onlookers", "everyone", "men", "women",
 }
+_FUTURE_MARKER_TOKEN_STOPWORDS = {
+    "with", "while", "from", "that", "this", "then", "their",
+    "becomes", "starts", "continues", "scene", "scenes",
+    "sherin", "jomy", "riya",
+}
 
 PIPELINE_GRAPH = {
     "start": ["planner_context"],
@@ -798,15 +803,7 @@ class PipelineOrchestrator:
 
     @staticmethod
     def _distinctive_future_markers(step: str) -> set[str]:
-        lowered = re.sub(r"[^a-z0-9\s]+", " ", (step or "").lower())
-        tokens = [
-            token for token in lowered.split()
-            if len(token) > 3 and token not in {
-                "with", "while", "from", "that", "this", "then", "their",
-                "becomes", "starts", "continues", "scene", "scenes",
-                "sherin", "jomy", "riya",
-            }
-        ]
+        tokens = PipelineOrchestrator._marker_tokens(step)
         markers = set()
         for size in (3, 2):
             for i in range(0, max(0, len(tokens) - size + 1)):
@@ -816,8 +813,19 @@ class PipelineOrchestrator:
         return markers
 
     @staticmethod
+    def _marker_tokens(text: str) -> list[str]:
+        lowered = re.sub(r"[^a-z0-9\s]+", " ", (text or "").lower())
+        return [
+            token for token in lowered.split()
+            if len(token) > 3 and token not in _FUTURE_MARKER_TOKEN_STOPWORDS
+        ]
+
+    @staticmethod
     def _normalized_text_for_marker_checks(text: str) -> str:
-        return re.sub(r"[^a-z0-9\s]+", " ", (text or "").lower())
+        # Normalize with the same token filtering used by marker extraction.
+        # This avoids false positives from punctuation/joiner differences like
+        # "Arjun/Marcus" vs "Arjun and Marcus".
+        return " ".join(PipelineOrchestrator._marker_tokens(text))
 
     def _future_premise_violations(
         self,

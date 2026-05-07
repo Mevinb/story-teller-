@@ -1,81 +1,118 @@
 # Story Teller
 
-Story Teller is a multi-agent story generation pipeline with both a web UI and a CLI. It orchestrates a set of specialized agents (architect, planner, writer, consistency checker, editor) to generate long-form fiction with structured memory and semantic retrieval.
+Story Teller is a multi-agent fiction generation system with:
 
-## Features
+- a Flask web app (live streaming generation, project manager, reader, manual scene flow)
+- a Rich-powered CLI
+- structured story memory (`state.json`) plus semantic retrieval (FAISS + sentence-transformers)
 
-- Multi-agent pipeline: Story Architect, Scene Planner, Scene Writer, Consistency Engine, Editor.
-- Transition-aware consistency checks that capture valid character evolution as state updates.
-- Explicit execution graphs for deterministic orchestration (chapter graph + scene graph).
-- Local-first generation via llama.cpp GGUF models with optional Groq cloud acceleration.
-- Structured memory (JSON state) plus semantic retrieval (FAISS vector index).
-- Immutable state transitions with versioned state snapshots and change history.
-- Web UI with live generation updates (SSE), logs, reader, and state inspector.
-- Manual chapter mode in the Web UI (set chapter heading + scene briefs, then AI-enhance each scene brief before generation).
-- CLI for project creation, generation, status, and reading.
-- Project export, reset, and delete tools.
+It is designed for long-form chapter writing with consistency checks, editable project state, and reproducible project files.
+
+## What it does
+
+- Orchestrates specialized agents: architect, planner, writer, consistency engine, editor
+- Generates chapters automatically or scene-by-scene in interactive manual mode
+- Streams generation events over SSE to the web UI
+- Tracks story state and history on disk
+- Stores and retrieves semantic memory chunks for continuity
+- Supports local GGUF inference (`llama.cpp`) and optional Groq backend
+- Supports Gemini-powered "Combine & Polish" across all chapters
+
+## Project structure
+
+```text
+story teller/
+├── app.py                  # Flask app + REST API + SSE
+├── main.py                 # CLI entry point
+├── config.py               # Central configuration and defaults
+├── agents/                 # Architect, planner, writer, consistency, editor
+├── pipeline/               # Orchestrator + Gemini combiner
+├── memory/                 # State manager, retriever, vector store, evolution tools
+├── models/                 # LlamaCPP + Groq wrappers
+├── static/ templates/      # Web UI assets
+└── projects/               # Generated story projects
+```
 
 ## Requirements
 
-- Python 3.x with pip
-- A local `.gguf` model file
-- `llama-cpp-python` installed with CUDA support for GPU acceleration
-- Optional: Groq API key for cloud generation
+- Python 3.9+
+- `pip`
+- For local generation: at least one `.gguf` model file
+- Optional: `GROQ_API_KEY` for Groq backend
+- Optional: `GEMINI_API_KEY` for Combine & Polish
 
-## Setup
+## Install
 
-1. Create a virtual environment and install dependencies:
+```bash
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-   ```bash
-   python -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+## Configure
 
-2. Configure environment variables:
+Create a `.env` file (or copy from `.env.example`) and set what you need:
 
-   ```bash
-   cp .env.example .env
-   # edit .env
-   ```
+```bash
+cp .env.example .env
+```
 
-3. Install llama.cpp support and place a GGUF model under `models/`:
+Common variables:
 
-   ```bash
-   # CPU install:
-   pip install llama-cpp-python
+| Variable | Purpose |
+| --- | --- |
+| `LLAMA_MODELS_DIR` | Directory scanned for `.gguf` models (default: `./models`) |
+| `LLAMA_MODEL_PATH` | Active local `.gguf` model path |
+| `LLAMA_PROMPT_TEMPLATE` | Prompt format (`mistral`, `llama3`, `chatml`) |
+| `LLAMA_N_GPU_LAYERS` | GPU offload layers for llama.cpp |
+| `LLAMA_N_BATCH` | llama.cpp batch size |
+| `LLAMA_N_THREADS` | CPU threads for local inference |
+| `LOCAL_NUM_CTX` | Local context window |
+| `USE_CLOUD_MODEL` | `true` to prefer Groq in local/cloud hybrid mode |
+| `GROQ_API_KEY` | Enables Groq API backend |
+| `GROQ_MODEL` | Groq model id |
+| `GEMINI_API_KEY` | Enables Combine & Polish |
+| `GEMINI_MODEL` | Gemini model for combining/polishing |
 
-   # CUDA build for RTX GPUs:
-   CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 pip install --force-reinstall llama-cpp-python
-   ```
+## Local model setup (llama.cpp)
 
-   Recommended starting point for an RTX 4050 with ~6GB VRAM: a 7B or 8B `Q4_K_M` GGUF model, such as Mistral 7B Instruct or LLaMA 3 8B Instruct.
+Install `llama-cpp-python` and provide a GGUF file under `models/` (or point `LLAMA_MODEL_PATH` elsewhere).
 
-## Running
+CPU install:
 
-### Web UI
+```bash
+pip install llama-cpp-python
+```
 
-Run the Flask server and open the UI:
+CUDA build example:
+
+```bash
+CMAKE_ARGS="-DGGML_CUDA=on" FORCE_CMAKE=1 pip install --force-reinstall llama-cpp-python
+```
+
+## Run the app
+
+Web UI (default `http://127.0.0.1:5000`):
 
 ```bash
 python app.py
 ```
 
-Or via the CLI entry point:
+or:
 
 ```bash
 python main.py serve
 ```
 
-The UI runs at http://127.0.0.1:5000 by default.
-
-If you use the provided script (expects a venv at ./venv):
+Helper script:
 
 ```bash
 ./start.sh
 ```
 
-### CLI
+`start.sh` expects `./venv/bin/python` and attempts to stop anything already bound to port 5000.
+
+## CLI usage
 
 Create a project:
 
@@ -89,87 +126,75 @@ Generate chapters:
 python main.py generate <project_name> --chapters 1 --pacing moderate
 ```
 
-Check status:
-
-```bash
-python main.py status <project_name>
-```
-
-Read chapters:
-
-```bash
-python main.py read <project_name> [chapter_number]
-```
-
-Delete chapter N and everything after it (also syncs state, WIP, logs, vectors):
-
-```bash
-python main.py delete-chapters <project_name> <from_chapter> --yes
-```
-
-List projects:
+Other commands:
 
 ```bash
 python main.py list
+python main.py status <project_name>
+python main.py read <project_name> [chapter_number]
+python main.py delete-chapters <project_name> <from_chapter> --yes
+python main.py serve
 ```
 
-## Configuration
+## Web UI workflow
 
-Environment variables are loaded from .env via python-dotenv. Key options:
+1. Create a project (title, genre, premise, setting, themes, characters)
+2. Pick a backend/model from the header model selector
+3. Generate chapters (1-10 at a time), watch live token/agent output
+4. Use **Manual Page** for interactive scene-by-scene chapter writing
+5. Read chapters, edit/resume a chapter, delete from chapter N onward
+6. Inspect and edit story state in **State**
+7. Optionally run **Combine & Polish** (Gemini) and download outputs
 
-- GROQ_API_KEY: enables Groq cloud model usage when set
-- USE_CLOUD_MODEL: set to true to prefer Groq (fallback to local on failure)
-- GROQ_MODEL: default qwen/qwen3-32b
-- LLAMA_MODELS_DIR: directory scanned for `.gguf` files
-- LLAMA_MODEL_PATH: active `.gguf` model path
-- LLAMA_PROMPT_TEMPLATE: `mistral` or `llama3`
-- LLAMA_N_GPU_LAYERS: default 20; raise gradually for more GPU offload
-- LLAMA_N_BATCH: default 512
-- LLAMA_F16_KV: default true
-- LOCAL_NUM_CTX: default 4096
+## API overview
 
-Generation parameters (scene counts, word targets, retries, etc.) are defined in config.py.
-Determinism controls are also in config.py, including:
+Main route groups:
 
-- `AGENT_TEMPERATURES` (Planner 0.2, Writer 0.7, Critic 0.1, Editor 0.2)
-- `MAX_SCENE_ITERATIONS`
-- `MAX_PIPELINE_STEPS`
-- `MAX_TOKEN_BUDGET`
-- `SSE_QUEUE_MAXSIZE`
+- Models: `/api/models`, `/api/models/switch`
+- Projects: `/api/projects`, `/api/project/create`, `/api/project/<name>`
+- State: `/api/project/<name>/state` (GET, PUT)
+- Chapters: list/read/delete/export
+- Generation: auto, manual, interactive manual session, SSE stream, cancel
+- Combine: start, SSE progress, download artifacts
 
-## Project Data Layout
+Notable SSE endpoints:
 
-Projects are stored under the projects/ directory:
+- `/api/project/<name>/generate/stream`
+- `/api/project/<name>/combine/stream`
 
-- projects/<name>/state.json: structured story state
-- projects/<name>/state_history.jsonl: change log
-- projects/<name>/chapters/chapter_XXX.md: generated chapters
-- projects/<name>/logs/: per-chapter generation logs
-- projects/<name>/vector_index/: FAISS index and metadata
+## Project data layout
 
-## Web API Endpoints
+Each project is stored under `projects/<project_name>/`:
 
-- GET /api/models: list available GGUF models
-- POST /api/models/switch: switch active GGUF model
-- GET /api/projects: list projects
-- POST /api/project/create: create project
-- GET /api/project/<name>: project info and state
-- GET /api/project/<name>/state: get state
-- PUT /api/project/<name>/state: update state
-- GET /api/project/<name>/chapters: list chapters
-- GET /api/project/<name>/chapter/<num>: read a chapter
-- POST /api/project/<name>/chapters/delete: delete chapter N+ and sync state/WIP/memory
-- POST /api/project/<name>/generate: start generation
-- POST /api/project/<name>/generate/manual: start generation from manual chapter heading + scene briefs
-- GET /api/project/<name>/generate/stream: SSE stream for live updates
-- POST /api/project/<name>/generate/cancel: cancel generation
-- POST /api/project/<name>/delete: delete project
-- POST /api/project/<name>/reset: reset generated content
-- GET /api/project/<name>/export: download full story
+```text
+projects/<name>/
+├── state.json
+├── state_history.jsonl
+├── chapter_###_wip.json          # checkpoints during generation
+├── chapters/
+│   └── chapter_###.md
+├── logs/
+│   ├── chapter_###.json
+│   └── chapter_###_trace.jsonl
+├── vector_index/
+│   ├── index.faiss
+│   ├── metadata.json
+│   └── texts.json
+├── combined_original.md          # after Combine & Polish
+├── combined_polished.md          # after Combine & Polish
+└── story_analysis.md             # after Combine & Polish
+```
+
+## Troubleshooting
+
+- **`GGUF model file not found`**: set `LLAMA_MODEL_PATH` correctly or place model in `LLAMA_MODELS_DIR`.
+- **Groq unavailable**: verify internet, API key, and `GROQ_MODEL`.
+- **Gemini combine fails**: ensure `GEMINI_API_KEY` is set.
+- **Port 5000 already in use**: stop the process using it, or use `start.sh` to auto-stop it.
+- **Slow local inference**: reduce context/batch, lower model size, or tune `LLAMA_N_GPU_LAYERS`.
 
 ## Notes
 
-- Local-only mode is the default. To use Groq, set GROQ_API_KEY and USE_CLOUD_MODEL=true.
-- If a Groq request is blocked by moderation or rate limits, the pipeline falls back to the local model.
-- Resetting a project clears generated content (chapters, logs, vectors) but keeps user-entered metadata.
-- SSE payloads now include a normalized schema: `type`, `agent`, `content`, `timestamp`, `payload` (and compatibility keys `event`, `data`).
+- Default mode is local generation unless Groq is explicitly selected/enabled.
+- Project reset keeps user metadata and characters, and clears generated chapters/memory artifacts.
+- Deleting chapters from N rewinds state, vector memory, WIP checkpoints, and related logs.
