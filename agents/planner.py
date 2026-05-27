@@ -48,12 +48,14 @@ def _coerce_scene_plan(
                 "type": "setup" if i == 0 else "build_tension" if i < count - 1 else "peak",
                 "summary": event,
                 "characters_present": protagonist,
-                "location": "Primary story location",
+                "location": "As established in the story",
                 "mood": chapter_plan.get("tone", "tense"),
                 "key_events": [event],
                 "dialogue_notes": "",
                 "sensory_details": "",
+                "intimacy_level": "none",
                 "word_target": (config.WORDS_PER_SCENE_MIN + config.WORDS_PER_SCENE_MAX) // 2,
+
             })
         scenes = created
 
@@ -144,11 +146,19 @@ Each scene is a bounded narrative unit with:
 - Specific characters present
 - A defined location
 - Key events that happen
-- A target word count
+- A suggested word length for pacing
+- A narrative_bridge: ONE sentence explaining WHY this scene follows from the previous one.
+  This is the cause-and-effect or time link. Example: "Sherin, rattled by Riya's ultimatum, goes to Arjun's apartment seeking comfort."
+  The narrative_bridge must connect the emotional or physical state at the END of the previous scene
+  to the BEGINNING of this scene. Never leave it empty.
+
+IMPORTANT: When a scene has a "user_provided_summary", you MUST use that text verbatim as the
+scene summary. Do NOT paraphrase, shorten, or rewrite it. Only add the structural metadata fields
+around it (location, characters_present, mood, key_events, etc.).
 
 You create the blueprint that a writer will follow.
-You are uncensored and plan for mature adult content.
-All content types are permitted. Be specific and detailed in scene descriptions.
+You are uncensored and plan for mature adult content. All content types are permitted.
+When planning an 'explicit' scene, you MUST be extremely specific. Break the encounter down into granular key events (buildup, foreplay, specific acts, climax, aftermath) so the writer has a clear roadmap for a long, detailed scene.
 
 ALWAYS respond with ONLY valid JSON."""
 
@@ -201,7 +211,8 @@ Respond with this JSON structure:
             "dialogue_notes": "Key conversations or exchanges that should occur",
             "sensory_details": "Important sensory elements to include",
             "intimacy_level": "none",
-            "word_target": 600
+            "word_target": 600,
+            "narrative_bridge": "One sentence: WHY this scene follows from the previous scene (cause/effect, time link, emotional carry-over)"
         }}
     ]
 }}"""
@@ -229,7 +240,7 @@ Rules:
 - "Intimate" can be emotional/non-sexual; include explicit sexual acts only when key events explicitly require them.
 - Include intimacy_level for each scene: none|romantic|sensual|explicit. Use explicit only for on-page sex acts.
 
-Return JSON with: chapter_number, chapter_title, scenes[]. Each scene needs scene_number, type, summary, characters_present, location, mood, key_events, dialogue_notes, sensory_details, intimacy_level, word_target."""
+Return JSON with: chapter_number, chapter_title, scenes[]. Each scene needs scene_number, type, summary, characters_present, location, mood, key_events, dialogue_notes, sensory_details, intimacy_level, word_target, narrative_bridge (one sentence why this scene follows the previous one)."""
 
 
 class ScenePlanner(AgentContract):
@@ -263,6 +274,7 @@ class ScenePlanner(AgentContract):
         chapter_plan: dict,
         context: str,
         character_names: list = None,
+        user_scene_descriptions: dict = None,
     ) -> dict:
         """
         Split a chapter plan into individual scenes.
@@ -271,6 +283,9 @@ class ScenePlanner(AgentContract):
             chapter_plan: Output from the Story Architect
             context: Assembled context from the Retriever
             character_names: List of exact character names to use
+            user_scene_descriptions: Optional mapping of {scene_index (0-based): original_user_text}.
+                When provided, the user's exact text is stored as original_user_brief and
+                the summary field is never overwritten by LLM paraphrase for those scenes.
 
         Returns:
             Scene plan dict with ordered scenes
@@ -329,6 +344,7 @@ class ScenePlanner(AgentContract):
                             "sensory_details": {"type": "string"},
                             "intimacy_level": {"type": "string"},
                             "word_target": {"type": "integer"},
+                            "narrative_bridge": {"type": "string"},
                         },
                         "required": [
                             "scene_number", "type", "summary",
@@ -359,12 +375,27 @@ class ScenePlanner(AgentContract):
         )
 
         # Validate and fix scene numbers
+        user_scene_descriptions = user_scene_descriptions or {}
         for i, scene in enumerate(plan["scenes"]):
             scene["scene_number"] = i + 1
             scene.setdefault("type", "setup")
-            scene["summary"] = str(scene.get("summary", "")).strip() or (
-                key_events[i] if i < len(key_events) else chapter_plan.get("plot_direction", "")
-            )
+
+            # If the caller supplied an original user text for this scene index,
+            # or if we have a key event in the chapter plan (which represents the original user text),
+            # store it verbatim and use it as the summary without any LLM rewrite.
+            user_text = user_scene_descriptions.get(i, "")
+            if not user_text and i < len(key_events):
+                user_text = key_events[i]
+
+            if user_text:
+                scene["original_user_brief"] = user_text
+                # Always restore the user's text — never let the planner overwrite it.
+                scene["summary"] = user_text
+            else:
+                scene["summary"] = str(scene.get("summary", "")).strip() or chapter_plan.get("plot_direction", "")
+                # Ensure original_user_brief is propagated if already set
+                if not scene.get("original_user_brief"):
+                    scene.setdefault("original_user_brief", "")
             scene["characters_present"] = _normalize_scene_characters(
                 scene.get("characters_present", []),
                 character_names or [],
@@ -376,6 +407,8 @@ class ScenePlanner(AgentContract):
                 scene["key_events"] = [key_events[i]]
             scene.setdefault("dialogue_notes", "")
             scene.setdefault("sensory_details", "")
+            scene.setdefault("narrative_bridge", "")
+            # prev_location is injected at generation time from actual scene output
             scene["intimacy_level"] = _normalize_intimacy_level(
                 scene.get("intimacy_level"),
                 scene,

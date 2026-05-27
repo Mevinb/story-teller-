@@ -212,9 +212,33 @@ class LLMInterface(ABC):
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
-                # For rate limits, use longer delay
+                
+                # Auto-adjust max_tokens if the model rejects the requested amount
+                if "max_tokens" in err_str and "less than or equal to" in err_str:
+                    match = re.search(r"less than or equal to `?(\d+)`?", str(e))
+                    if match:
+                        new_max = int(match.group(1))
+                        max_tokens = new_max
+                        logger.warning(
+                            f"[{self.get_name()}] Auto-adjusting max_tokens to {new_max} based on model limits."
+                        )
+                        continue  # Retry immediately with new limit
+                        
+                # Handle 413 Request Entity Too Large (context window / token request too big)
+                if "request entity too large" in err_str or "request_too_large" in err_str:
+                    if max_tokens is None or max_tokens > 1024:
+                        new_max = 1024 if (max_tokens is None or max_tokens > 2048) else (max_tokens // 2)
+                        logger.warning(f"[{self.get_name()}] 413 Entity Too Large. Reducing max_tokens to {new_max}.")
+                        max_tokens = new_max
+                        continue # Retry immediately with fewer requested tokens
+                        
+                # For rate limits, use longer delay or exact requested delay
                 if 'rate' in err_str and 'limit' in err_str:
-                    wait = max(delay, 15)  # At least 15s for rate limits
+                    match = re.search(r"try again in ([\d\.]+)s", err_str)
+                    if match:
+                        wait = float(match.group(1)) + 1.5
+                    else:
+                        wait = max(delay, 15)  # At least 15s for rate limits
                 else:
                     wait = delay
                 if attempt < max_retries - 1:

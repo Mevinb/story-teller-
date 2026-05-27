@@ -10,7 +10,6 @@ Upgraded with hybrid narrative retrieval:
 - Emotional relevance weighting
 - Evolution context injection (arcs, relationships, transitions, phase)
 """
-import re
 import logging
 
 import config
@@ -247,8 +246,19 @@ class Retriever:
         chapter_num: int,
         characters: dict,
         unresolved_threads: list,
+        backstory_query: bool = False,
     ) -> list:
-        """Re-rank search results using hybrid scoring."""
+        """Re-rank search results using recency-weighted hybrid scoring.
+
+        Primary formula (per spec):
+            recency_score = 1.0 - 0.05 * (current_chapter - chunk_chapter)
+            final_score   = semantic_score * 0.7 + recency_score * 0.3
+
+        Secondary tie-breaker signals (character overlap, thread relevance,
+        emotional keywords) are applied within the remaining headroom so that
+        recent chapters almost always outweigh older ones unless the query
+        explicitly references backstory.
+        """
         scene_chars = set(c.lower() for c in scene_plan.get("characters_present", []))
         thread_text = " ".join(unresolved_threads).lower()
 
@@ -257,18 +267,25 @@ class Retriever:
             semantic = float(result.score)
             meta = result.metadata
 
-            # Recency: favor recent chapters
+            # ── Recency weight (spec-mandated formula) ────────────────────
             chapter_gap = max(0, chapter_num - meta.chapter)
-            recency = max(0.0, 1.0 - chapter_gap * 0.12)
+            recency_score = max(0.0, 1.0 - 0.05 * chapter_gap)
 
-            # Character overlap
+            # When the query is explicitly about backstory, recency penalty is
+            # halved so that older chapters can surface naturally.
+            if backstory_query:
+                recency_score = max(0.0, 1.0 - 0.025 * chapter_gap)
+
+            # ── Spec-mandated combination ─────────────────────────────────
+            base_score = semantic * 0.7 + recency_score * 0.3
+
+            # ── Secondary tie-breaker signals (small weight) ──────────────
             chunk_chars = set(c.lower() for c in (meta.characters or []))
             if scene_chars and chunk_chars:
                 overlap = len(scene_chars & chunk_chars) / max(1, len(scene_chars))
             else:
                 overlap = 0.0
 
-            # Unresolved plot relevance
             text_lower = result.text.lower()
             unresolved_score = 0.0
             if thread_text:
@@ -277,19 +294,14 @@ class Retriever:
                 common = len(thread_words & text_words)
                 unresolved_score = min(1.0, common / max(1, len(thread_words)) * 3)
 
-            # Emotional relevance (check if emotional keywords present)
             emotional_keywords = {"afraid", "angry", "love", "betray", "trust", "grief", "joy", "despair"}
             emo_count = sum(1 for kw in emotional_keywords if kw in text_lower)
             emotional_score = min(1.0, emo_count * 0.25)
 
-            final = (
-                semantic * 0.40
-                + recency * 0.20
-                + overlap * 0.15
-                + unresolved_score * 0.15
-                + emotional_score * 0.10
-            )
-            result._hybrid_score = final
+            # Tie-breaker: up to +0.05 bonus — never overrides recency dominance
+            tiebreaker = (overlap * 0.5 + unresolved_score * 0.35 + emotional_score * 0.15) * 0.05
+
+            result._hybrid_score = base_score + tiebreaker
             scored.append(result)
 
         scored.sort(key=lambda r: r._hybrid_score, reverse=True)

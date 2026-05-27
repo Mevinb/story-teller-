@@ -11,7 +11,6 @@ This drives retrieval prioritization and context budget allocation.
 """
 import re
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -168,8 +167,6 @@ class ImportanceRanker:
         # Find dialogue lines that follow the character's name within 100 chars
         dialogue_matches = cls._DIALOGUE_RE.findall(scene_text or "")
         total_dialogue_chars = sum(len(d) for d in dialogue_matches)
-        total_text_chars = max(1, len(scene_text or ""))
-
         # Rough heuristic: if this character is mentioned near dialogue
         char_dialogue = 0
         for match in cls._DIALOGUE_RE.finditer(scene_text or ""):

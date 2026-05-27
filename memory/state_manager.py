@@ -235,6 +235,36 @@ def _merge_character_records(primary: dict, duplicate: dict) -> dict:
     return primary
 
 
+def _create_default_character(info: Optional[dict] = None) -> dict:
+    """Returns a fully populated default character dictionary to maintain schema consistency."""
+    info = info or {}
+    role = info.get("role", "supporting")
+    return {
+        "description": info.get("description", ""),
+        "traits": info.get("traits", []),
+        "relationships": info.get("relationships", {}),
+        "state": info.get("state", {
+            "emotion": "neutral",
+            "location": "",
+            "goal": "",
+        }),
+        "arc_progression": info.get("arc_progression", []),
+        "role": role,
+        # Evolution engine fields
+        "emotional_history": info.get("emotional_history", []),
+        "importance_score": info.get("importance_score", 0.7 if role == "main" else 0.3),
+        "mention_count": info.get("mention_count", 0),
+        "dialogue_density": info.get("dialogue_density", 0.0),
+        "status": info.get("status", "active"),
+        "first_seen": info.get("first_seen", 0),
+        "last_seen": info.get("last_seen", 0),
+        "aliases": info.get("aliases", []),
+        "arc_progression_data": info.get("arc_progression_data", {}),
+        "story_events_involved": info.get("story_events_involved", 0),
+        "generated": info.get("generated", False),
+    }
+
+
 class StateManager:
     """
     Manages the structured JSON state for a story project.
@@ -259,21 +289,60 @@ class StateManager:
     def reset_generated(self) -> None:
         """Reset all AI-generated content while preserving user-entered data.
 
-        Keeps: metadata (title, genre, premise, themes, setting), characters, world
-        Clears: plot data, chapter files, vectors, logs, WIP checkpoints
+        Keeps: metadata (title, genre, premise, themes, setting), character
+               definitions (description, traits, role), world
+        Clears: ALL generated runtime data — plot events, story_events,
+                legend_memory, foreshadowing, unresolved_threads,
+                chapter_summaries, transitions, narrative_phase, and all
+                per-character runtime fields (emotional_history,
+                arc_progression, arc_progression_data, mention_count,
+                dialogue_density, importance_score, first_seen, last_seen,
+                story_events_involved, state).
         """
+        _CHAR_RUNTIME_FIELDS = (
+            "arc_progression", "arc_progression_data", "emotional_history",
+            "mention_count", "dialogue_density", "importance_score",
+            "first_seen", "last_seen", "story_events_involved",
+            "emotion", "location", "goal",
+        )
+        _CHAR_RUNTIME_DEFAULTS = {
+            "arc_progression": [],
+            "arc_progression_data": {},
+            "emotional_history": [],
+            "mention_count": 0,
+            "dialogue_density": 0.0,
+            "importance_score": 0.7,  # will be re-scored on generation
+            "first_seen": 0,
+            "last_seen": 0,
+            "story_events_involved": 0,
+            "state": {"emotion": "neutral", "goal": "", "location": ""},
+        }
+
         def mutator(current: dict) -> dict:
+            # Fully wipe all generated plot data including evolution engine fields
             current["plot"] = {
                 "major_events": [],
                 "unresolved_threads": [],
                 "foreshadowing": [],
                 "chapter_summaries": [],
+                "story_events": [],
+                "legend_memory": [],
             }
+            # Wipe top-level transitions list (scene-transition carry-over)
+            current["transitions"] = []
+            # Reset narrative tracking metadata
             current["metadata"]["current_chapter"] = 0
             current["metadata"]["total_scenes_written"] = 0
+            current["metadata"]["narrative_phase"] = "introduction"
+            # Strip all AI-generated runtime fields from every character
             for char in current.get("characters", {}).values():
-                char["arc_progression"] = []
-                char["state"] = {"emotion": "neutral", "goal": "", "location": ""}
+                if not isinstance(char, dict):
+                    continue
+                for field, default in _CHAR_RUNTIME_DEFAULTS.items():
+                    char[field] = deepcopy(default)
+                # Also remove loose top-level generated keys written by older code
+                for stale_key in ("emotion", "location", "goal"):
+                    char.pop(stale_key, None)
             return current
 
         self._transition("reset_generated", {}, mutator)
@@ -446,29 +515,7 @@ class StateManager:
             })
             if characters:
                 for name, info in characters.items():
-                    next_state["characters"][name] = {
-                        "description": info.get("description", ""),
-                        "traits": info.get("traits", []),
-                        "relationships": info.get("relationships", {}),
-                        "state": info.get("state", {
-                            "emotion": "neutral",
-                            "location": "",
-                            "goal": "",
-                        }),
-                        "arc_progression": [],
-                        "role": info.get("role", "main"),
-                        # Evolution engine fields
-                        "emotional_history": [],
-                        "importance_score": 0.7 if info.get("role") == "main" else 0.3,
-                        "mention_count": 0,
-                        "dialogue_density": 0.0,
-                        "status": info.get("status", "active"),
-                        "first_seen": 0,
-                        "last_seen": 0,
-                        "aliases": info.get("aliases", []),
-                        "arc_progression_data": info.get("arc_progression_data", {}),
-                        "story_events_involved": 0,
-                    }
+                    next_state["characters"][name] = _create_default_character(info)
             return next_state
 
         self._transition("initialize", payload, mutator)
@@ -489,14 +536,10 @@ class StateManager:
 
             if target_key is None:
                 target_key = name
-                chars[target_key] = {
-                    "description": "",
-                    "traits": [],
-                    "relationships": {},
-                    "state": {"emotion": "neutral", "location": "", "goal": ""},
-                    "arc_progression": [],
+                chars[target_key] = _create_default_character({
                     "role": "supporting",
-                }
+                    "generated": True,
+                })
 
             char = chars[target_key]
             if target_key != name:
@@ -646,8 +689,13 @@ class StateManager:
             metadata = current.setdefault("metadata", {})
             metadata["current_chapter"] = max_chapter
             metadata["total_scenes_written"] = total_scenes_written
+            # Also reset narrative phase to introduction if rewinding to zero
+            if max_chapter == 0:
+                metadata["narrative_phase"] = "introduction"
 
             plot = current.setdefault("plot", {})
+
+            # chapter_summaries — keep only entries up to max_chapter
             chapter_summaries = plot.get("chapter_summaries", [])
             if isinstance(chapter_summaries, list):
                 plot["chapter_summaries"] = [
@@ -655,6 +703,7 @@ class StateManager:
                     if chapter_num(s.get("chapter", 0)) <= max_chapter
                 ]
 
+            # major_events — filter by chapter
             major_events = plot.get("major_events", [])
             if isinstance(major_events, list):
                 plot["major_events"] = [
@@ -662,9 +711,35 @@ class StateManager:
                     if chapter_num(e.get("chapter", 0)) <= max_chapter
                 ]
 
-            # Character state/arc changes are generated during scene/chapter runs.
-            # Older projects did not record per-character chapter provenance, so after
-            # deleting chapters we must prefer a clean baseline over stale future facts.
+            # story_events — filter by chapter (evolution engine events)
+            story_events = plot.get("story_events", [])
+            if isinstance(story_events, list):
+                plot["story_events"] = [
+                    e for e in story_events
+                    if chapter_num(e.get("chapter", 0)) <= max_chapter
+                ]
+
+            # legend_memory — no chapter provenance, wipe entirely on full reset
+            if max_chapter == 0:
+                plot["legend_memory"] = []
+
+            # foreshadowing — no chapter tag; wipe entirely on full reset
+            if max_chapter == 0:
+                plot["foreshadowing"] = []
+
+            # unresolved_threads — no chapter tag; wipe entirely on full reset
+            if max_chapter == 0:
+                plot["unresolved_threads"] = []
+
+            # transitions — filter to only transitions whose from_chapter <= max_chapter
+            transitions = current.get("transitions", [])
+            if isinstance(transitions, list):
+                current["transitions"] = [
+                    t for t in transitions
+                    if chapter_num(t.get("from_chapter", 0)) <= max_chapter
+                ]
+
+            # Characters — strip all generated runtime fields
             characters = current.setdefault("characters", {})
             if isinstance(characters, dict):
                 for name in list(characters.keys()):
@@ -684,17 +759,36 @@ class StateManager:
                         summary["supporting_characters_removed"] += 1
                         continue
 
+                    # arc_progression — always wipe (no chapter provenance)
                     if char.get("arc_progression"):
                         summary["character_arcs_cleared"] += len(char.get("arc_progression", []))
                     char["arc_progression"] = []
+                    char["arc_progression_data"] = {}
+
+                    # emotional_history — filter by chapter
+                    emotional_history = char.get("emotional_history", [])
+                    if isinstance(emotional_history, list):
+                        char["emotional_history"] = [
+                            e for e in emotional_history
+                            if chapter_num(e.get("chapter", 0)) <= max_chapter
+                        ]
+
+                    # Reset runtime metrics so they are recalculated fresh
+                    char["mention_count"] = 0
+                    char["dialogue_density"] = 0.0
+                    char["story_events_involved"] = 0
+                    char["first_seen"] = 0
+                    char["last_seen"] = 0
+                    char["importance_score"] = 0.7 if char.get("role") == "main" else 0.3
 
                     if char.get("state") != {"emotion": "neutral", "goal": "", "location": ""}:
                         summary["character_states_reset"] += 1
                     char["state"] = {"emotion": "neutral", "goal": "", "location": ""}
 
-                    for generated_key in ("emotion", "location", "goal"):
-                        if generated_key in char:
-                            char.pop(generated_key, None)
+                    # Remove stale loose top-level keys written by older pipeline code
+                    for stale_key in ("emotion", "location", "goal"):
+                        if stale_key in char:
+                            char.pop(stale_key, None)
                             summary["generated_character_fields_removed"] += 1
 
             return current
@@ -762,15 +856,10 @@ class StateManager:
                         )
                     else:
                         current["characters"][name] = merge_character(
-                            {
-                                "description": "",
-                                "traits": [],
-                                "relationships": {},
-                                "state": {"emotion": "neutral", "location": "", "goal": ""},
-                                "arc_progression": [],
+                            _create_default_character({
                                 "role": "supporting",
                                 "generated": True,
-                            },
+                            }),
                             char_updates,
                         )
                         logger.info("Added new supporting character from state update: '%s'", name)

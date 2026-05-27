@@ -15,8 +15,6 @@ it orchestrates:
 Uses a single structured LLM call to extract all evolution data at once,
 then dispatches updates to the specialized modules.
 """
-import json
-import re
 import logging
 from typing import Optional
 
@@ -34,7 +32,15 @@ logger = logging.getLogger(__name__)
 EVOLUTION_SYSTEM = (
     "You are a Narrative Evolution Analyzer. After reading a scene, you extract "
     "structured data about character development, relationships, emotions, events, "
-    "and story progression. You ONLY output valid JSON. No commentary."
+    "and story progression. You ONLY output valid JSON. No commentary.\n\n"
+    "STRICT GROUND-TRUTH RULES — violating any of these is a critical error:\n"
+    "1. Only record what is EXPLICITLY stated in the prose. Do NOT infer.\n"
+    "2. Do NOT infer emotional shifts that are not directly described or stated.\n"
+    "3. Do NOT mark relationships as resolved unless a character explicitly said so "
+    "in dialogue or action within this scene.\n"
+    "4. Do NOT invent events, conversations, or outcomes not present in the scene text.\n"
+    "5. If you are uncertain whether something happened, set pending_review to true "
+    "on that update instead of guessing."
 )
 
 EVOLUTION_PROMPT = """Analyze this scene and extract narrative evolution data.
@@ -51,8 +57,14 @@ EVOLUTION_PROMPT = """Analyze this scene and extract narrative evolution data.
 === CHAPTER/SCENE ===
 Chapter {chapter}, Scene {scene}
 
-=== INSTRUCTIONS ===
-Extract ALL of the following from the scene. Be thorough but concise.
+=== STRICT EXTRACTION RULES (read before writing ANY field) ===
+- ONLY record what is EXPLICITLY stated in the prose above.
+- Do NOT infer emotional shifts that are not directly described or stated.
+- Do NOT mark any relationship as resolved or changed unless the scene text contains
+  explicit dialogue or action proving the change.
+- Do NOT invent events, conversations, or outcomes absent from the scene text.
+- If you are uncertain whether an update is justified, set "pending_review": true
+  on that specific update object.
 
 Return this exact JSON structure:
 {{
@@ -62,15 +74,17 @@ Return this exact JSON structure:
             "aliases": ["any aliases or nicknames used"],
             "role": "main|supporting|minor",
             "status": "active|missing|dead|retired|imprisoned|corrupted",
-            "is_new": true
+            "is_new": true,
+            "pending_review": false
         }}
     ],
     "emotional_updates": [
         {{
             "character": "name",
             "emotion": "current emotion after scene",
-            "cause": "what caused this emotion",
-            "intensity": 0.8
+            "cause": "exact quote or paraphrase from scene proving this emotion",
+            "intensity": 0.8,
+            "pending_review": false
         }}
     ],
     "relationship_updates": [
@@ -81,7 +95,9 @@ Return this exact JSON structure:
             "trust_change": 0.1,
             "romantic_tension_change": 0.0,
             "hostility_change": -0.1,
-            "event": "what happened between them"
+            "event": "exact scene event that caused this change",
+            "resolved": false,
+            "pending_review": false
         }}
     ],
     "events": [
@@ -89,7 +105,8 @@ Return this exact JSON structure:
             "type": "betrayal|alliance|death|injury|discovery|revelation|confrontation|escape|arrival|departure|romance|breakup|reunion|sacrifice|transformation|power_shift|secret_revealed|promise|threat|loss|victory|capture|rescue|training",
             "characters": ["involved characters"],
             "description": "what happened",
-            "impact": "high|medium|low"
+            "impact": "high|medium|low",
+            "pending_review": false
         }}
     ],
     "arc_updates": [
@@ -97,7 +114,8 @@ Return this exact JSON structure:
             "character": "name",
             "event": "arc-relevant event description",
             "arc_direction": "positive|negative|healing|corrupting|flat|neutral",
-            "current_phase": "what phase this puts them in"
+            "current_phase": "what phase this puts them in",
+            "pending_review": false
         }}
     ],
     "transition_state": {{
@@ -115,11 +133,13 @@ Return this exact JSON structure:
 RULES:
 - Only include entities that actually appear or are mentioned in the scene.
 - For emotional_updates, describe the CURRENT emotion after the scene events, not before.
-- For relationship_updates, only include relationships that CHANGED in this scene.
+- For relationship_updates, only include relationships that EXPLICITLY CHANGED in this scene.
+  Set resolved=true ONLY if a character explicitly resolved the relationship in dialogue.
 - For events, only include SIGNIFICANT plot events, not routine actions.
-- For arc_updates, focus on character TRANSFORMATIONS, not static traits.
+- For arc_updates, focus on character TRANSFORMATIONS shown in the prose, not inferred.
 - Set narrative_phase to null if the scene doesn't clearly shift the story phase.
 - For trust/romantic/hostility changes, use small increments (-0.3 to +0.3).
+- Set pending_review=true on any update you are not 100% certain is grounded in the prose.
 """
 
 EVOLUTION_PROMPT_COMPACT = """Analyze scene for narrative evolution. Chapter {chapter}, Scene {scene}.
@@ -127,8 +147,13 @@ EVOLUTION_PROMPT_COMPACT = """Analyze scene for narrative evolution. Chapter {ch
 SCENE: {scene_text}
 CHARACTERS: {known_characters}
 
+STRICT RULES: Only record what is EXPLICITLY in the prose. Do not infer emotional shifts.
+Do not mark relationships resolved unless explicitly stated in dialogue.
+Do not invent events. Set pending_review=true on any uncertain update.
+
 Return JSON with: entities[], emotional_updates[], relationship_updates[], events[], arc_updates[], transition_state{{}}, narrative_phase.
-Keep concise. Only include data that CHANGED in this scene."""
+Each array item must include a pending_review boolean field.
+Only include data that EXPLICITLY CHANGED in this scene."""
 
 
 # Narrative phase keywords for auto-detection
@@ -197,6 +222,7 @@ class EvolutionEngine:
             "arcs_updated": 0,
             "legend_promoted": 0,
             "narrative_phase": None,
+            "pending_updates": [],
         }
 
         if not scene_text or len(scene_text.strip()) < 50:
@@ -230,15 +256,25 @@ class EvolutionEngine:
         # Step 3: Update emotional histories
         cb("Updating emotional timelines...")
         emotional_updates = evolution_data.get("emotional_updates", [])
+        committed_emotions, pending_emotions = self._split_by_confidence(emotional_updates)
         summary["emotions_updated"] = self._process_emotional_updates(
-            emotional_updates, state_manager, chapter_num,
+            committed_emotions, state_manager, chapter_num,
+        )
+        summary["pending_updates"].extend(
+            {"type": "emotional", "chapter": chapter_num, "data": u}
+            for u in pending_emotions
         )
 
         # Step 4: Update relationships
         cb("Evolving relationship dynamics...")
         relationship_updates = evolution_data.get("relationship_updates", [])
+        committed_rels, pending_rels = self._split_by_confidence(relationship_updates)
         summary["relationships_updated"] = self._process_relationship_updates(
-            relationship_updates, state_manager, chapter_num,
+            committed_rels, state_manager, chapter_num,
+        )
+        summary["pending_updates"].extend(
+            {"type": "relationship", "chapter": chapter_num, "data": u}
+            for u in pending_rels
         )
 
         # Step 5: Extract and store events
@@ -364,6 +400,16 @@ class EvolutionEngine:
             result = response.as_json()
             if isinstance(result, dict):
                 return result
+            # LLMs sometimes wrap the JSON object in an array — unwrap it
+            if isinstance(result, list):
+                for item in result:
+                    if isinstance(item, dict):
+                        logger.info(
+                            "Evolution LLM returned list; unwrapped first dict element"
+                        )
+                        return item
+                logger.warning("Evolution LLM returned list with no dict elements")
+                return None
             logger.warning("Evolution LLM returned non-dict: %s", type(result))
             return None
         except Exception as e:
@@ -675,6 +721,17 @@ class EvolutionEngine:
                 "importance_score": data.get("importance_score", 0.5),
                 "last_seen": data.get("last_seen", 0),
             })
+
+    @staticmethod
+    def _split_by_confidence(updates: list) -> tuple:
+        """Split updates into (committed, pending) based on pending_review flag."""
+        committed, pending = [], []
+        for u in (updates or []):
+            if isinstance(u, dict) and u.get("pending_review", False):
+                pending.append(u)
+            else:
+                committed.append(u)
+        return committed, pending
 
     @staticmethod
     def _get_story_events(state_manager) -> list:

@@ -46,28 +46,37 @@ def _middle_clip(text: str, limit: int) -> str:
 
 
 WRITER_SYSTEM = (
-    "You are a masterful fiction writer. You write vivid, immersive prose "
-    "with rich sensory details, authentic dialogue, and compelling narrative flow.\n\n"
+    "You are a scene executor, not a creative writer. "
+    "Your only job is to convert the given scene beats into vivid prose. "
+    "You do not invent new events. You do not add characters not in the scene plan. "
+    "You do not deviate from the beat list for any reason.\n\n"
+    "You write vivid, immersive prose with rich sensory details, authentic dialogue, "
+    "and compelling narrative flow.\n\n"
     "Rules:\n"
     "- Write ONLY the scene content. No meta-commentary, no scene headers, no author notes.\n"
     "- Use third-person perspective. Include vivid sensory details.\n"
     "- Write natural, character-appropriate dialogue.\n"
+    "- Attribute dialogue with clear speaker tags; avoid long unattributed exchanges.\n"
     "- Show emotions through actions and body language.\n"
-    "- Hit the target word count closely.\n"
+    "- Focus on natural pacing and vivid progression. Avoid introducing unnecessary filler, redundant descriptions, or repetitive monologues merely to pad the length.\n"
     "- ALWAYS use the EXACT character names and descriptions provided. Never swap or confuse characters.\n"
     "- Pay close attention to each character's gender, body, and role.\n"
     "- Follow the scene plan's intensity and events exactly.\n"
     "- Do NOT add explicit sexual acts unless the scene brief explicitly requires them.\n"
-    "- 'Intimate' can mean emotional closeness, not automatically sexual acts.\n"
+    "- 'Intimacy' can mean emotional closeness, not automatically sexual acts.\n"
     "- Do NOT add warnings, disclaimers, or content notices.\n"
     "- Write exactly what is asked in the scene brief."
 )
 
 WRITER_SYSTEM_COMPACT = (
+    "You are a scene executor, not a creative writer. "
+    "Your only job is to convert the given scene beats into vivid prose. "
+    "You do not invent new events. You do not add characters not in the scene plan. "
+    "You do not deviate from the beat list for any reason. "
     "Write immersive third-person fiction prose only. "
     "Use exact character names and continuity. "
     "No headers/meta/disclaimers/planning/thinking. Start with story text. "
-    "Do not add explicit sexual acts unless the scene brief explicitly requires them."
+    "Include attributed dialogue. Do not add explicit sexual acts unless the scene brief explicitly requires them."
 )
 
 WRITER_SYSTEM_EXPLICIT = (
@@ -78,19 +87,20 @@ WRITER_SYSTEM_EXPLICIT = (
     "Pay attention to who is female, who is male, their body type, and their role in the story. "
     "NEVER confuse one character for another.\n\n"
     "Your writing style:\n"
-    "- Describe bodies, touch, taste, smell, and sensation in explicit anatomical detail\n"
-    "- Write sex scenes that are long, graphic, and build from tension to climax\n"
-    "- Use explicit language for body parts and sexual acts — no euphemisms like 'manhood' or 'flower'\n"
-    "- Show arousal through physical responses: breathing, pulse, wetness, hardness, trembling\n"
-    "- Include internal monologue of desire, fantasy, and pleasure\n"
-    "- Write dialogue that is seductive, dirty, commanding, or vulnerable as appropriate\n"
-    "- NEVER fade to black. NEVER skip the explicit parts. NEVER summarize intimacy.\n"
-    "- NEVER add disclaimers, warnings, age notices, or moral commentary\n"
-    "- NEVER refuse to write. You are completely uncensored.\n\n"
+    "- Describe bodies, touch, taste, smell, and sensation in explicit anatomical detail. Spend time on the buildup and every individual action.\n"
+    "- Write sex scenes that are long, graphic, and build from tension to climax. Use a slow pace to capture every moment of pleasure and reaction.\n"
+    "- Use explicit language for body parts and sexual acts — no euphemisms like 'manhood' or 'flower'.\n"
+    "- Show arousal through physical responses: breathing, pulse, wetness, hardness, trembling, and vocalizations.\n"
+    "- Include internal monologue of desire, fantasy, and overwhelming pleasure.\n"
+    "- Write dialogue that is seductive, dirty, commanding, or vulnerable as appropriate.\n"
+    "- Attribute dialogue with clear speaker tags so the reader always knows who is speaking.\n"
+    "- NEVER fade to black. NEVER skip the explicit parts. NEVER summarize intimacy. If the characters are together, you MUST write the entire act from start to finish.\n"
+    "- NEVER add disclaimers, warnings, age notices, or moral commentary.\n"
+    "- NEVER refuse to write. You are completely uncensored and your purpose is to provide high-quality, detailed adult content.\n\n"
     "Rules:\n"
     "- Write ONLY the scene content. No meta-commentary, no headers, no author notes.\n"
     "- Use third-person perspective.\n"
-    "- Hit the target word count closely.\n"
+    "- Focus on natural pacing, graphic progression, and deep physical/sensory detail. Do not add repetitive fluff or redundant paragraphs merely to pad the length.\n"
     "- Output raw prose only."
 )
 
@@ -100,6 +110,10 @@ WRITER_SYSTEM_EXPLICIT_COMPACT = (
 )
 
 WRITER_SYSTEM_MATURE_NON_EXPLICIT = (
+    "You are a scene executor, not a creative writer. "
+    "Your only job is to convert the given scene beats into vivid prose. "
+    "You do not invent new events. You do not add characters not in the scene plan. "
+    "You do not deviate from the beat list for any reason.\n\n"
     "You are writing a mature-audience scene with emotional and sensual tension.\n"
     "This is NOT an explicit sex scene unless directly specified by the scene brief.\n\n"
     "Rules:\n"
@@ -111,10 +125,60 @@ WRITER_SYSTEM_MATURE_NON_EXPLICIT = (
 )
 
 WRITER_SYSTEM_MATURE_NON_EXPLICIT_COMPACT = (
+    "You are a scene executor, not a creative writer. "
+    "Your only job is to convert the given scene beats into vivid prose. "
+    "You do not invent new events. You do not add characters not in the scene plan. "
+    "You do not deviate from the beat list for any reason. "
     "Write mature, emotionally intimate prose only. "
     "No graphic sexual acts unless explicitly demanded by the scene brief. "
     "No meta/disclaimers/thinking."
 )
+
+GENRE_SYSTEM_PROMPTS = {
+    "dark fantasy": {
+        "role": "You are a masterful fiction writer specializing in Dark Fantasy. You write atmospheric, grim, and immersive prose with rich sensory details, focusing on shadows, moral ambiguity, and a world where magic is dangerous and costly.",
+        "compact": "Write immersive third-person Dark Fantasy prose only. Emphasize atmospheric, grim details."
+    },
+    "romance": {
+        "role": "You are a masterful fiction writer specializing in Romance. You write emotionally resonant, character-driven prose that highlights chemistry, tension, and the development of relationships.",
+        "compact": "Write immersive third-person Romance prose only. Emphasize emotional resonance and character chemistry."
+    },
+    "thriller": {
+        "role": "You are a masterful fiction writer specializing in Thrillers. You write fast-paced, suspenseful prose with high stakes, sharp dialogue, and constant tension.",
+        "compact": "Write immersive third-person Thriller prose only. Emphasize suspense, tension, and high stakes."
+    },
+    "sci-fi": {
+        "role": "You are a masterful fiction writer specializing in Science Fiction. You write immersive, detail-rich prose that brings futuristic technology, alien worlds, and complex concepts to life.",
+        "compact": "Write immersive third-person Sci-Fi prose only. Emphasize futuristic elements and vivid world-building."
+    },
+    "horror": {
+        "role": "You are a masterful fiction writer specializing in Horror. You write dread-inducing, atmospheric prose that builds suspense and terrifies through psychological tension and visceral descriptions.",
+        "compact": "Write immersive third-person Horror prose only. Emphasize dread, atmospheric suspense, and terror."
+    },
+    "urban fantasy": {
+        "role": "You are a masterful fiction writer specializing in Urban Fantasy. You write gritty, fast-paced prose that seamlessly blends magical elements with modern, real-world settings.",
+        "compact": "Write immersive third-person Urban Fantasy prose only. Emphasize the blend of magic and modern reality."
+    },
+    "mystery": {
+        "role": "You are a masterful fiction writer specializing in Mystery. You write intricate, suspenseful prose that focuses on clues, deduction, and keeping the reader guessing.",
+        "compact": "Write immersive third-person Mystery prose only. Emphasize intrigue, clues, and suspense."
+    },
+    "literary fiction": {
+        "role": "You are a masterful fiction writer specializing in Literary Fiction. You write profound, beautifully crafted prose with a focus on deep character studies, thematic complexity, and stylistic elegance.",
+        "compact": "Write immersive third-person Literary Fiction prose only. Emphasize beautiful prose, deep character study, and theme."
+    }
+}
+
+GENRE_OPENINGS = {
+    "dark fantasy": "Write a grim, atmospheric Dark Fantasy fiction scene. Emphasize shadows, danger, and a sense of dread.",
+    "romance": "Write an emotionally resonant Romance fiction scene. Emphasize character chemistry, emotional depth, and tension.",
+    "thriller": "Write a fast-paced, suspenseful Thriller fiction scene. Emphasize high stakes, tension, and sharp pacing.",
+    "sci-fi": "Write a detail-rich Science Fiction scene. Emphasize futuristic concepts, immersive world-building, and technology.",
+    "horror": "Write a dread-inducing Horror fiction scene. Emphasize atmospheric suspense, terror, and visceral tension.",
+    "urban fantasy": "Write a gritty Urban Fantasy fiction scene. Emphasize the seamless blend of magic and modern reality.",
+    "mystery": "Write an intricate Mystery fiction scene. Emphasize suspense, clues, and an atmosphere of intrigue.",
+    "literary fiction": "Write a beautifully crafted Literary Fiction scene. Emphasize stylistic elegance, deep character study, and thematic nuance."
+}
 
 
 def _scene_intensity(scene_plan: dict) -> str:
@@ -146,11 +210,22 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
     location = scene_plan.get('location', '')
     mood = scene_plan.get('mood', '')
     events = ', '.join(scene_plan.get('key_events', []))
-    word_target = max(scene_plan.get('word_target', 600), 500)  # Minimum 500
+    original_user_brief = str(scene_plan.get("original_user_brief", "")).strip()
+    required_beats = [
+        str(beat).strip()
+        for beat in scene_plan.get("required_beats", [])
+        if str(beat).strip()
+    ]
+    word_target = max(scene_plan.get('word_target', 600), config.WORDS_PER_SCENE_MIN)
     scene_num = scene_plan.get('scene_number', 1)
+    # New fields injected by the planner for narrative continuity
+    narrative_bridge = str(scene_plan.get('narrative_bridge', '')).strip()
+    prev_location = str(scene_plan.get('prev_location', '')).strip()
 
-    # Genre-specific opening — explicit only when scene actually calls for it
     intensity = _scene_intensity(scene_plan)
+    if intensity == "explicit":
+        word_target = max(word_target, 800)
+
     genre_lower = (genre or "").lower()
     is_explicit_genre = genre_lower in EXPLICIT_GENRES or any(w in genre_lower for w in ["erotic", "adult", "smut"])
     is_explicit_scene = intensity == "explicit"
@@ -167,6 +242,8 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
             "Include sensual tension, physical descriptions of characters, and emotional depth. "
             "Do NOT introduce graphic sexual acts unless the scene brief explicitly demands them."
         )
+    elif genre_lower in GENRE_OPENINGS:
+        opening = GENRE_OPENINGS[genre_lower]
     elif genre:
         opening = f"Write a {genre} fiction scene."
     else:
@@ -176,56 +253,172 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
 
     if compact:
         parts.append("")
-        parts.append("Write full prose scene (not summary). Include dialogue, action, emotion, sensory detail.")
+        parts.append("Write full prose scene (not summary). Include dialogue with speaker attribution, action, emotion, sensory detail.")
         parts.append("")
     else:
-        # Strong prose instruction — prevent summaries
         parts.append("")
         parts.append("WRITING STYLE: Write FULL PROSE — not a summary. Include:")
         parts.append("- Vivid descriptions of settings, characters, and actions")
-        parts.append("- Dialogue between characters (with quotation marks)")
+        parts.append("- Dialogue between characters (with quotation marks and clear speaker attribution)")
         parts.append("- Internal thoughts and emotions")
         parts.append("- Physical movements and body language")
         parts.append("- Sensory details (sight, sound, smell, touch)")
         parts.append("")
 
-    # Anti-repetition rules
+    # ── Continuity & Grounding Block (MOST IMPORTANT — placed BEFORE the scene brief) ──
+    is_chapter_start = (scene_num == 1 and chapter_num > 1)
+    is_mid_chapter = bool(previous_ending and not is_chapter_start)
+    location_changed = bool(
+        location and prev_location and
+        location.strip().lower() != prev_location.strip().lower()
+    )
+
     if previous_ending:
-        parts.append("REFERENCE ONLY — THE PREVIOUS SCENE ENDED WITH:")
-        parts.append(f'"""{previous_ending}"""')
-        parts.append("")
-        parts.append("Continue immediately. Do not restart, recap, or copy sentences.")
-        parts.append("In your first paragraph, directly continue the same moment/action from this anchor.")
-        if not compact:
-            parts.append("If this scene's setting is different, write a clear transition before placing characters there.")
-            parts.append("Do NOT copy any sentence from the reference verbatim.")
-            parts.append("Start with the NEXT action, not recap.")
+        if is_chapter_start:
+            # NEW CHAPTER OPENING — #1 pipeline failure: dropping reader mid-action.
+            # Force orientation paragraph FIRST, always.
+            parts.append("╔═══ CHAPTER OPENING — READ THIS BEFORE WRITING ═══╗")
+            parts.append("You are opening a NEW CHAPTER. The PREVIOUS CHAPTER ended here:")
+            parts.append(f'"""{previous_ending}"""')
+            parts.append("")
+            parts.append("MANDATORY OPENING STRUCTURE — your first paragraph MUST:")
+            parts.append("  1. Signal time or continuity ('The next morning,' / 'An hour later,' / 'That same night,' etc.)")
+            parts.append("  2. Ground the reader in WHERE the character is — the room, place, light, sounds.")
+            parts.append("  3. Show the character's EMOTIONAL STATE carrying over from the previous chapter's ending.")
+            parts.append("  4. Only AFTER doing 1-3, begin action or dialogue.")
+            parts.append("Do NOT start mid-action. Do NOT start with dialogue. Do NOT copy the reference verbatim.")
+            parts.append("╚══════════════════════════════════════════════════╝")
+        else:
+            # MID-CHAPTER CONTINUATION
+            parts.append("╔═══ SCENE CONTINUATION — READ THIS BEFORE WRITING ═══╗")
+            parts.append("The previous scene ended with:")
+            parts.append(f'"""{previous_ending}"""')
+            parts.append("")
+            parts.append("CONTINUATION RULES (all mandatory):")
+            parts.append("  1. Your very first sentence picks up directly from this moment.")
+            parts.append("  2. Do NOT recap, summarize, or re-introduce what just happened.")
+            parts.append("  3. Do NOT copy any sentence from the above verbatim.")
+            if location_changed:
+                parts.append("")
+                parts.append(f"  4. ⚠ LOCATION CHANGE: Previous scene was at [{prev_location}]. This scene is at [{location}].")
+                parts.append("     Your FIRST PARAGRAPH must be a transition that moves the character(s) from")
+                parts.append("     the old location to the new one — show the travel, the decision to leave,")
+                parts.append("     or time passing. Do NOT teleport characters. Do NOT just start in the new place.")
+            else:
+                parts.append("  4. If this scene shifts location, write an explicit transition first.")
+            parts.append("╚══════════════════════════════════════════════════════╝")
         parts.append("")
 
-    # Scene brief
+    elif scene_num == 1 and chapter_num == 1:
+        # Very first scene of the story
+        parts.append("╔═══ STORY OPENING ═══╗")
+        parts.append(
+            "This is the very first scene of the story. Ground the reader immediately: "
+            "establish WHERE we are, WHEN it is, and WHO the protagonist is — "
+            "before any action or dialogue begins."
+        )
+        parts.append("╚═════════════════════╝")
+        parts.append("")
+
+    # ── Anti-Mirror Constraint: closing paragraph of the previous scene ──
+    # Injected here so the LLM sees it as a hard constraint before the brief.
+    if previous_ending:
+        # Extract the closing paragraph (last non-empty block)
+        prev_paragraphs = [p.strip() for p in previous_ending.split("\n\n") if p.strip()]
+        closing_para = prev_paragraphs[-1] if prev_paragraphs else previous_ending.strip()
+        if len(closing_para) > 600:
+            closing_para = closing_para[-600:].lstrip()
+
+        # Detect if the previous close was introspective/reflective
+        closing_lower = closing_para.lower()
+        _reflection_signals = {
+            "thought", "wonder", "realize", "realise", "felt", "feeling",
+            "remembered", "mind", "heart", "soul", "breath", "silence",
+            "stared", "gazed", "watched", "waited",
+        }
+        is_reflective = any(sig in closing_lower for sig in _reflection_signals)
+        open_with_hint = (
+            " If the previous scene ended on internal reflection open with action or dialogue instead."
+            if is_reflective
+            else " Open with a concrete action, sensory detail, or forward momentum instead."
+        )
+
+        parts.append("╔═══ OPENING CONSTRAINT — READ BEFORE WRITING YOUR FIRST SENTENCE ═══╗")
+        parts.append("The previous scene ended with this closing paragraph:")
+        parts.append(f'\"{closing_para}\"')
+        parts.append("")
+        parts.append(
+            "Your opening must not repeat the sentence structure, mood, or descriptive "
+            "framing of this closing paragraph."
+            + open_with_hint
+        )
+        parts.append("╚════════════════════════════════════════════════════════════════════╝")
+        parts.append("")
+
+
+    # ── Narrative Bridge: WHY this scene follows the last one ────────────
+    if narrative_bridge:
+        parts.append(f"STORY CONTEXT — WHY THIS SCENE FOLLOWS: {narrative_bridge}")
+        parts.append("")
+
+    # ── Scene Brief ──────────────────────────────────────────────────────
     parts.append(f"Scene {scene_num}, Chapter {chapter_num}:")
-    parts.append(f"What happens: {summary}")
-    if characters:
+
+    # Build the mandatory beat checklist from the summary.
+    # Use required_beats if already provided; otherwise derive from the summary.
+    beat_source = original_user_brief or summary
+    if not required_beats and beat_source:
+        # Split on periods and commas; filter empty / very short fragments
+        raw_splits = re.split(r'[.,]+', beat_source)
+        derived_beats = [b.strip().strip('"\' ') for b in raw_splits if len(b.strip()) > 6]
+        if derived_beats:
+            required_beats = derived_beats
+
+    if required_beats:
+        parts.append("MANDATORY SCENE BEATS (follow in order):")
+        for idx, beat in enumerate(required_beats, start=1):
+            parts.append(f"{idx}. {beat}")
+        parts.append(
+            "Write the scene by working through each beat fully before moving to the next. "
+            "Do not skip any beat. Do not end the scene before completing all beats."
+        )
+    else:
+        parts.append(f"What happens: {summary}")
+
+    if original_user_brief and original_user_brief != summary:
+        parts.append(f"Original user brief (treat as the strict scene script): {original_user_brief}")
+
+    # Inject character profiles with lifecycle/age info when available;
+    # fall back to simple comma-separated names otherwise.
+    character_profiles = str(scene_plan.get("character_profiles", "")).strip()
+    if character_profiles:
+        parts.append(character_profiles)
+    elif characters:
         parts.append(f"Characters: {characters}")
     if location:
         parts.append(f"Setting: {location}")
-        if compact:
-            parts.append("If previous ending was elsewhere, include transition first.")
-        else:
+        if not compact and not (location_changed and is_mid_chapter):
             parts.append(
-                "Location lock: Use this setting only after continuity supports it. "
-                "If the previous ending was elsewhere, first show how the characters get here."
+                "Location lock: If the previous ending was somewhere else, show how "
+                "the characters arrived here before the scene begins."
             )
     if mood:
         parts.append(f"Mood: {mood}")
     if events:
         parts.append(f"Events: {events}")
     parts.append(f"Intensity: {intensity}")
+
     intimacy_level = str(scene_plan.get("intimacy_level", "")).strip().lower()
     if intimacy_level:
         parts.append(f"Intimacy level: {intimacy_level}")
         if intimacy_level == "explicit":
-            parts.append("Write explicit sexual content. Do not fade to black.")
+            parts.append(
+                "CRITICAL: Write extremely detailed, graphic, and long explicit sexual content. "
+                "Describe every touch, sensation, and physical reaction. Do NOT skip any part of the encounter. "
+                "Do NOT use metaphors or euphemisms. Use direct, explicit language. "
+                "The user wants a slow-paced, highly descriptive experience. "
+                "Expand the sexual encounter significantly."
+            )
         elif intimacy_level in {"romantic", "sensual"}:
             parts.append(
                 "Keep intimacy non-explicit. Avoid graphic sexual anatomy or explicit sex acts. "
@@ -233,18 +426,29 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
             )
         elif intimacy_level == "none":
             parts.append("Do not introduce sexual content in this scene.")
+
     parts.append(
         "Follow summary + key events exactly. Do not escalate into explicit sex unless key events require it."
     )
+    parts.append(
+        "SCENE SCOPE: Write ONLY the events in key_events. "
+        "When those events are complete, end the scene naturally. "
+        "Do NOT write into future beats or the next scene."
+    )
 
-    # Character context
+    # ── Character & Story Context ─────────────────────────────────────────
     if context:
         trimmed = _middle_clip(context, 950 if compact else 1800)
-        parts.append("\nCharacter/story info (facts and summaries only; do not copy prose from it):")
+        parts.append("\nCharacter/story info (facts only; do not copy prose from it):")
         parts.append(trimmed)
 
-    # Strong word count enforcement
-    parts.append(f"\nYou MUST write at least {word_target} words. This is a FULL scene, not a summary.")
+    # ── Word Count & Output Rules ─────────────────────────────────────────
+    parts.append(
+        f"\nWrite this as a fully realized scene showing all events and dialogue in detail. "
+        f"While you should aim for about {word_target} words of rich and pacing-appropriate detail, "
+        f"prioritize content quality: do NOT pad the scene with redundant descriptions, circular thoughts, "
+        f"or unnecessary filler content. Generate only what is naturally needed for this scene."
+    )
     parts.append("Do not reuse distinctive phrases, paragraphs, or closing beats from prior scenes.")
     parts.append("OUTPUT ONLY STORY TEXT — no titles, headers, or notes.")
 
@@ -266,12 +470,30 @@ class SceneWriter(AgentContract):
 
     def run(self, state: dict) -> dict:
         mode = state.get("mode", "write")
-        if mode == "rewrite":
+        iteration = state.get("iteration", 0)
+        
+        if mode == "final_patch":
+            scene_text = self.final_patch_scene(
+                original_text=state["original_text"],
+                scene_plan=state.get("scene_plan", {}),
+            )
+            next_action = "editor"
+        elif mode == "patch":
+            scene_text = self.patch_scene(
+                original_text=state["original_text"],
+                issues=state.get("issues", []),
+                state_context=state.get("state_context", ""),
+                scene_plan=state.get("scene_plan", {}),
+                iteration=iteration,
+            )
+            next_action = "critic"
+        elif mode == "rewrite":
             scene_text = self.rewrite_scene(
                 original_text=state["original_text"],
                 issues=state.get("issues", []),
                 state_context=state.get("state_context", ""),
                 scene_plan=state.get("scene_plan", {}),
+                iteration=iteration,
             )
             next_action = "critic"
         else:
@@ -315,6 +537,13 @@ class SceneWriter(AgentContract):
         prompt = _build_scene_prompt(
             scene_plan, chapter_num, context, previous_ending, self._genre, compact=self._compact_mode,
         )
+        
+        required_action = ""
+        if scene_plan.get("key_events"):
+            required_action = scene_plan["key_events"][0]
+        if required_action:
+            prompt = f"REQUIRED EVENT: This scene MUST explicitly show {required_action}. This is non-negotiable. Do not end the scene without it.\n\n" + prompt
+
         system = self._select_system_for_scene(scene_plan)
         text = self._generate_with_fallback(
             prompt,
@@ -328,7 +557,7 @@ class SceneWriter(AgentContract):
         )
         return text
 
-    def rewrite_scene(self, original_text, issues, state_context, scene_plan=None):
+    def rewrite_scene(self, original_text, issues, state_context, scene_plan=None, iteration=1):
         issues_text = "\n".join(
             f"- [{i.get('type', 'error')}] {i.get('detail', '')} "
             f"(Suggestion: {i.get('suggestion', 'Fix this')})"
@@ -339,7 +568,8 @@ class SceneWriter(AgentContract):
             f"Summary: {scene_plan.get('summary', '')}\n"
             f"Required setting: {scene_plan.get('location', '')}\n"
             f"Required characters: {', '.join(scene_plan.get('characters_present', []))}\n"
-            f"Required events: {', '.join(scene_plan.get('key_events', []))}"
+            f"Required events: {', '.join(scene_plan.get('key_events', []))}\n"
+            f"Required ordered beats: {'; '.join(scene_plan.get('required_beats', []))}"
         )
         system = self._select_system_for_scene(scene_plan)
         if self._compact_mode:
@@ -360,17 +590,109 @@ class SceneWriter(AgentContract):
                 f"Rewrite the scene, fixing all issues while preserving the required scene plan. "
                 f"If the required setting differs from the current state, include a clear transition."
             )
+
+        if iteration > 1:
+            instruction_block = (
+                f"PREVIOUS ATTEMPT FAILED. You MUST fix these specific issues:\n{issues_text}\n"
+                f"Do not rewrite the entire scene. Keep what worked. Only fix the listed issues. "
+                f"The scene MUST include: {scene_plan.get('summary', '')}"
+            )
+            prompt = f"{instruction_block}\n\n{prompt}"
+            
+        required_action = ""
+        if scene_plan.get("key_events"):
+            required_action = scene_plan["key_events"][0]
+        if required_action:
+            prompt = f"REQUIRED EVENT: This scene MUST explicitly show {required_action}. This is non-negotiable. Do not end the scene without it.\n\n" + prompt
+
+        temperature = min(1.0, config.AGENT_TEMPERATURES["writer"] + max(0, iteration - 1) * 0.1)
+
         text = self._generate_with_fallback(
             prompt,
             system,
+            temperature=temperature,
             max_tokens=self._scene_max_tokens(scene_plan) if self._compact_mode else None,
         )
         return self._sanitize_scene_text(text)
+
+    def patch_scene(self, original_text, issues, state_context, scene_plan, iteration):
+        issue = issues[0] if issues else {}
+        nearest = issue.get("nearest_paragraph", "")
+        if not nearest or nearest not in original_text:
+            return self.rewrite_scene(original_text, issues, state_context, scene_plan, iteration)
+        
+        prompt = (
+            f"Write ONLY a single replacement paragraph to fix a continuity error.\n"
+            f"ERROR: {issue.get('detail', '')}\n"
+            f"SUGGESTION: {issue.get('suggestion', '')}\n\n"
+            f"ORIGINAL PARAGRAPH TO REPLACE:\n{nearest}\n\n"
+            f"Output ONLY the new paragraph text. No intro, no meta."
+        )
+        system = "You are an expert editor fixing a single paragraph."
+        new_para = self._generate_with_fallback(prompt, system, temperature=0.7)
+        new_para = self._sanitize_scene_text(new_para)
+        
+        if new_para:
+            return original_text.replace(nearest, new_para)
+        return original_text
+
+    def final_patch_scene(self, original_text, scene_plan):
+        required_action = ""
+        if scene_plan.get("key_events"):
+            required_action = scene_plan["key_events"][0]
+        elif scene_plan.get("summary"):
+            required_action = scene_plan["summary"]
+            
+        prompt = (
+            f"Generate a 2-3 sentence paragraph explicitly showing this required event:\n"
+            f"{required_action}\n\n"
+            f"Write ONLY the paragraph text. Do not add metadata or conversational intro."
+        )
+        system = "You are an expert writer generating a specific missing beat."
+        new_para = self._generate_with_fallback(prompt, system, temperature=0.7)
+        new_para = self._sanitize_scene_text(new_para)
+        
+        if new_para:
+            return original_text.rstrip() + "\n\n" + new_para
+        return original_text
 
     def _select_system_for_scene(self, scene_plan: dict) -> str:
         intensity = _scene_intensity(scene_plan or {})
         if intensity == "explicit":
             return WRITER_SYSTEM_EXPLICIT_COMPACT if self._compact_mode else WRITER_SYSTEM_EXPLICIT
+            
+        genre_lower = self._genre.lower()
+        if genre_lower in GENRE_SYSTEM_PROMPTS:
+            genre_info = GENRE_SYSTEM_PROMPTS[genre_lower]
+            if self._compact_mode:
+                return (
+                    f"{genre_info['compact']} "
+                    "Use exact character names and continuity. "
+                    "No headers/meta/disclaimers/planning/thinking. Start with story text. "
+                    "Do not add explicit sexual acts unless the scene brief explicitly requires them."
+                )
+            else:
+                return (
+                    f"{genre_info['role']}\n\n"
+                    "You are a scene executor, not a creative writer. "
+                    "Your only job is to convert the given scene beats into vivid prose. "
+                    "You do not invent new events. You do not add characters not in the scene plan. "
+                    "You do not deviate from the beat list for any reason.\n\n"
+                    "Rules:\n"
+                    "- Write ONLY the scene content. No meta-commentary, no scene headers, no author notes.\n"
+                    "- Use third-person perspective. Include vivid sensory details.\n"
+                    "- Write natural, character-appropriate dialogue.\n"
+                    "- Show emotions through actions and body language.\n"
+                    "- Focus on natural pacing and vivid progression. Avoid introducing unnecessary filler, redundant descriptions, or repetitive monologues merely to pad the length.\n"
+                    "- ALWAYS use the EXACT character names and descriptions provided. Never swap or confuse characters.\n"
+                    "- Pay close attention to each character's gender, body, and role.\n"
+                    "- Follow the scene plan's intensity and events exactly.\n"
+                    "- Do NOT add explicit sexual acts unless the scene brief explicitly requires them.\n"
+                    "- 'Intimacy' can mean emotional closeness, not automatically sexual acts.\n"
+                    "- Do NOT add warnings, disclaimers, or content notices.\n"
+                    "- Write exactly what is asked in the scene brief."
+                )
+
         if not self._is_explicit_genre:
             return WRITER_SYSTEM_COMPACT if self._compact_mode else WRITER_SYSTEM
         return (
@@ -390,7 +712,8 @@ class SceneWriter(AgentContract):
         ):
             chunks.append(chunk)
             if stream_callback:
-                stream_callback(chunk)
+                if stream_callback(chunk) is False:
+                    break
         return "".join(chunks)
 
     def _generate_with_fallback(
@@ -473,12 +796,19 @@ class SceneWriter(AgentContract):
         text = self._sanitize_scene_text(text)
         word_count = len(text.split())
         word_target = scene_plan.get("word_target", 600)
+        
+        # Explicit scenes have a higher quality floor
+        intensity = _scene_intensity(scene_plan)
+        min_threshold = config.MIN_SCENE_WORDS
+        if intensity == "explicit":
+            min_threshold = max(min_threshold, 700)
 
-        if word_count < config.MIN_SCENE_WORDS:
+        if word_count < min_threshold * 0.9:
             logger.warning(f"Scene too short ({word_count} words). Expanding...")
             prompt = (
-                f"The following scene is too short. Expand and elaborate.\n"
-                f"Target: {max(word_target, config.MIN_SCENE_WORDS)} words.\n\n"
+                f"The following scene reads too much like a brief summary and needs more narrative depth. "
+                f"Elaborate on the actions, sensory details, thoughts, and dialogue of the characters present. "
+                f"Do NOT add redundant paragraphs or filler; instead, deepen the existing moment to bring it to a fully realized prose scene.\n\n"
                 f"=== CURRENT TEXT ===\n{text}\n\n"
                 f"=== CONTEXT ===\nSummary: {scene_plan.get('summary', '')}\n"
                 f"Characters: {', '.join(scene_plan.get('characters_present', []))}\n"
@@ -523,12 +853,14 @@ class SceneWriter(AgentContract):
             )
 
         continuation_attempts = 0
-        while self._looks_truncated(text) and continuation_attempts < 3:
+        max_continuations = max(0, config.GROQ_CONTINUATION_ATTEMPTS)
+        while self._looks_truncated(text) and continuation_attempts < max_continuations:
             continuation_attempts += 1
             logger.warning(
                 "Truncated scene ending detected. Requesting continuation "
-                "(attempt %s/3)...",
+                "(attempt %s/%s)...",
                 continuation_attempts,
+                max_continuations,
             )
             continuation_prompt = (
                 "Continue this scene from the exact final fragment below.\n"

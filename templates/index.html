@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Multi-Agent Story Generation Pipeline — AI-powered long-form narrative creation with memory and consistency">
     <title>Story Teller — AI Story Generation</title>
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=3">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖊️</text></svg>">
 </head>
 <body>
@@ -22,9 +22,7 @@
                 </div>
             </div>
             <div class="header-actions">
-                <select class="form-select" id="modelSelect" onchange="switchModel(this.value)" title="AI backend/model" style="width:auto;font-size:0.8rem;padding:4px 8px">
-                    <option>Loading models...</option>
-                </select>
+                <button class="btn btn-sm" onclick="switchView('settings')" title="Settings">⚙️ Settings</button>
                 <button class="btn btn-sm" id="btnRefresh" onclick="loadProjects()" title="Refresh">🔄 Refresh</button>
             </div>
         </header>
@@ -39,6 +37,8 @@
             <button class="nav-tab hidden" data-view="logs" onclick="switchView('logs')" id="tabLogs">📋 Logs</button>
             <button class="nav-tab hidden" data-view="state" onclick="switchView('state')" id="tabState">🧠 State</button>
             <button class="nav-tab hidden" data-view="combine" onclick="switchView('combine')" id="tabCombine">📦 Combine</button>
+            <button class="nav-tab hidden" data-view="edit" onclick="switchView('edit')" id="tabEdit">✏️ Edit Story</button>
+            <button class="nav-tab" data-view="settings" onclick="switchView('settings')">⚙️ Settings</button>
         </nav>
 
         <!-- Dashboard View -->
@@ -111,6 +111,60 @@
                     <div class="mt-4">
                         <button class="btn btn-primary" onclick="createProject()" id="btnCreateProject">
                             🚀 Create Project
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Edit Project View -->
+        <div class="view" id="viewEdit">
+            <div class="create-form">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">✏️</span> Edit Story Details</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Title</label>
+                        <input class="form-input" id="editTitle">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Genre</label>
+                        <input class="form-input" id="editGenre">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Premise</label>
+                        <textarea class="form-textarea" id="editPremise" rows="3"></textarea>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Setting</label>
+                        <input class="form-input" id="editSetting">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Themes (comma-separated)</label>
+                        <input class="form-input" id="editThemes">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Add/Update Character</label>
+                        <div class="flex gap-2">
+                            <input class="form-input" id="editCharName" placeholder="Name" style="flex:1">
+                            <input class="form-input" id="editCharDesc" placeholder="Description" style="flex:2">
+                            <input class="form-input" id="editCharTraits" placeholder="Traits (comma-sep)" style="flex:1.5">
+                            <button class="btn btn-sm" onclick="addEditCharacter()">+ Add/Update</button>
+                        </div>
+                        <div class="text-sm text-dim mt-2" style="margin-bottom:8px">Note: This only updates the definition. Existing plot occurrences will remain in the text.</div>
+                        <div class="character-list" id="editCharacterList"></div>
+                    </div>
+
+                    <div class="mt-4">
+                        <button class="btn btn-primary" onclick="saveProjectEdits()" id="btnSaveEdits">
+                            💾 Save Changes
                         </button>
                     </div>
                 </div>
@@ -345,11 +399,30 @@
                     <div class="card-header">
                         <span class="card-title"><span class="icon">📦</span> Combine & Polish with Gemini</span>
                     </div>
-                    <p class="combine-desc">
-                        Concatenate all chapters into a single document and send it to <strong>Google Gemini</strong>
-                        for continuity analysis, character consistency checks, and narrative polish.
-                        The large context window processes your entire story in one pass.
-                    </p>
+                    <!-- Polished Story History -->
+                    <div class="form-group mb-4" id="combineVersionsContainer" style="margin-bottom: 16px;">
+                        <label class="form-label" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
+                            <span>Polished Story History (Oldest to Newest)</span>
+                            <div class="flex gap-2">
+                                <button class="btn btn-sm" id="btnRenameVersion" onclick="renameSelectedVersion()" title="Rename selected version" style="padding: 2px 8px; font-size: 0.8rem;">✎ Rename</button>
+                                <button class="btn btn-sm btn-danger" id="btnDeleteVersion" onclick="deleteSelectedVersion()" title="Delete selected version" style="padding: 2px 8px; font-size: 0.8rem;">🗑️ Delete</button>
+                            </div>
+                        </label>
+                        <select class="form-select" id="combineVersionSelect" onchange="changeCombineVersion()">
+                            <option value="">No versions available</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group mb-4" style="margin-bottom: 16px;">
+                        <label class="form-label" for="combineModelSelect">Gemini Model for Combine & Polish</label>
+                        <select class="form-select" id="combineModelSelect">
+                            <option value="gemini-2.5-flash-lite" selected>✨ Gemini 2.5 Flash Lite (default, fast & balanced)</option>
+                            <option value="gemini-2.5-flash">⚡ Gemini 2.5 Flash (high speed & instruction following)</option>
+                            <option value="gemini-2.5-pro">🧠 Gemini 2.5 Pro (maximum reasoning & precision)</option>
+                            <option value="gemini-1.5-flash">⚡ Gemini 1.5 Flash (legacy fast)</option>
+                            <option value="gemini-1.5-pro">🧠 Gemini 1.5 Pro (legacy reasoning)</option>
+                        </select>
+                    </div>
 
                     <div class="combine-actions" id="combineActions">
                         <button class="btn btn-gemini" onclick="startCombine()" id="btnCombine">
@@ -405,6 +478,313 @@
                 </div>
             </div>
         </div>
+
+        <!-- Settings View -->
+        <div class="view" id="viewSettings">
+            <div class="settings-container">
+                <div class="card settings-hero">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">⚙️</span> Runtime Settings</span>
+                        <div class="flex gap-2">
+                            <button class="btn btn-sm" onclick="loadSettings()">🔄 Reload</button>
+                            <button class="btn btn-primary" onclick="saveSettings()" id="btnSaveSettings">💾 Save Settings</button>
+                        </div>
+                    </div>
+                    <div class="settings-summary" id="settingsSummary">Loading settings...</div>
+                </div>
+
+                <div class="settings-grid">
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Backend Mode</span>
+                        </div>
+                        <div class="settings-mode-grid" id="settingsBackendMode">
+                            <label class="settings-mode">
+                                <input type="radio" name="backendMode" value="local">
+                                <span>
+                                    <strong>Local only</strong>
+                                    <small>All agents use llama.cpp. Slowest on CPU, no cloud limits.</small>
+                                </span>
+                            </label>
+                            <label class="settings-mode">
+                                <input type="radio" name="backendMode" value="hybrid">
+                                <span>
+                                    <strong>Hybrid</strong>
+                                    <small>Groq writer, local planner/critic/editor. Best balance.</small>
+                                </span>
+                            </label>
+                            <label class="settings-mode">
+                                <input type="radio" name="backendMode" value="groq">
+                                <span>
+                                    <strong>Full Groq</strong>
+                                    <small>Every agent uses Groq. Fast but most likely to rate-limit.</small>
+                                </span>
+                            </label>
+                            <label class="settings-mode">
+                                <input type="radio" name="backendMode" value="gemini">
+                                <span>
+                                    <strong>Full Gemini</strong>
+                                    <small>Every agent uses Google Gemini. High quality, generous free tier.</small>
+                                </span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Model Selection</span>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Active local model</label>
+                            <select class="form-select" id="settingsActiveModel"></select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Local model path</label>
+                            <input class="form-input" id="setting_LLAMA_MODEL_PATH" data-setting="LLAMA_MODEL_PATH" placeholder="/path/to/model.gguf">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Models folder</label>
+                            <input class="form-input" id="setting_LLAMA_MODELS_DIR" data-setting="LLAMA_MODELS_DIR" placeholder="/path/to/models">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Prompt template</label>
+                            <select class="form-select" id="setting_LLAMA_PROMPT_TEMPLATE" data-setting="LLAMA_PROMPT_TEMPLATE">
+                                <option value="mistral">Mistral / INST</option>
+                                <option value="llama3">Llama 3</option>
+                                <option value="chatml">ChatML</option>
+                                <option value="plain">Plain</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">API Keys</span>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Groq primary key</label>
+                            <input class="form-input" id="setting_GROQ_API_KEY" data-setting="GROQ_API_KEY" placeholder="gsk_...">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Groq key rotation list</label>
+                            <textarea class="form-textarea" id="setting_GROQ_API_KEYS" data-setting="GROQ_API_KEYS" rows="3" placeholder="gsk_1,gsk_2,gsk_3"></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Gemini API key</label>
+                            <input class="form-input" id="setting_GEMINI_API_KEY" data-setting="GEMINI_API_KEY" placeholder="AIza...">
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Cloud Models</span>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Groq model</label>
+                            <select class="form-select" id="setting_GROQ_MODEL" data-setting="GROQ_MODEL">
+                                <optgroup label="Alibaba Cloud">
+                                    <option value="qwen/qwen3-32b">qwen/qwen3-32b</option>
+                                </optgroup>
+                                <optgroup label="Canopy Labs">
+                                    <option value="canopylabs/orpheus-arabic-saudi">canopylabs/orpheus-arabic-saudi</option>
+                                    <option value="canopylabs/orpheus-v1-english">canopylabs/orpheus-v1-english</option>
+                                </optgroup>
+                                <optgroup label="Groq">
+                                    <option value="groq/compound">groq/compound</option>
+                                    <option value="groq/compound-mini">groq/compound-mini</option>
+                                </optgroup>
+                                <optgroup label="Meta">
+                                    <option value="llama-3.1-8b-instant">llama-3.1-8b-instant</option>
+                                    <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile</option>
+                                    <option value="meta-llama/llama-4-scout-17b-16e-instruct">meta-llama/llama-4-scout-17b-16e-instruct</option>
+                                    <option value="meta-llama/llama-prompt-guard-2-22m">meta-llama/llama-prompt-guard-2-22m</option>
+                                    <option value="meta-llama/llama-prompt-guard-2-86m">meta-llama/llama-prompt-guard-2-86m</option>
+                                </optgroup>
+                                <optgroup label="OpenAI">
+                                    <option value="openai/gpt-oss-120b">openai/gpt-oss-120b</option>
+                                    <option value="openai/gpt-oss-20b">openai/gpt-oss-20b</option>
+                                    <option value="openai/gpt-oss-safeguard-20b">openai/gpt-oss-safeguard-20b</option>
+                                    <option value="whisper-large-v3">whisper-large-v3</option>
+                                    <option value="whisper-large-v3-turbo">whisper-large-v3-turbo</option>
+                                </optgroup>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Gemini model</label>
+                            <input class="form-input" id="setting_GEMINI_MODEL" data-setting="GEMINI_MODEL" placeholder="gemini-2.5-flash-lite">
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Cloud max tokens</label>
+                                <input class="form-input" type="number" id="setting_CLOUD_MAX_TOKENS" data-setting="CLOUD_MAX_TOKENS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Temperature</label>
+                                <input class="form-input" type="number" step="0.05" id="setting_CLOUD_TEMPERATURE" data-setting="CLOUD_TEMPERATURE">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Top P</label>
+                                <input class="form-input" type="number" step="0.05" id="setting_CLOUD_TOP_P" data-setting="CLOUD_TOP_P">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Local Performance</span>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">GPU layers</label>
+                                <input class="form-input" type="number" id="setting_LLAMA_N_GPU_LAYERS" data-setting="LLAMA_N_GPU_LAYERS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Batch</label>
+                                <input class="form-input" type="number" id="setting_LLAMA_N_BATCH" data-setting="LLAMA_N_BATCH">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Threads</label>
+                                <input class="form-input" type="number" id="setting_LLAMA_N_THREADS" data-setting="LLAMA_N_THREADS">
+                            </div>
+                        </div>
+                        <label class="settings-check">
+                            <input type="checkbox" id="setting_LLAMA_F16_KV" data-setting="LLAMA_F16_KV">
+                            <span>Use F16 KV cache</span>
+                        </label>
+                        <div class="settings-field-row mt-4">
+                            <div class="form-group">
+                                <label class="form-label">Context tokens</label>
+                                <input class="form-input" type="number" id="setting_LOCAL_NUM_CTX" data-setting="LOCAL_NUM_CTX">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Local max tokens</label>
+                                <input class="form-input" type="number" id="setting_LOCAL_MAX_TOKENS" data-setting="LOCAL_MAX_TOKENS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Structured max</label>
+                                <input class="form-input" type="number" id="setting_LOCAL_STRUCTURED_MAX_TOKENS" data-setting="LOCAL_STRUCTURED_MAX_TOKENS">
+                            </div>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Local temperature</label>
+                                <input class="form-input" type="number" step="0.05" id="setting_LOCAL_TEMPERATURE" data-setting="LOCAL_TEMPERATURE">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Local top P</label>
+                                <input class="form-input" type="number" step="0.05" id="setting_LOCAL_TOP_P" data-setting="LOCAL_TOP_P">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Groq Rate Limits</span>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Min request interval</label>
+                                <input class="form-input" type="number" step="0.5" id="setting_GROQ_MIN_REQUEST_INTERVAL" data-setting="GROQ_MIN_REQUEST_INTERVAL">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Retry buffer</label>
+                                <input class="form-input" type="number" step="0.5" id="setting_GROQ_RATE_LIMIT_BUFFER" data-setting="GROQ_RATE_LIMIT_BUFFER">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Continuations</label>
+                                <input class="form-input" type="number" min="0" max="5" id="setting_GROQ_CONTINUATION_ATTEMPTS" data-setting="GROQ_CONTINUATION_ATTEMPTS">
+                            </div>
+                        </div>
+                        <label class="settings-check">
+                            <input type="checkbox" id="setting_GROQ_ROTATE_ON_RATE_LIMIT" data-setting="GROQ_ROTATE_ON_RATE_LIMIT">
+                            <span>Rotate Groq keys aggressively on 429</span>
+                        </label>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Story Generation</span>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Scene words min</label>
+                                <input class="form-input" type="number" id="setting_WORDS_PER_SCENE_MIN" data-setting="WORDS_PER_SCENE_MIN">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Scene words max</label>
+                                <input class="form-input" type="number" id="setting_WORDS_PER_SCENE_MAX" data-setting="WORDS_PER_SCENE_MAX">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Min accepted words</label>
+                                <input class="form-input" type="number" id="setting_MIN_SCENE_WORDS" data-setting="MIN_SCENE_WORDS">
+                            </div>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Scene iterations</label>
+                                <input class="form-input" type="number" id="setting_MAX_SCENE_ITERATIONS" data-setting="MAX_SCENE_ITERATIONS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Pipeline steps</label>
+                                <input class="form-input" type="number" id="setting_MAX_PIPELINE_STEPS" data-setting="MAX_PIPELINE_STEPS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Token budget</label>
+                                <input class="form-input" type="number" id="setting_MAX_TOKEN_BUDGET" data-setting="MAX_TOKEN_BUDGET">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">Retrieval & App</span>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Retrieval chunks</label>
+                                <input class="form-input" type="number" id="setting_TOP_K_RETRIEVAL" data-setting="TOP_K_RETRIEVAL">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Context budget</label>
+                                <input class="form-input" type="number" id="setting_CONTEXT_TOKEN_BUDGET" data-setting="CONTEXT_TOKEN_BUDGET">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">SSE queue size</label>
+                                <input class="form-input" type="number" id="setting_SSE_QUEUE_MAXSIZE" data-setting="SSE_QUEUE_MAXSIZE">
+                            </div>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Retry base delay</label>
+                                <input class="form-input" type="number" step="0.5" id="setting_RETRY_BASE_DELAY" data-setting="RETRY_BASE_DELAY">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Retry max delay</label>
+                                <input class="form-input" type="number" step="0.5" id="setting_RETRY_MAX_DELAY" data-setting="RETRY_MAX_DELAY">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Backoff factor</label>
+                                <input class="form-input" type="number" step="0.1" id="setting_RETRY_BACKOFF_FACTOR" data-setting="RETRY_BACKOFF_FACTOR">
+                            </div>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Flask host</label>
+                                <input class="form-input" id="setting_FLASK_HOST" data-setting="FLASK_HOST">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Flask port</label>
+                                <input class="form-input" type="number" id="setting_FLASK_PORT" data-setting="FLASK_PORT">
+                            </div>
+                            <label class="settings-check settings-check-inline">
+                                <input type="checkbox" id="setting_FLASK_DEBUG" data-setting="FLASK_DEBUG">
+                                <span>Debug reload</span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Status Bar -->
@@ -418,6 +798,6 @@
         </div>
     </div>
 
-    <script src="/static/js/app.js?v=2"></script>
+    <script src="/static/js/app.js?v=3"></script>
 </body>
 </html>

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 import config
@@ -167,7 +168,7 @@ class LlamaCPP(LLMInterface):
         user_text = (prompt or "").strip()
 
         if self.prompt_template == "llama3":
-            parts = ["<|begin_of_text|>"]
+            parts = []
             if system_text:
                 parts.append(
                     "<|start_header_id|>system<|end_header_id|>\n\n"
@@ -261,8 +262,29 @@ class LlamaCPP(LLMInterface):
             max_tokens=max_tokens,
             stream=False,
         )
+        started = time.time()
+        logger.info(
+            "llama.cpp generation started",
+            extra={
+                "model": self.model,
+                "prompt_chars": len(str(kwargs.get("prompt", ""))),
+                "max_tokens": kwargs.get("max_tokens"),
+                "temperature": kwargs.get("temperature"),
+            },
+        )
         with self.inference_lock:
             response = self.llm(**kwargs)
+        elapsed = time.time() - started
+        usage = response.get("usage", {})
+        logger.info(
+            "llama.cpp generation finished",
+            extra={
+                "model": self.model,
+                "elapsed_seconds": round(elapsed, 2),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+            },
+        )
         choice = (response.get("choices") or [{}])[0]
         content = choice.get("text", "")
         if not content.strip():

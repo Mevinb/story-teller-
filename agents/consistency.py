@@ -2,6 +2,7 @@
 Consistency Engine — Post-generation validator.
 Compares generated text against the structured state to detect
 character contradictions, timeline errors, and logical conflicts.
+Also performs a second premise-alignment pass to catch drift.
 Runs on local model for cheap validation.
 """
 import logging
@@ -67,7 +68,8 @@ VALIDATE_PROMPT = (
     '            "detail": "What the inconsistency is",\n'
     '            "severity": "high|medium|low",\n'
     '            "blocking": true/false,\n'
-    '            "suggestion": "How to fix it"\n'
+    '            "suggestion": "How to fix it",\n'
+    '            "nearest_paragraph": "Exact sentence/paragraph from the prose where the missing event should have occurred (if applicable)"\n'
     '        }}\n'
     '    ],\n'
     '    "state_updates": {{\n'
@@ -90,7 +92,54 @@ VALIDATE_PROMPT_COMPACT = (
     "Check: character, relationship, location, timeline, logic contradictions. "
     "Required key events must happen on-page; aftermath-only scenes for required events are blocking logic errors. "
     "If emotional/personality/sexual status changes are shown in-scene, treat as state_updates (non-blocking). "
-    "Return JSON: is_consistent, issues[{{type,detail,severity,blocking,suggestion}}], state_updates."
+    "Return JSON: is_consistent, issues[{{type,detail,severity,blocking,suggestion,nearest_paragraph}}], state_updates."
+)
+
+# ── Premise Alignment Pass ──────────────────────────────────────────────────
+PREMISE_ALIGNMENT_SYSTEM = (
+    "You are a Premise Alignment Auditor. Your ONLY job is to verify that a "
+    "generated scene stays within the boundaries of the active story premise steps.\n"
+    "You do NOT check prose quality or character consistency — only premise adherence.\n"
+    "ALWAYS respond with ONLY valid JSON."
+)
+
+PREMISE_ALIGNMENT_PROMPT = (
+    "Audit this scene for premise alignment.\n\n"
+    "=== ACTIVE PREMISE STEPS (allowed content for this chapter) ===\n{allowed_steps}\n\n"
+    "=== FORBIDDEN FUTURE STEPS (must NOT appear yet) ===\n{forbidden_steps}\n\n"
+    "=== CURRENT NARRATIVE PHASE ===\n{narrative_phase}\n"
+    "=== EMOTIONAL INTENSITY TARGET ===\n{intensity_target}/1.0\n\n"
+    "=== GENERATED SCENE TEXT ===\n{scene_text}\n\n"
+    "=== AUDIT QUESTIONS ===\n"
+    "1. Does this scene serve an ALLOWED premise step? "
+    "If not, identify which forbidden future step it resembles.\n"
+    "2. Has any FORBIDDEN future step leaked into the prose? "
+    "Quote the specific passage if yes.\n"
+    "3. Is the emotional intensity appropriate for the current narrative phase "
+    "(not peaking too early, not too flat for a climax)?\n\n"
+    "Respond with this JSON:\n"
+    '{{\n'
+    '    "premise_aligned": true/false,\n'
+    '    "violations": [\n'
+    '        {{\n'
+    '            "type": "future_step_leak|wrong_premise_step|intensity_mismatch",\n'
+    '            "detail": "What specifically is wrong",\n'
+    '            "quoted_passage": "The exact sentence from the scene causing the issue",\n'
+    '            "suggestion": "How the writer should fix it"\n'
+    '        }}\n'
+    '    ]\n'
+    '}}'
+)
+
+PREMISE_ALIGNMENT_PROMPT_COMPACT = (
+    "Audit scene for premise alignment.\n\n"
+    "ALLOWED STEPS:\n{allowed_steps}\n"
+    "FORBIDDEN STEPS:\n{forbidden_steps}\n"
+    "PHASE: {narrative_phase} | INTENSITY TARGET: {intensity_target}/1.0\n"
+    "SCENE:\n{scene_text}\n\n"
+    "Return JSON: premise_aligned (bool), "
+    "violations[{{type, detail, quoted_passage, suggestion}}]. "
+    "Types: future_step_leak|wrong_premise_step|intensity_mismatch"
 )
 
 
@@ -98,6 +147,7 @@ class ConsistencyEngine(AgentContract):
     """
     Validates generated scenes against the structured state.
     This is a validator, not a generator — it checks for factual errors.
+    Runs two passes: internal consistency + premise alignment.
     """
 
     def __init__(self, model: LLMInterface):
@@ -143,13 +193,29 @@ class ConsistencyEngine(AgentContract):
             "next_action": "decision" if has_blocking else "editor",
         }
 
-    def validate(self, scene_text: str, state_context: str, scene_plan: dict = None) -> dict:
+    def validate(
+        self,
+        scene_text: str,
+        state_context: str,
+        scene_plan: dict = None,
+        allowed_steps: list = None,
+        forbidden_steps: list = None,
+        narrative_phase: str = "",
+        intensity_target: float = 0.5,
+    ) -> dict:
         """
-        Validate a scene against the current state.
+        Validate a scene against the current state (pass 1: internal consistency)
+        then against the active premise window (pass 2: premise alignment).
+        Then run pass 3: deterministic beat-presence check against scene.summary.
 
         Args:
             scene_text: The generated prose to validate
             state_context: Context from the Retriever (state + past content)
+            scene_plan: The intended scene plan
+            allowed_steps: Premise steps permitted this chapter
+            forbidden_steps: Premise steps that must not appear yet
+            narrative_phase: Current story phase label
+            intensity_target: Expected emotional intensity 0.0–1.0
 
         Returns:
             Validation report dict with is_consistent, issues, state_updates
@@ -246,7 +312,196 @@ class ConsistencyEngine(AgentContract):
         else:
             result["is_consistent"] = True
 
+        # ── Pass 2: Premise alignment ──────────────────────────────────────
+        if allowed_steps is not None or forbidden_steps is not None:
+            alignment_issues = self._check_premise_alignment(
+                scene_text=scene_text,
+                allowed_steps=allowed_steps or [],
+                forbidden_steps=forbidden_steps or [],
+                narrative_phase=narrative_phase or "unknown",
+                intensity_target=intensity_target,
+            )
+            if alignment_issues:
+                result["issues"].extend(alignment_issues)
+                result["is_consistent"] = False
+                logger.warning(
+                    "Premise alignment check found %d blocking violation(s).",
+                    len(alignment_issues),
+                )
+
+        # ── Pass 3: Deterministic beat-presence check ────────────────────
+        # This is a completion gate: the scene cannot pass as consistent until
+        # every beat from the summary checklist is confirmed present in the prose.
+        beat_issues = self._check_beat_presence(scene_text, scene_plan or {})
+        if beat_issues:
+            result["issues"].extend(beat_issues)
+            # Completion gate: force is_consistent False regardless of LLM verdict
+            result["is_consistent"] = False
+            logger.warning(
+                "Beat-presence check found %d missing beat(s). Scene blocked until all beats present.",
+                len(beat_issues),
+            )
+
         return result
+
+    def _check_premise_alignment(
+        self,
+        scene_text: str,
+        allowed_steps: list,
+        forbidden_steps: list,
+        narrative_phase: str,
+        intensity_target: float,
+    ) -> list:
+        """
+        Run the premise-alignment LLM pass. Returns a list of blocking issues
+        (empty list = scene is aligned).
+        """
+        scene_text_limit = 1600 if self._compact_mode else 3000
+        allowed_text = "\n".join(f"- {s}" for s in allowed_steps) or "(none specified)"
+        forbidden_text = "\n".join(f"- {s}" for s in forbidden_steps) or "(none specified)"
+
+        template = PREMISE_ALIGNMENT_PROMPT_COMPACT if self._compact_mode else PREMISE_ALIGNMENT_PROMPT
+        prompt = template.format(
+            scene_text=scene_text[:scene_text_limit],
+            allowed_steps=allowed_text,
+            forbidden_steps=forbidden_text,
+            narrative_phase=narrative_phase,
+            intensity_target=round(intensity_target, 2),
+        )
+
+        schema = {
+            "type": "object",
+            "properties": {
+                "premise_aligned": {"type": "boolean"},
+                "violations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string"},
+                            "detail": {"type": "string"},
+                            "quoted_passage": {"type": "string"},
+                            "suggestion": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "required": ["premise_aligned", "violations"],
+        }
+
+        try:
+            response = self.model.generate_with_retry(
+                prompt=prompt,
+                system=PREMISE_ALIGNMENT_SYSTEM,
+                schema=schema,
+                temperature=config.AGENT_TEMPERATURES["critic"],
+                max_tokens=600 if self._compact_mode else None,
+            )
+            result = response.as_json()
+        except Exception as exc:
+            logger.warning("Premise alignment check failed: %s", exc)
+            return []
+
+        if not isinstance(result, dict):
+            return []
+        if result.get("premise_aligned", True):
+            return []
+
+        blocking_issues = []
+        for v in (result.get("violations") or []):
+            if not isinstance(v, dict):
+                continue
+            detail = str(v.get("detail", "")).strip()
+            quoted = str(v.get("quoted_passage", "")).strip()
+            suggestion = str(v.get("suggestion", "")).strip()
+            full_detail = detail
+            if quoted:
+                full_detail += f" | Offending passage: \"{quoted}\""
+            blocking_issues.append({
+                "type": "premise_alignment",
+                "detail": full_detail,
+                "severity": "high",
+                "blocking": True,
+                "suggestion": suggestion,
+            })
+
+        return blocking_issues
+
+    @staticmethod
+    def _extract_beats(scene_plan: dict) -> list[str]:
+        """
+        Extract individual beats from the scene plan.
+        Prefers required_beats; falls back to splitting original_user_brief / summary
+        on periods and commas, the same way the writer prompt does.
+        """
+        required = [
+            str(b).strip() for b in scene_plan.get("required_beats", [])
+            if str(b).strip()
+        ]
+        if required:
+            return required
+
+        source = (
+            str(scene_plan.get("original_user_brief", "")).strip()
+            or str(scene_plan.get("summary", "")).strip()
+        )
+        if not source:
+            return []
+
+        beats = [
+            b.strip().strip('"\'') for b in re.split(r'[.,]+', source)
+            if len(b.strip()) > 6
+        ]
+        return beats
+
+    def _check_beat_presence(self, scene_text: str, scene_plan: dict) -> list[dict]:
+        """
+        Deterministic check: for each beat derived from scene.summary (or
+        required_beats / original_user_brief), verify that the key phrases from
+        that beat appear somewhere in the generated prose.
+        Returns a list of blocking issues for any beat not found.
+        """
+        beats = self._extract_beats(scene_plan)
+        if not beats:
+            return []
+
+        prose_lower = scene_text.lower()
+        missing_issues = []
+
+        for beat in beats:
+            beat_lower = beat.lower()
+            # Tokenise the beat into meaningful keywords (≥4 chars, skip stop-words)
+            _STOP = {
+                "then", "after", "before", "during", "while", "with", "from", "into",
+                "they", "them", "this", "that", "their", "scene", "event", "chapter",
+                "have", "does", "will", "when", "where", "what", "which", "also",
+            }
+            keywords = [
+                token for token in re.findall(r"[a-z0-9']+", beat_lower)
+                if len(token) >= 4 and token not in _STOP
+            ]
+
+            # A beat is considered present if:
+            #   (a) its full lowercased text is a substring of the prose, OR
+            #   (b) at least half of its meaningful keywords appear in the prose.
+            full_match = beat_lower in prose_lower
+            if not full_match and keywords:
+                matched = sum(1 for kw in keywords if kw in prose_lower)
+                full_match = matched >= max(1, len(keywords) // 2)
+
+            if not full_match:
+                missing_issues.append({
+                    "type": "logic_error",
+                    "detail": f"Required beat not found in prose: {beat}",
+                    "severity": "high",
+                    "blocking": True,
+                    "suggestion": (
+                        f"Add on-page prose that explicitly covers this beat: '{beat}'. "
+                        "Do not summarise it in passing — show it happening."
+                    ),
+                })
+
+        return missing_issues
 
     def has_blocking_issues(self, report: dict) -> bool:
         """Check if a validation report has issues that should block publishing."""

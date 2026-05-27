@@ -15,7 +15,6 @@ Extracts and categorizes significant plot events from scene text:
 This enables smarter unresolved plot tracking and event-based retrieval.
 """
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

@@ -10,7 +10,6 @@ This prevents context collapse on long stories by ensuring
 critical facts are never lost while managing memory budget.
 """
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 

@@ -85,7 +85,10 @@ class VectorStore:
         if self._model is None:
             logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL}")
             self._model = SentenceTransformer(config.EMBEDDING_MODEL)
-            self._dimension = self._model.get_sentence_embedding_dimension()
+            if hasattr(self._model, "get_embedding_dimension"):
+                self._dimension = self._model.get_embedding_dimension()
+            else:
+                self._dimension = self._model.get_sentence_embedding_dimension()
             logger.info(f"Embedding dimension: {self._dimension}")
         return self._model
 

@@ -1,0 +1,9 @@
+[2026-05-27 00:52:47 +0530] [8515] [INFO] Starting gunicorn 26.0.0
+[2026-05-27 00:52:47 +0530] [8515] [INFO] Listening at: http://127.0.0.1:5000 (8515)
+[2026-05-27 00:52:47 +0530] [8515] [INFO] Using worker: gthread
+[2026-05-27 00:52:47 +0530] [8516] [INFO] Booting worker with pid: 8516
+[2026-05-27 00:52:47 +0530] [8515] [INFO] Control socket listening at /run/user/1000/gunicorn.ctl
+[2026-05-27 00:53:00 +0530] [8515] [INFO] Handling signal: term
+[2026-05-27 00:53:01 +0530] [8516] [INFO] Worker exiting (pid: 8516)
+✅ Loaded 1 Groq API keys for rotation.
+[2026-05-27 00:53:06 +0530] [8515] [INFO] Shutting down: Master

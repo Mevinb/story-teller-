@@ -15,6 +15,7 @@ let streamSceneNodes = new Map();
 let plannedChapters = 1;
 let completedChapters = 0;
 const GROQ_MODEL_OPTION = '__groq_api__';
+const GEMINI_MODEL_OPTION = '__gemini_api__';
 
 // Manual interactive session state
 let manualSessionActive = false;
@@ -26,13 +27,21 @@ function isGroqProvider(provider) {
     return String(provider || '').toLowerCase().includes('groq');
 }
 
+function isGeminiProvider(provider) {
+    return String(provider || '').toLowerCase().includes('gemini');
+}
+
 function providerBadge(provider) {
+    if (isGeminiProvider(provider)) return '✨ Gemini';
     return isGroqProvider(provider) ? '☁️ Groq' : '💻 llama.cpp';
 }
 
-function modelOptionLabel(modelId, groqModelName) {
+function modelOptionLabel(modelId, groqModelName, geminiModelName) {
     if (modelId === GROQ_MODEL_OPTION) {
         return `☁️ Groq API (${groqModelName || 'default'})`;
+    }
+    if (modelId === GEMINI_MODEL_OPTION) {
+        return `✨ Gemini API (${geminiModelName || 'default'})`;
     }
     return `💻 ${modelId}`;
 }
@@ -50,7 +59,10 @@ function switchView(viewName) {
 
     if (viewName === 'reader' && currentProject) loadChapters();
     if (viewName === 'state' && currentProject) refreshState();
+    if (viewName === 'combine' && currentProject) loadCombineVersions();
+    if (viewName === 'edit' && currentProject) loadProjectForEdit();
     if (viewName === 'dashboard') loadProjects();
+    if (viewName === 'settings') loadSettings();
     if (viewName === 'manual' && currentProject) {
         // Fetch the current manual session status to restore UI state
         fetch(`/api/project/${currentProject}/generate/manual/status`)
@@ -59,15 +71,19 @@ function switchView(viewName) {
                 if (data.active) {
                     manualSessionActive = true;
                     manualScenesCompleted = data.scenes_completed;
+                    manualIsGeneratingScene = Boolean(data.is_generating);
                     document.getElementById('manualStartCard')?.classList.add('hidden');
                     document.getElementById('manualSceneCard')?.classList.remove('hidden');
                     document.getElementById('manualSessionTitle').innerHTML = `<span class="icon">✍️</span> Chapter ${data.chapter_num}: ${escHtml(data.chapter_title)}`;
                     document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
                     document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
+                    document.getElementById('btnManualScene').disabled = manualIsGeneratingScene;
+                    document.getElementById('btnManualScene').textContent = manualIsGeneratingScene ? '⏳ Generating...' : '▶ Generate Scene';
+                    document.getElementById('btnManualStopScene')?.classList.toggle('hidden', !manualIsGeneratingScene);
                     if (data.completed_scenes) {
                         renderManualScenes(data.completed_scenes);
                     }
-                    if (manualScenesCompleted > 0) {
+                    if (manualScenesCompleted > 0 && !manualIsGeneratingScene) {
                         document.getElementById('btnManualFinish').classList.remove('hidden');
                     } else {
                         document.getElementById('btnManualFinish').classList.add('hidden');
@@ -135,6 +151,7 @@ function showProjectTabs() {
     document.getElementById('tabLogs').classList.remove('hidden');
     document.getElementById('tabState').classList.remove('hidden');
     document.getElementById('tabCombine').classList.remove('hidden');
+    document.getElementById('tabEdit').classList.remove('hidden');
 }
 
 // ─── Projects ────────────────────────────────────────────────────
@@ -205,9 +222,138 @@ async function selectProject(name) {
             document.getElementById('btnCombine').innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
         }
 
+        loadCombineVersions();
+
         switchView('generate');
     } catch (e) {
         showToast('Failed to load project', 'error');
+    }
+}
+
+// ─── Edit Project ────────────────────────────────────────────────
+let editCharacters = [];
+
+async function loadProjectForEdit() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}`);
+        const data = await res.json();
+        
+        const metadata = data.state.metadata || {};
+        document.getElementById('editTitle').value = metadata.title || '';
+        document.getElementById('editGenre').value = metadata.genre || '';
+        document.getElementById('editPremise').value = metadata.premise || '';
+        document.getElementById('editSetting').value = metadata.setting || '';
+        document.getElementById('editThemes').value = (metadata.themes || []).join(', ');
+
+        const charsObj = data.state.characters || {};
+        editCharacters = Object.keys(charsObj).map(name => ({
+            name: name,
+            description: charsObj[name].description || '',
+            traits: charsObj[name].traits || [],
+            originalName: name
+        }));
+        renderEditCharacterList();
+    } catch (e) {
+        showToast('Failed to load project for editing', 'error');
+    }
+}
+
+function renderEditCharacterList() {
+    const list = document.getElementById('editCharacterList');
+    list.innerHTML = editCharacters.map((c, i) => `
+        <div class="character-entry">
+            <span class="char-name">${escHtml(c.name)}</span>
+            <span>${escHtml(c.description)}</span>
+            <span class="text-dim">${c.traits.join(', ')}</span>
+            <span class="char-remove" onclick="removeEditCharacter(${i})">✕</span>
+        </div>
+    `).join('');
+}
+
+function addEditCharacter() {
+    const name = document.getElementById('editCharName').value.trim();
+    const desc = document.getElementById('editCharDesc').value.trim();
+    const traits = document.getElementById('editCharTraits').value.trim();
+
+    if (!name) { showToast('Enter a character name', 'error'); return; }
+
+    const existingIndex = editCharacters.findIndex(c => c.name.toLowerCase() === name.toLowerCase());
+    if (existingIndex >= 0) {
+        editCharacters[existingIndex].description = desc;
+        editCharacters[existingIndex].traits = traits ? traits.split(',').map(t => t.trim()) : [];
+    } else {
+        editCharacters.push({
+            name,
+            description: desc,
+            traits: traits ? traits.split(',').map(t => t.trim()) : [],
+            isNew: true
+        });
+    }
+
+    renderEditCharacterList();
+    document.getElementById('editCharName').value = '';
+    document.getElementById('editCharDesc').value = '';
+    document.getElementById('editCharTraits').value = '';
+    document.getElementById('editCharName').focus();
+}
+
+function removeEditCharacter(index) {
+    editCharacters.splice(index, 1);
+    renderEditCharacterList();
+}
+
+async function saveProjectEdits() {
+    if (!currentProject) return;
+
+    const title = document.getElementById('editTitle').value.trim();
+    const genre = document.getElementById('editGenre').value.trim();
+    const premise = document.getElementById('editPremise').value.trim();
+    const setting = document.getElementById('editSetting').value.trim();
+    const themesStr = document.getElementById('editThemes').value.trim();
+
+    if (!title) { showToast('Title cannot be empty', 'error'); return; }
+
+    const btn = document.getElementById('btnSaveEdits');
+    btn.disabled = true;
+    btn.textContent = '⏳ Saving...';
+
+    const metadataUpdate = {
+        title, genre, premise, setting,
+        themes: themesStr ? themesStr.split(',').map(t => t.trim()) : []
+    };
+
+    const charactersUpdate = {};
+    editCharacters.forEach(c => {
+        charactersUpdate[c.name] = {
+            description: c.description,
+            traits: c.traits
+        };
+    });
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/state`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                metadata: metadataUpdate,
+                characters: charactersUpdate
+            }),
+        });
+
+        const data = await res.json();
+        if (data.status === 'ok') {
+            showToast('Story details saved successfully', 'success');
+            // If title changed, we might want to update the sidebar/header
+            document.getElementById('genTitle').innerHTML = `<span class="icon">✍️</span> ${escHtml(title)}`;
+        } else {
+            showToast(data.error || 'Failed to save edits', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to save edits', 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '💾 Save Changes';
     }
 }
 
@@ -456,6 +602,26 @@ function onManualSceneDone(data) {
         return;
     }
 
+    if (data.status === 'error') {
+        manualScenesCompleted = data.scenes_completed ?? manualScenesCompleted;
+        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
+        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
+        if (statusEl) {
+            statusEl.classList.remove('hidden');
+            statusEl.textContent = 'Scene failed. Completed scenes are still saved.';
+        }
+        if (manualScenesCompleted > 0 && finishBtn) finishBtn.classList.remove('hidden');
+        showToast(data.error || 'Scene generation failed', 'error');
+        addLogEntry({
+            timestamp: new Date().toLocaleTimeString(),
+            level: 'error',
+            message: data.error || 'Scene generation failed',
+        });
+        loadChapters();
+        return;
+    }
+
     manualScenesCompleted = data.scene_number || (manualScenesCompleted + 1);
 
     // Add completed scene to the display
@@ -621,11 +787,24 @@ function handleSSE(event) {
             if (data.chapter > 1) {
                 appendOutput('<hr style="border:none;border-top:2px solid var(--accent-primary);margin:32px 0">');
             }
+            loadChapters(); // Refresh list to show WIP chapter
             break;
 
         case 'agent_active':
             updatePipelineStage(data.agent);
             updateStats({ status: `${data.agent}: ${data.step}` });
+            if (manualSessionActive && manualIsGeneratingScene) {
+                const statusEl = document.getElementById('manualSceneStatus');
+                if (statusEl && !statusEl.classList.contains('hidden')) {
+                    const phaseMap = {
+                        'Scene Writer':      '✍️ Writing scene...',
+                        'Consistency Engine':'🔍 Reviewing consistency...',
+                        'Editor':            '✂️ Polishing scene...',
+                        'Retriever':         '📚 Retrieving context...',
+                    };
+                    statusEl.textContent = phaseMap[data.agent] || `⚙️ ${data.agent}...`;
+                }
+            }
             break;
 
         case 'chapter_planned':
@@ -640,6 +819,12 @@ function handleSSE(event) {
 
         case 'scene_start':
             updateStats({ status: `Writing scene ${data.scene}/${data.total}` });
+            if (manualSessionActive && manualIsGeneratingScene) {
+                const statusEl = document.getElementById('manualSceneStatus');
+                if (statusEl && !statusEl.classList.contains('hidden')) {
+                    statusEl.textContent = '✍️ Writing scene...';
+                }
+            }
             break;
 
         case 'token':
@@ -684,6 +869,7 @@ function handleSSE(event) {
                 }
                 appendOutput(`<p>${escHtml(data.text).replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')}</p>`);
             }
+            loadChapters(); // Update word count/status in reader list
             break;
 
         case 'chapter_complete':
@@ -693,6 +879,7 @@ function handleSSE(event) {
                 'success',
             );
             updateStats({ status: `Completed chapter ${completedChapters}/${plannedChapters}` });
+            loadChapters(); // Update status from 'writing' to 'completed'
             break;
 
         case 'log':
@@ -710,6 +897,13 @@ function handleSSE(event) {
 
         case 'status':
             updateStats({ status: data });
+            // Mirror live status into manual scene status label during generation
+            if (manualSessionActive && manualIsGeneratingScene) {
+                const statusEl = document.getElementById('manualSceneStatus');
+                if (statusEl && !statusEl.classList.contains('hidden')) {
+                    statusEl.textContent = typeof data === 'string' ? data : JSON.stringify(data);
+                }
+            }
             break;
 
         case 'error':
@@ -723,9 +917,14 @@ function handleSSE(event) {
             break;
 
         case 'done':
+            if (data.status === 'cancelled') {
+                showToast('Generation stopped.', 'info');
+            }
             if (manualSessionActive) {
                 resetManualSession();
-                showToast('Chapter finalized successfully!', 'success');
+                if (data.status !== 'cancelled') {
+                    showToast('Chapter finalized successfully!', 'success');
+                }
             }
             stopGeneration();
             break;
@@ -830,16 +1029,30 @@ function renderChapterList(chapters) {
         list.innerHTML = '<p class="text-dim text-sm">No chapters yet.</p>';
         return;
     }
-    list.innerHTML = chapters.map(ch => `
-        <div class="chapter-item" onclick="readChapter(${ch.number}, this)">
-            <div><span class="ch-num">Chapter ${ch.number}</span></div>
-            <div class="flex gap-2 items-center">
-                <div class="ch-words">${ch.words} words</div>
-                <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();resumeChapter(${ch.number})" title="Edit this chapter (warning: deletes later chapters)">✎ Edit</button>
-                <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteChaptersFrom(${ch.number})" title="Delete this chapter and all later chapters">Delete+</button>
+    list.innerHTML = chapters.map(ch => {
+        const isWriting = ch.status === 'writing';
+        const statusBadge = isWriting ? `<span class="badge badge-working" style="font-size:0.7rem;margin-left:8px">Writing...</span>` : '';
+        const progressInfo = isWriting ? `<div class="text-xs text-dim">${ch.scenes_completed}/${ch.scenes_total} scenes</div>` : '';
+        
+        return `
+            <div class="chapter-item ${isWriting ? 'wip' : ''}" onclick="readChapter(${ch.number}, this)">
+                <div class="flex flex-col">
+                    <div class="flex items-center">
+                        <span class="ch-num">Chapter ${ch.number}</span>
+                        ${statusBadge}
+                    </div>
+                    ${progressInfo}
+                </div>
+                <div class="flex gap-2 items-center">
+                    <div class="ch-words">${ch.words} words</div>
+                    ${!isWriting ? `
+                        <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();resumeChapter(${ch.number})" title="Edit this chapter (warning: deletes later chapters)">✎ Edit</button>
+                        <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteChaptersFrom(${ch.number})" title="Delete this chapter and all later chapters">Delete+</button>
+                    ` : ''}
+                </div>
             </div>
-        </div>
-    `).join('');
+        `;
+    }).join('');
 }
 
 async function readChapter(num, el = null) {
@@ -1222,9 +1435,13 @@ async function startCombine() {
     setStatus('working', 'Combining with Gemini...');
 
     try {
+        const modelSelect = document.getElementById('combineModelSelect');
+        const selectedModel = modelSelect ? modelSelect.value : null;
+
         const res = await fetch(`/api/project/${currentProject}/combine`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: selectedModel })
         });
 
         if (!res.ok) {
@@ -1257,9 +1474,9 @@ function handleCombineSSE(event) {
             break;
 
         case 'combine_done': {
-            populateCombineUI(data);
             stopCombine();
             showToast('Story combined and polished successfully!', 'success');
+            loadCombineVersions();
             break;
         }
 
@@ -1288,8 +1505,127 @@ function stopCombine() {
 
 function downloadCombined(type) {
     if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    window.open(`/api/project/${currentProject}/combine/download/${type}`, '_blank');
+    const select = document.getElementById('combineVersionSelect');
+    const suffix = select ? select.value : 'latest';
+    window.open(`/api/project/${currentProject}/combine/download/${type}?suffix=${suffix}`, '_blank');
     showToast(`Downloading ${type} file...`, 'info');
+}
+
+// ─── Polished Story History Management ────────────────────────────
+let combineVersionsList = [];
+
+async function loadCombineVersions(selectSuffix = null) {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/versions`);
+        const data = await res.json();
+        
+        const select = document.getElementById('combineVersionSelect');
+        if (!select) return;
+        
+        combineVersionsList = data.versions || [];
+        
+        if (combineVersionsList.length === 0) {
+            select.innerHTML = '<option value="">No versions available</option>';
+            document.getElementById('combineAnalysisCard').classList.add('hidden');
+            document.getElementById('combinePolishedCard').classList.add('hidden');
+            document.getElementById('combineDownloadCard').classList.add('hidden');
+            document.getElementById('btnDeleteCombine').classList.add('hidden');
+            const btn = document.getElementById('btnCombine');
+            if (btn) btn.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
+            return;
+        }
+        
+        select.innerHTML = combineVersionsList.map(v => 
+            `<option value="${v.suffix}">${escHtml(v.label)} (${(v.revised_chars/1024).toFixed(1)} KB)</option>`
+        ).join('');
+        
+        let targetSuffix = selectSuffix;
+        if (!targetSuffix || !combineVersionsList.some(v => v.suffix === targetSuffix)) {
+            targetSuffix = combineVersionsList[combineVersionsList.length - 1].suffix;
+        }
+        
+        select.value = targetSuffix;
+        fetchCombineVersion(targetSuffix);
+    } catch (e) {
+        showToast('Failed to load polished story history', 'error');
+    }
+}
+
+async function changeCombineVersion() {
+    const select = document.getElementById('combineVersionSelect');
+    if (!select || !select.value) return;
+    fetchCombineVersion(select.value);
+}
+
+async function fetchCombineVersion(suffix) {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/version/${suffix}`);
+        const data = await res.json();
+        if (res.ok) {
+            populateCombineUI(data);
+        } else {
+            showToast(data.error || 'Failed to fetch version', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to fetch version details', 'error');
+    }
+}
+
+async function renameSelectedVersion() {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    const select = document.getElementById('combineVersionSelect');
+    if (!select || !select.value) { showToast('No version selected', 'error'); return; }
+    
+    const suffix = select.value;
+    const currentLabel = select.options[select.selectedIndex].text.split(' (')[0];
+    
+    const newName = prompt(`Enter a new label for this polished version:`, currentLabel);
+    if (!newName || newName.trim() === '') return;
+    
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/rename`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ suffix: suffix, new_name: newName.trim() })
+        });
+        const data = await res.json();
+        if (res.ok && data.status === 'ok') {
+            showToast('Polished version renamed successfully!', 'success');
+            loadCombineVersions(data.new_suffix);
+        } else {
+            showToast(data.error || 'Rename failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to rename version', 'error');
+    }
+}
+
+async function deleteSelectedVersion() {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    const select = document.getElementById('combineVersionSelect');
+    if (!select || !select.value) { showToast('No version selected', 'error'); return; }
+    
+    const suffix = select.value;
+    if (!confirm('Are you sure you want to delete this specific polished version and its analysis? This cannot be undone.')) return;
+    
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/delete_version`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ suffix: suffix })
+        });
+        const data = await res.json();
+        if (res.ok && data.status === 'ok') {
+            showToast('Polished version deleted.', 'success');
+            loadCombineVersions();
+        } else {
+            showToast(data.error || 'Delete failed', 'error');
+        }
+    } catch (e) {
+        showToast('Failed to delete version', 'error');
+    }
 }
 
 function populateCombineUI(data) {
@@ -1303,11 +1639,15 @@ function populateCombineUI(data) {
     if (data.analysis) {
         analysisEl.innerHTML = markdownToHtml(data.analysis);
         analysisCard.classList.remove('hidden');
+    } else {
+        analysisCard.classList.add('hidden');
     }
 
     if (data.revised) {
         polishedEl.innerHTML = markdownToHtml(data.revised);
         polishedCard.classList.remove('hidden');
+    } else {
+        polishedCard.classList.add('hidden');
     }
 
     statsEl.innerHTML = `
@@ -1328,7 +1668,6 @@ function populateCombineUI(data) {
     `;
     downloadCard.classList.remove('hidden');
     
-    // Change button text to indicate recombination is possible
     const btn = document.getElementById('btnCombine');
     if (btn) {
         btn.innerHTML = '<span class="gemini-icon">🔮</span> Re-Combine & Polish';
@@ -1355,31 +1694,20 @@ function toggleCombineSection(elId, btnId) {
 
 async function deleteCombineData() {
     if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    if (!confirm('Are you sure you want to delete the polished version and analysis? This cannot be undone.')) return;
+    if (!confirm('Are you sure you want to delete ALL polished versions and analyses? This cannot be undone.')) return;
 
     try {
         const res = await fetch(`/api/project/${currentProject}/combine/delete`, { method: 'POST' });
         const data = await res.json();
         
         if (res.ok && data.status === 'ok') {
-            showToast('Polished version deleted.', 'success');
-            
-            // Reset combine view
-            document.getElementById('combineAnalysisCard').classList.add('hidden');
-            document.getElementById('combinePolishedCard').classList.add('hidden');
-            document.getElementById('combineDownloadCard').classList.add('hidden');
-            document.getElementById('btnDeleteCombine').classList.add('hidden');
-            
-            const btn = document.getElementById('btnCombine');
-            if (btn) {
-                btn.disabled = false;
-                btn.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
-            }
+            showToast('All polished versions deleted.', 'success');
+            loadCombineVersions();
         } else {
-            showToast(data.error || 'Failed to delete polished version', 'error');
+            showToast(data.error || 'Failed to delete polished versions', 'error');
         }
     } catch (e) {
-        showToast('Failed to delete polished version', 'error');
+        showToast('Failed to delete polished versions', 'error');
     }
 }
 
@@ -1392,9 +1720,117 @@ document.addEventListener('keydown', (e) => {
     }
 });
 
-// ─── Model Management ────────────────────────────────────────────
+// ─── Settings / Model Management ─────────────────────────────────
+function settingsFieldValue(el) {
+    if (!el) return '';
+    if (el.type === 'checkbox') return el.checked;
+    return el.value;
+}
+
+function setSettingsField(key, value) {
+    const el = document.querySelector(`[data-setting="${key}"]`);
+    if (!el) return;
+    if (el.type === 'checkbox') {
+        el.checked = Boolean(value);
+    } else {
+        el.value = value ?? '';
+    }
+}
+
+function currentBackendMode() {
+    return document.querySelector('input[name="backendMode"]:checked')?.value || 'local';
+}
+
+function renderSettingsSummary(data) {
+    const summary = document.getElementById('settingsSummary');
+    if (!summary) return;
+    const settings = data.settings || {};
+    const mode = data.backend_mode || settings.BACKEND_MODE || 'local';
+    const active = data.active_model || settings.ACTIVE_MODEL || settings.LLAMA_MODEL_PATH || 'none';
+    const localCount = (data.local_models || []).length;
+    summary.innerHTML = `
+        <div class="settings-pill"><strong>Mode</strong><span>${escHtml(mode)}</span></div>
+        <div class="settings-pill"><strong>Active</strong><span>${escHtml(active)}</span></div>
+        <div class="settings-pill"><strong>Local models</strong><span>${localCount}</span></div>
+        <div class="settings-pill"><strong>.env</strong><span>${escHtml(data.env_path || '.env')}</span></div>
+    `;
+}
+
+function populateSettings(data) {
+    const settings = data.settings || {};
+    Object.entries(settings).forEach(([key, value]) => setSettingsField(key, value));
+
+    const mode = settings.BACKEND_MODE || data.backend_mode || 'local';
+    const modeInput = document.querySelector(`input[name="backendMode"][value="${mode}"]`);
+    if (modeInput) modeInput.checked = true;
+
+    const activeModel = document.getElementById('settingsActiveModel');
+    if (activeModel) {
+        const models = data.local_models || [];
+        const active = settings.ACTIVE_MODEL || data.active_model || '';
+        const options = models.map(model =>
+            `<option value="${escHtml(model)}" ${model === active ? 'selected' : ''}>${escHtml(model)}</option>`
+        );
+        if (active && active !== GROQ_MODEL_OPTION && !models.includes(active)) {
+            options.unshift(`<option value="${escHtml(active)}" selected>${escHtml(active)}</option>`);
+        }
+        activeModel.innerHTML = options.length
+            ? options.join('')
+            : '<option value="">No GGUF models found</option>';
+    }
+
+    renderSettingsSummary(data);
+}
+
+async function loadSettings() {
+    try {
+        const res = await fetch('/api/settings');
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to load settings');
+        populateSettings(data);
+    } catch (e) {
+        showToast(e.message || 'Failed to load settings', 'error');
+    }
+}
+
+async function saveSettings() {
+    const btn = document.getElementById('btnSaveSettings');
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Saving...';
+    }
+
+    const settings = { BACKEND_MODE: currentBackendMode() };
+    document.querySelectorAll('[data-setting]').forEach(el => {
+        settings[el.dataset.setting] = settingsFieldValue(el);
+    });
+
+    const activeModel = document.getElementById('settingsActiveModel')?.value || '';
+    if (activeModel) settings.ACTIVE_MODEL = activeModel;
+
+    try {
+        const res = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ settings }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save settings');
+        populateSettings(data);
+        showToast('Settings saved. New generations will use them.', 'success');
+    } catch (e) {
+        showToast(e.message || 'Failed to save settings', 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = '💾 Save Settings';
+        }
+    }
+}
+
 async function loadModels() {
     const select = document.getElementById('modelSelect');
+    if (!select) return;
     try {
         const res = await fetch('/api/models');
         const data = await res.json();
@@ -1403,7 +1839,7 @@ async function loadModels() {
             return;
         }
         select.innerHTML = data.models.map(m =>
-            `<option value="${escHtml(m)}" ${m === data.active ? 'selected' : ''}>${escHtml(modelOptionLabel(m, data.groq_model))}</option>`
+            `<option value="${escHtml(m)}" ${m === data.active ? 'selected' : ''}>${escHtml(modelOptionLabel(m, data.groq_model, data.gemini_model))}</option>`
         ).join('');
     } catch (e) {
         select.innerHTML = '<option>Error loading models</option>';
@@ -1421,6 +1857,8 @@ async function switchModel(model) {
         if (data.status === 'ok') {
             if ((data.active || model) === GROQ_MODEL_OPTION) {
                 showToast(`Switched to Groq API (${data.groq_model || 'default'})`, 'success');
+            } else if ((data.active || model) === GEMINI_MODEL_OPTION) {
+                showToast(`Switched to Gemini API (${data.gemini_model || 'default'})`, 'success');
             } else {
                 showToast(`Switched to ${data.active || model}`, 'success');
             }
@@ -1437,5 +1875,10 @@ async function switchModel(model) {
 document.addEventListener('DOMContentLoaded', () => {
     loadProjects();
     loadModels();
+    loadSettings();
+    document.getElementById('settingsActiveModel')?.addEventListener('change', (e) => {
+        const pathInput = document.getElementById('setting_LLAMA_MODEL_PATH');
+        if (pathInput && e.target.value) pathInput.value = e.target.value;
+    });
     setStatus('online', 'Ready');
 });
