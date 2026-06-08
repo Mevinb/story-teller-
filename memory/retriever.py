@@ -173,6 +173,27 @@ class Retriever:
                 parts.append(events_block)
                 char_count += len(events_block)
 
+        # ─── Part 2.8b: Graph Retrieval (Related Events) ─────────────
+        if story_events and characters and char_count < max_chars - 200:
+            related_events = []
+            for char_name in characters:
+                char_events = EventExtractor.get_character_events(story_events, char_name)
+                related_events.extend(char_events)
+            
+            seen_desc = set()
+            unique_related = []
+            for e in related_events:
+                if e['description'] not in seen_desc:
+                    seen_desc.add(e['description'])
+                    unique_related.append(e)
+            
+            if unique_related:
+                graph_summary = EventExtractor.get_events_summary(unique_related, max_events=6, unresolved_only=False)
+                if graph_summary:
+                    graph_block = f"\n=== RELEVANT PAST EVENTS (GRAPH RETRIEVAL) ===\n{graph_summary}"
+                    parts.append(graph_block)
+                    char_count += len(graph_block)
+
         # ─── Part 2.9: Continuity Anchor ─────────────────────────────
         if previous_ending:
             anchor = " ".join(previous_ending.split())
@@ -197,11 +218,12 @@ class Retriever:
             results = self.vectors.search(query, top_k=top_k * 2)  # Over-fetch for re-ranking
 
             if results:
-                # Re-rank with hybrid scoring
+                # Re-rank with hybrid scoring + cross encoder
                 reranked = self._hybrid_rerank(
                     results, scene_plan, chapter_num,
                     self.state.get_characters(),
                     self.state.state.get("plot", {}).get("unresolved_threads", []),
+                    query=merged_query,
                 )
 
                 parts.append("\n=== RELEVANT PAST CONTENT (REFERENCE ONLY - DO NOT COPY PROSE) ===")
@@ -246,9 +268,10 @@ class Retriever:
         chapter_num: int,
         characters: dict,
         unresolved_threads: list,
+        query: str = "",
         backstory_query: bool = False,
     ) -> list:
-        """Re-rank search results using recency-weighted hybrid scoring.
+        """Re-rank search results using recency-weighted hybrid scoring and optional cross encoder.
 
         Primary formula (per spec):
             recency_score = 1.0 - 0.05 * (current_chapter - chunk_chapter)
@@ -261,6 +284,19 @@ class Retriever:
         """
         scene_chars = set(c.lower() for c in scene_plan.get("characters_present", []))
         thread_text = " ".join(unresolved_threads).lower()
+
+        if query and hasattr(self.vectors, "cross_encoder") and self.vectors.cross_encoder is not None and len(results) > 0:
+            try:
+                pairs = [[query, r.text] for r in results]
+                ce_scores = self.vectors.cross_encoder.predict(pairs)
+                import math
+                def sigmoid(x):
+                    return 1 / (1 + math.exp(-x))
+                for i, r in enumerate(results):
+                    # Replace semantic score with normalized CE score
+                    r.score = sigmoid(float(ce_scores[i]))
+            except Exception as e:
+                logger.warning(f"Cross encoder failed: {e}")
 
         scored = []
         for result in results:

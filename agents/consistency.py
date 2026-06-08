@@ -223,6 +223,36 @@ class ConsistencyEngine(AgentContract):
         scene_text_limit = 1600 if self._compact_mode else 3000
         scene_plan_limit = 650 if self._compact_mode else 1200
         state_context_limit = 900 if self._compact_mode else 2000
+
+        # ── Fast Pass: Deterministic Checks ──────────────────────────────────
+        fast_issues = []
+        
+        # 1. Check Character Mismatch (Missing required characters)
+        scene_chars = scene_plan.get("characters_present", []) if scene_plan else []
+        text_lower = scene_text.lower()
+        for char in scene_chars:
+            if len(char) > 3 and char.lower() not in text_lower:
+                fast_issues.append({
+                    "type": "character_contradiction",
+                    "detail": f"Required character '{char}' is completely missing from the generated scene text.",
+                    "severity": "high",
+                    "blocking": True,
+                    "suggestion": f"Rewrite to include '{char}'."
+                })
+                
+        # 2. Check Missing Beats (Logic Error)
+        beat_issues = self._check_beat_presence(scene_text, scene_plan or {})
+        if beat_issues:
+            fast_issues.extend(beat_issues)
+            
+        if fast_issues:
+            logger.warning(f"Fast validation failed with {len(fast_issues)} issues. Skipping LLM critic.")
+            return {
+                "is_consistent": False,
+                "issues": fast_issues,
+                "state_updates": {},
+            }
+
         template = VALIDATE_PROMPT_COMPACT if self._compact_mode else VALIDATE_PROMPT
         prompt = template.format(
             scene_text=scene_text[:scene_text_limit],
@@ -328,19 +358,6 @@ class ConsistencyEngine(AgentContract):
                     "Premise alignment check found %d blocking violation(s).",
                     len(alignment_issues),
                 )
-
-        # ── Pass 3: Deterministic beat-presence check ────────────────────
-        # This is a completion gate: the scene cannot pass as consistent until
-        # every beat from the summary checklist is confirmed present in the prose.
-        beat_issues = self._check_beat_presence(scene_text, scene_plan or {})
-        if beat_issues:
-            result["issues"].extend(beat_issues)
-            # Completion gate: force is_consistent False regardless of LLM verdict
-            result["is_consistent"] = False
-            logger.warning(
-                "Beat-presence check found %d missing beat(s). Scene blocked until all beats present.",
-                len(beat_issues),
-            )
 
         return result
 

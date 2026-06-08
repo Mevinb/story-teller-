@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import faiss
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 import config
 
@@ -78,6 +78,17 @@ class VectorStore:
         self._metadata: List[dict] = []
         self._dimension: int = 384  # MiniLM-L6-v2 dimension
         self._embedding_cache: dict[str, np.ndarray] = {}
+        self._cross_encoder: Optional[CrossEncoder] = None
+
+    @property
+    def cross_encoder(self) -> Optional[CrossEncoder]:
+        """Lazy-load the cross-encoder model."""
+        if self._cross_encoder is None:
+            model_name = getattr(config, "CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+            if model_name:
+                logger.info(f"Loading cross-encoder model: {model_name}")
+                self._cross_encoder = CrossEncoder(model_name)
+        return self._cross_encoder
 
     @property
     def model(self) -> SentenceTransformer:

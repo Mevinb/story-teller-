@@ -75,7 +75,8 @@ WORDS_PER_SCENE_MIN = 500
 WORDS_PER_SCENE_MAX = 1000
 
 # ─── Embedding / Retrieval ──────────────────────────────────────────
-EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
+CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 CHUNK_SIZE = 400          # tokens per chunk
 CHUNK_OVERLAP = 50        # token overlap between chunks
 TOP_K_RETRIEVAL = 4       # number of chunks to retrieve

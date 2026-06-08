@@ -241,8 +241,13 @@ def _create_default_character(info: Optional[dict] = None) -> dict:
     role = info.get("role", "supporting")
     return {
         "description": info.get("description", ""),
+        "personality": info.get("personality", []),
+        "speech_patterns": info.get("speech_patterns", []),
         "traits": info.get("traits", []),
         "relationships": info.get("relationships", {}),
+        "goals": info.get("goals", []),
+        "fears": info.get("fears", []),
+        "knowledge": info.get("knowledge", []),
         "state": info.get("state", {
             "emotion": "neutral",
             "location": "",
@@ -931,8 +936,20 @@ class StateManager:
 
         for name, info in chars.items():
             char_str = f"\nCharacter '{name}':"
+            if info.get("description"):
+                char_str += f" Desc: {info['description']}."
+            if info.get("personality"):
+                char_str += f" Personality: {', '.join(info['personality'])}."
+            if info.get("speech_patterns"):
+                char_str += f" Speech: {', '.join(info['speech_patterns'])}."
             if info.get("traits"):
                 char_str += f" Traits: {', '.join(info['traits'])}."
+            if info.get("goals"):
+                char_str += f" Goals: {', '.join(info['goals'])}."
+            if info.get("fears"):
+                char_str += f" Fears: {', '.join(info['fears'])}."
+            if info.get("knowledge"):
+                char_str += f" Knowledge: {', '.join(info['knowledge'])}."
             if info.get("state"):
                 state_parts = [f"{k}={v}" for k, v in info["state"].items() if v]
                 if state_parts:
