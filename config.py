@@ -40,6 +40,11 @@ USE_CLOUD_MODEL = os.getenv("USE_CLOUD_MODEL", "false").lower() in ("1", "true",
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
 
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MIN_REQUEST_INTERVAL = float(os.getenv("OPENROUTER_MIN_REQUEST_INTERVAL", "1.0"))
+
 # ─── Generation Parameters ──────────────────────────────────────────
 LOCAL_MODEL_PARAMS = {
     "num_ctx": int(os.getenv("LOCAL_NUM_CTX", "4096")),

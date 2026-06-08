@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Multi-Agent Story Generation Pipeline — AI-powered long-form narrative creation with memory and consistency">
     <title>Story Teller — AI Story Generation</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=3">
+    <link rel="stylesheet" href="/static/css/style.css?v=5">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖊️</text></svg>">
 </head>
 <body>
@@ -22,6 +22,12 @@
                 </div>
             </div>
             <div class="header-actions">
+                <div class="model-selector-wrap" style="display:inline-flex;align-items:center;gap:8px;margin-right:8px;">
+                    <label class="text-dim text-sm" for="modelSelect" style="white-space:nowrap;">Model:</label>
+                    <select class="form-select" id="modelSelect" style="width:auto;min-width:180px;font-size:0.85rem;" onchange="switchModel(this.value)">
+                        <option value="">Loading...</option>
+                    </select>
+                </div>
                 <button class="btn btn-sm" onclick="switchView('settings')" title="Settings">⚙️ Settings</button>
                 <button class="btn btn-sm" id="btnRefresh" onclick="loadProjects()" title="Refresh">🔄 Refresh</button>
             </div>
@@ -191,6 +197,7 @@
                                 <option value="3">3 Chapters</option>
                                 <option value="5">5 Chapters</option>
                                 <option value="10">10 Chapters</option>
+                                <option value="-1">📖 Entire Story (All Remaining Chapters)</option>
                             </select>
                             <button class="btn btn-primary" onclick="startGeneration()" id="btnGenerate">
                                 ▶ Generate
@@ -308,9 +315,13 @@
                             <textarea class="form-textarea" id="manualSceneBrief" rows="3"
                                 placeholder="Enter the theme/prompt for this scene... (e.g. 'The protagonist discovers a hidden letter in the attic')"></textarea>
                         </div>
-                        <div class="flex gap-2 items-center">
+                        <div class="flex gap-2 items-center" style="flex-wrap:wrap">
                             <button class="btn btn-primary" onclick="generateNextScene()" id="btnManualScene">
                                 ▶ Generate Scene
+                            </button>
+                            <button class="btn" onclick="toggleTypedScenePanel()" id="btnManualTypeScene"
+                                style="background:var(--accent-secondary);color:#fff" title="Write a scene manually by typing it">
+                                ✍️ Type Scene
                             </button>
                             <button class="btn btn-danger hidden" onclick="stopManualScene()" id="btnManualStopScene">
                                 🛑 Stop Scene
@@ -320,6 +331,26 @@
                                 ✅ Finish Chapter
                             </button>
                             <span class="text-dim text-sm hidden" id="manualSceneStatus"></span>
+                        </div>
+                    </div>
+
+                    <!-- Typed scene panel (hidden by default) -->
+                    <div class="hidden" id="manualTypedScenePanel" style="margin-top:16px">
+                        <div class="card" style="background:var(--surface-2);padding:16px;border:2px dashed var(--accent-secondary);border-radius:8px">
+                            <div class="text-sm" style="margin-bottom:8px;font-weight:600;color:var(--accent-secondary)">✍️ Type your scene text directly</div>
+                            <p class="text-dim text-sm" style="margin-bottom:12px">Write the scene prose exactly as it should appear in the chapter. This bypasses AI generation entirely.</p>
+                            <textarea class="form-textarea" id="manualTypedSceneText" rows="10"
+                                style="font-family:'Lora',serif;font-size:0.95rem;line-height:1.8;white-space:pre-wrap"
+                                placeholder="Type your scene text here..."></textarea>
+                            <div class="flex gap-2 items-center" style="margin-top:12px">
+                                <button class="btn btn-primary" onclick="addTypedScene()" id="btnAddTypedScene">
+                                    ✅ Add Scene
+                                </button>
+                                <button class="btn" onclick="toggleTypedScenePanel()">
+                                    ✕ Cancel
+                                </button>
+                                <span class="text-dim text-sm" id="typedSceneWordCount">0 words</span>
+                            </div>
                         </div>
                     </div>
 
@@ -348,6 +379,14 @@
                     <div class="chapter-list" id="chapterList"></div>
                 </div>
                 <div class="card">
+                    <div class="card-header" id="readerCardHeader" style="display:none">
+                        <span class="card-title" id="readerChapterTitle"><span class="icon">📖</span> Chapter</span>
+                        <div class="flex gap-2">
+                            <button class="btn btn-sm" id="btnReaderEdit" onclick="toggleReaderEdit()" title="Edit this chapter's raw text">✏️ Edit</button>
+                            <button class="btn btn-sm hidden" id="btnReaderSave" onclick="saveReaderEdit()" style="background:var(--success);color:#fff" title="Save changes">💾 Save</button>
+                            <button class="btn btn-sm hidden" id="btnReaderCancel" onclick="cancelReaderEdit()" title="Discard changes">✕ Cancel</button>
+                        </div>
+                    </div>
                     <div class="reader-content" id="readerContent">
                         <div class="empty-state">
                             <span class="icon">📖</span>
@@ -355,6 +394,7 @@
                             <p>Choose a chapter from the sidebar to read.</p>
                         </div>
                     </div>
+                    <textarea class="form-textarea hidden" id="readerEditor" style="width:100%;min-height:500px;font-family:'Lora',serif;font-size:0.95rem;line-height:1.8;padding:24px;background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;resize:vertical;white-space:pre-wrap"></textarea>
                 </div>
             </div>
         </div>
@@ -416,11 +456,19 @@
                     <div class="form-group mb-4" style="margin-bottom: 16px;">
                         <label class="form-label" for="combineModelSelect">Gemini Model for Combine & Polish</label>
                         <select class="form-select" id="combineModelSelect">
-                            <option value="gemini-2.5-flash-lite" selected>✨ Gemini 2.5 Flash Lite (default, fast & balanced)</option>
-                            <option value="gemini-2.5-flash">⚡ Gemini 2.5 Flash (high speed & instruction following)</option>
-                            <option value="gemini-2.5-pro">🧠 Gemini 2.5 Pro (maximum reasoning & precision)</option>
-                            <option value="gemini-1.5-flash">⚡ Gemini 1.5 Flash (legacy fast)</option>
-                            <option value="gemini-1.5-pro">🧠 Gemini 1.5 Pro (legacy reasoning)</option>
+                            <optgroup label="Gemini 3.x">
+                                <option value="gemini-3.5-flash">gemini-3.5-flash (5 RPM)</option>
+                                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (15 RPM)</option>
+                                <option value="gemini-3-flash">gemini-3-flash (5 RPM)</option>
+                            </optgroup>
+                            <optgroup label="Gemini 2.5">
+                                <option value="gemini-2.5-flash">gemini-2.5-flash (5 RPM)</option>
+                                <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite (10 RPM)</option>
+                            </optgroup>
+                            <optgroup label="Gemma Open Models">
+                                <option value="gemma-4-26b">gemma-4-26b (15 RPM)</option>
+                                <option value="gemma-4-31b">gemma-4-31b (15 RPM)</option>
+                            </optgroup>
                         </select>
                     </div>
 
@@ -433,10 +481,26 @@
                         </button>
                     </div>
 
+                    <!-- Generate Entire Story Callout -->
+                    <div class="mt-4 p-3 border rounded bg-dim" style="margin-top: 24px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: rgba(255, 255, 255, 0.03);">
+                        <h4 style="margin-top: 0; margin-bottom: 8px; display: flex; align-items: center; gap: 8px;">
+                            <span>✍️</span> Generate the Entire Story Instead
+                        </h4>
+                        <p class="text-sm text-dim" style="margin-bottom: 12px; font-size: 0.9rem; line-height: 1.4;">
+                            If you only have one or a few chapters generated, "Combine & Polish" will fill missing premise beats with short paragraph-length scenes. For a fully-realized, long-form novel, use the automatic sequential generator to write all remaining chapters in full detail.
+                        </p>
+                        <button class="btn btn-sm btn-secondary" onclick="switchToEntireStoryGeneration()" style="font-size: 0.85rem; padding: 6px 12px;">
+                            🚀 Switch to Auto-Generation
+                        </button>
+                    </div>
+
                     <!-- Progress -->
                     <div class="combine-progress hidden" id="combineProgress">
                         <div class="combine-spinner"></div>
                         <div class="combine-status" id="combineStatusText">Initializing...</div>
+                        <button class="btn btn-danger" onclick="cancelCombine()" id="btnCancelCombine" style="margin-left: auto; padding: 6px 12px; font-size: 13px;">
+                            🛑 Stop
+                        </button>
                     </div>
                 </div>
 
@@ -453,9 +517,19 @@
                 <div class="card hidden" id="combinePolishedCard">
                     <div class="card-header">
                         <span class="card-title"><span class="icon">📖</span> Polished Story</span>
-                        <button class="btn btn-sm" onclick="toggleCombineSection('combinePolished', 'btnTogglePolished')" id="btnTogglePolished">▼ Collapse</button>
+                        <div class="flex gap-2 items-center">
+                            <!-- Reader Toolbar -->
+                            <div class="reader-toolbar flex gap-1 items-center" style="border-right: 1px solid var(--border); padding-right: 8px; margin-right: 8px; display: inline-flex;">
+                                <button class="btn btn-sm" onclick="adjustReaderFontSize(-1)" title="Decrease Font Size" style="padding: 4px 8px; font-size: 11px;">A-</button>
+                                <button class="btn btn-sm" onclick="adjustReaderFontSize(1)" title="Increase Font Size" style="padding: 4px 8px; font-size: 11px;">A+</button>
+                                <button class="btn btn-sm" onclick="toggleReaderTheme()" id="btnReaderTheme" title="Change Theme" style="padding: 4px 8px; font-size: 11px;">🎨 Theme</button>
+                                <button class="btn btn-sm" onclick="toggleReaderFont()" id="btnReaderFont" title="Toggle Serif/Sans-Serif" style="padding: 4px 8px; font-size: 11px;">🔤 Font</button>
+                                <button class="btn btn-sm" onclick="toggleReaderFullscreen()" title="Fullscreen Mode" style="padding: 4px 8px; font-size: 11px;">📺 Fullscreen</button>
+                            </div>
+                            <button class="btn btn-sm" onclick="toggleCombineSection('combinePolished', 'btnTogglePolished')" id="btnTogglePolished">▼ Collapse</button>
+                        </div>
                     </div>
-                    <div class="combine-analysis" id="combinePolished"></div>
+                    <div class="polished-story-reader theme-obsidian font-sans" id="combinePolished"></div>
                 </div>
 
                 <!-- Download Section -->
@@ -525,6 +599,13 @@
                                 <span>
                                     <strong>Full Gemini</strong>
                                     <small>Every agent uses Google Gemini. High quality, generous free tier.</small>
+                                </span>
+                            </label>
+                            <label class="settings-mode">
+                                <input type="radio" name="backendMode" value="openrouter">
+                                <span>
+                                    <strong>Full OpenRouter</strong>
+                                    <small>Every agent uses OpenRouter. Access to hundreds of models (Claude, GPT, Llama, etc).</small>
                                 </span>
                             </label>
                         </div>
@@ -611,8 +692,23 @@
                         </div>
                         <div class="form-group">
                             <label class="form-label">Gemini model</label>
-                            <input class="form-input" id="setting_GEMINI_MODEL" data-setting="GEMINI_MODEL" placeholder="gemini-2.5-flash-lite">
+                            <select class="form-select" id="setting_GEMINI_MODEL" data-setting="GEMINI_MODEL">
+                                <optgroup label="Gemini 3.x">
+                                    <option value="gemini-3.5-flash">gemini-3.5-flash (5 RPM)</option>
+                                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (15 RPM)</option>
+                                    <option value="gemini-3-flash">gemini-3-flash (5 RPM)</option>
+                                </optgroup>
+                                <optgroup label="Gemini 2.5">
+                                    <option value="gemini-2.5-flash">gemini-2.5-flash (5 RPM)</option>
+                                    <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite (10 RPM)</option>
+                                </optgroup>
+                                <optgroup label="Gemma Open Models">
+                                    <option value="gemma-4-26b">gemma-4-26b (15 RPM, Unlimited TPM)</option>
+                                    <option value="gemma-4-31b">gemma-4-31b (15 RPM, Unlimited TPM)</option>
+                                </optgroup>
+                            </select>
                         </div>
+
                         <div class="settings-field-row">
                             <div class="form-group">
                                 <label class="form-label">Cloud max tokens</label>
@@ -699,6 +795,61 @@
                             <input type="checkbox" id="setting_GROQ_ROTATE_ON_RATE_LIMIT" data-setting="GROQ_ROTATE_ON_RATE_LIMIT">
                             <span>Rotate Groq keys aggressively on 429</span>
                         </label>
+                    </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <span class="card-title">OpenRouter Settings</span>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">API Key</label>
+                            <input class="form-input" id="setting_OPENROUTER_API_KEY" data-setting="OPENROUTER_API_KEY" placeholder="sk-or-...">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Model</label>
+                            <select class="form-select" id="setting_OPENROUTER_MODEL" data-setting="OPENROUTER_MODEL">
+                                <optgroup label="Free Models">
+                                    <option value="cognitivecomputations/dolphin-mistral-24b-venice-edition:free" selected>cognitivecomputations/dolphin-mistral-24b-venice-edition:free</option>
+                                    <option value="deepseek/deepseek-chat-v3-0324:free">deepseek/deepseek-chat-v3-0324:free</option>
+                                    <option value="google/gemma-3-27b-it:free">google/gemma-3-27b-it:free</option>
+                                    <option value="meta-llama/llama-3.3-70b-instruct:free">meta-llama/llama-3.3-70b-instruct:free</option>
+                                    <option value="qwen/qwen3-32b:free">qwen/qwen3-32b:free</option>
+                                    <option value="mistralai/mistral-small-3.1-24b-instruct:free">mistralai/mistral-small-3.1-24b-instruct:free</option>
+                                </optgroup>
+                                <optgroup label="Anthropic">
+                                    <option value="anthropic/claude-sonnet-4">anthropic/claude-sonnet-4</option>
+                                    <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
+                                    <option value="anthropic/claude-3-haiku">anthropic/claude-3-haiku</option>
+                                </optgroup>
+                                <optgroup label="OpenAI">
+                                    <option value="openai/gpt-4o">openai/gpt-4o</option>
+                                    <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
+                                </optgroup>
+                                <optgroup label="Meta">
+                                    <option value="meta-llama/llama-3.1-70b-instruct">meta-llama/llama-3.1-70b-instruct</option>
+                                    <option value="meta-llama/llama-3.3-70b-instruct">meta-llama/llama-3.3-70b-instruct</option>
+                                </optgroup>
+                                <optgroup label="Mistral">
+                                    <option value="mistralai/mistral-large">mistralai/mistral-large</option>
+                                    <option value="mistralai/mistral-small">mistralai/mistral-small</option>
+                                </optgroup>
+                                <optgroup label="Other">
+                                    <option value="deepseek/deepseek-chat">deepseek/deepseek-chat</option>
+                                    <option value="qwen/qwen-2.5-72b-instruct">qwen/qwen-2.5-72b-instruct</option>
+                                    <option value="google/gemini-pro-1.5">google/gemini-pro-1.5</option>
+                                </optgroup>
+                            </select>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Min request interval</label>
+                                <input class="form-input" type="number" step="0.1" id="setting_OPENROUTER_MIN_REQUEST_INTERVAL" data-setting="OPENROUTER_MIN_REQUEST_INTERVAL">
+                            </div>
+                        </div>
+                        <div class="text-dim text-sm" style="margin-top:8px">
+                            OpenRouter routes to 300+ models via a single API key. Get yours at
+                            <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--accent-primary)">openrouter.ai/keys</a>
+                        </div>
                     </div>
 
                     <div class="card">

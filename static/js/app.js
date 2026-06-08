@@ -16,6 +16,7 @@ let plannedChapters = 1;
 let completedChapters = 0;
 const GROQ_MODEL_OPTION = '__groq_api__';
 const GEMINI_MODEL_OPTION = '__gemini_api__';
+const OPENROUTER_MODEL_OPTION = '__openrouter_api__';
 
 // Manual interactive session state
 let manualSessionActive = false;
@@ -31,17 +32,25 @@ function isGeminiProvider(provider) {
     return String(provider || '').toLowerCase().includes('gemini');
 }
 
+function isOpenRouterProvider(provider) {
+    return String(provider || '').toLowerCase().includes('openrouter');
+}
+
 function providerBadge(provider) {
     if (isGeminiProvider(provider)) return '✨ Gemini';
+    if (isOpenRouterProvider(provider)) return '🌐 OpenRouter';
     return isGroqProvider(provider) ? '☁️ Groq' : '💻 llama.cpp';
 }
 
-function modelOptionLabel(modelId, groqModelName, geminiModelName) {
+function modelOptionLabel(modelId, groqModelName, geminiModelName, openrouterModelName) {
     if (modelId === GROQ_MODEL_OPTION) {
         return `☁️ Groq API (${groqModelName || 'default'})`;
     }
     if (modelId === GEMINI_MODEL_OPTION) {
         return `✨ Gemini API (${geminiModelName || 'default'})`;
+    }
+    if (modelId === OPENROUTER_MODEL_OPTION) {
+        return `🌐 OpenRouter API (${openrouterModelName || 'default'})`;
     }
     return `💻 ${modelId}`;
 }
@@ -98,23 +107,33 @@ function switchView(viewName) {
     }
 }
 
+// Store raw scene text for edit mode
+let manualSceneTexts = new Map();
+
 function renderManualScenes(scenes) {
     const completedDiv = document.getElementById('manualCompletedScenes');
     completedDiv.innerHTML = '';
+    manualSceneTexts.clear();
     if (scenes && scenes.length > 0) {
         scenes.forEach((scene, idx) => {
             // Handle both simple strings (from DB fallback) and dicts (from generate_manual_scene)
             const sceneText = typeof scene === 'string' ? scene : scene.text;
             const enhancedSummary = typeof scene === 'string' ? '' : (scene.enhanced_summary || '');
-            const words = typeof scene === 'string' ? '' : (scene.words || '');
+            const wordCount = (sceneText || '').split(/\s+/).filter(Boolean).length;
+            
+            // Store raw text in Map for edit mode
+            manualSceneTexts.set(idx, sceneText || '');
             
             const sceneHtml = `
                 <div class="manual-scene-result" style="position:relative; margin-bottom:16px;padding:16px;background:var(--surface-2);border-radius:8px;border-left:3px solid var(--accent-primary)">
-                    <button class="btn btn-sm btn-danger" style="position:absolute;top:12px;right:12px;z-index:10;font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${idx})" title="Delete this scene">🗑️</button>
-                    <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:40px">Scene ${idx + 1}</div>
+                    <div style="position:absolute;top:12px;right:12px;z-index:10;display:flex;gap:4px">
+                        <button class="btn btn-sm" style="font-size:0.8rem;padding:4px 8px;background:var(--accent-secondary);color:#fff" onclick="editManualScene(${idx})" title="Edit this scene's text">✏️</button>
+                        <button class="btn btn-sm btn-danger" style="font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${idx})" title="Delete this scene">🗑️</button>
+                    </div>
+                    <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:80px">Scene ${idx + 1}</div>
                     ${enhancedSummary ? `<div class="text-dim text-sm" style="margin-bottom:6px">Enhanced: ${escHtml(enhancedSummary)}</div>` : ''}
                     <div style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif;font-size:0.92rem;max-height:300px;overflow-y:auto">${escHtml(sceneText || '')}</div>
-                    ${words ? `<div class="text-dim text-sm" style="margin-top:8px">${words} words</div>` : ''}
+                    <div class="text-dim text-sm" style="margin-top:8px">${wordCount} words</div>
                 </div>
             `;
             completedDiv.insertAdjacentHTML('beforeend', sceneHtml);
@@ -139,6 +158,144 @@ async function deleteManualScene(index) {
             document.getElementById('btnManualFinish').classList.add('hidden');
         }
         showToast('Scene deleted', 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+// ─── Typed Scene Panel (Manual Mode) ─────────────────────────────
+function toggleTypedScenePanel() {
+    const panel = document.getElementById('manualTypedScenePanel');
+    if (panel.classList.contains('hidden')) {
+        panel.classList.remove('hidden');
+        document.getElementById('manualTypedSceneText').value = '';
+        document.getElementById('typedSceneWordCount').textContent = '0 words';
+        document.getElementById('manualTypedSceneText').focus();
+    } else {
+        panel.classList.add('hidden');
+    }
+}
+
+// Live word counter for typed scene textarea
+document.addEventListener('DOMContentLoaded', () => {
+    const ta = document.getElementById('manualTypedSceneText');
+    if (ta) {
+        ta.addEventListener('input', () => {
+            const words = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
+            document.getElementById('typedSceneWordCount').textContent = `${words} word${words !== 1 ? 's' : ''}`;
+        });
+    }
+});
+
+async function addTypedScene() {
+    if (!currentProject || !manualSessionActive) {
+        showToast('No active manual session', 'error');
+        return;
+    }
+
+    const text = document.getElementById('manualTypedSceneText').value.trim();
+    if (!text) {
+        showToast('Type some scene text first', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('btnAddTypedScene');
+    btn.disabled = true;
+    btn.textContent = '⏳ Adding...';
+
+    try {
+        // Use the scene API to add typed text as a "generated" scene via a special brief
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/typed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to add typed scene');
+
+        manualScenesCompleted = data.scenes_completed;
+        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
+        renderManualScenes(data.completed_scenes);
+
+        document.getElementById('btnManualFinish').classList.remove('hidden');
+        toggleTypedScenePanel();
+        showToast(`Typed scene added (${data.words} words)`, 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '✅ Add Scene';
+    }
+}
+
+// ─── Edit Scene Inline (Manual Mode) ─────────────────────────────
+function editManualScene(index) {
+    const container = document.getElementById('manualCompletedScenes');
+    const sceneEl = container.children[index];
+    if (!sceneEl) return;
+
+    // Get the raw text from our Map
+    const rawText = manualSceneTexts.get(index) || '';
+
+    // Replace the text display with a textarea
+    const oldHtml = sceneEl.innerHTML;
+    sceneEl.setAttribute('data-old-html', oldHtml);
+    sceneEl.innerHTML = `
+        <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary)">Scene ${index + 1} — Editing</div>
+        <textarea class="form-textarea" id="editSceneTextarea_${index}" rows="12"
+            style="font-family:'Lora',serif;font-size:0.92rem;line-height:1.7;width:100%;white-space:pre-wrap">${escHtml(rawText)}</textarea>
+        <div class="flex gap-2 items-center" style="margin-top:10px">
+            <button class="btn btn-primary" onclick="saveManualSceneEdit(${index})" style="font-size:0.85rem;padding:6px 14px">💾 Save</button>
+            <button class="btn" onclick="cancelManualSceneEdit(${index})" style="font-size:0.85rem;padding:6px 14px">✕ Cancel</button>
+            <span class="text-dim text-sm" id="editSceneWordCount_${index}"></span>
+        </div>
+    `;
+
+    // Word counter for edit textarea
+    const ta = document.getElementById(`editSceneTextarea_${index}`);
+    const wc = document.getElementById(`editSceneWordCount_${index}`);
+    const updateWc = () => {
+        const w = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
+        wc.textContent = `${w} words`;
+    };
+    updateWc();
+    ta.addEventListener('input', updateWc);
+    ta.focus();
+}
+
+function cancelManualSceneEdit(index) {
+    const container = document.getElementById('manualCompletedScenes');
+    const sceneEl = container.children[index];
+    if (!sceneEl) return;
+    const oldHtml = sceneEl.getAttribute('data-old-html');
+    if (oldHtml) {
+        sceneEl.innerHTML = oldHtml;
+    }
+}
+
+async function saveManualSceneEdit(index) {
+    const ta = document.getElementById(`editSceneTextarea_${index}`);
+    if (!ta) return;
+    const newText = ta.value.trim();
+    if (!newText) {
+        showToast('Scene text cannot be empty', 'error');
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${index}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: newText }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save scene edit');
+
+        manualScenesCompleted = data.scenes_completed;
+        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+        renderManualScenes(data.completed_scenes);
+        showToast(`Scene ${index + 1} updated (${data.words} words)`, 'success');
     } catch (e) {
         showToast(e.message, 'error');
     }
@@ -626,10 +783,15 @@ function onManualSceneDone(data) {
 
     // Add completed scene to the display
     const completedDiv = document.getElementById('manualCompletedScenes');
+    const sceneIdx = manualScenesCompleted - 1;
+    manualSceneTexts.set(sceneIdx, data.scene_text || '');
     const sceneHtml = `
         <div class="manual-scene-result" style="position:relative; margin-bottom:16px;padding:16px;background:var(--surface-2);border-radius:8px;border-left:3px solid var(--accent-primary)">
-            <button class="btn btn-sm btn-danger" style="position:absolute;top:12px;right:12px;z-index:10;font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${manualScenesCompleted - 1})" title="Delete this scene">🗑️</button>
-            <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:40px">Scene ${manualScenesCompleted}</div>
+            <div style="position:absolute;top:12px;right:12px;z-index:10;display:flex;gap:4px">
+                <button class="btn btn-sm" style="font-size:0.8rem;padding:4px 8px;background:var(--accent-secondary);color:#fff" onclick="editManualScene(${sceneIdx})" title="Edit this scene's text">✏️</button>
+                <button class="btn btn-sm btn-danger" style="font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${sceneIdx})" title="Delete this scene">🗑️</button>
+            </div>
+            <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:80px">Scene ${manualScenesCompleted}</div>
             <div class="text-dim text-sm" style="margin-bottom:6px">Enhanced: ${escHtml(data.enhanced_summary || '')}</div>
             <div style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif;font-size:0.92rem;max-height:300px;overflow-y:auto">${escHtml(data.scene_text || '')}</div>
             <div class="text-dim text-sm" style="margin-top:8px">${data.words || 0} words</div>
@@ -707,6 +869,7 @@ function resetManualSession() {
     manualScenesCompleted = 0;
     manualChapterNum = 0;
     manualIsGeneratingScene = false;
+    manualSceneTexts.clear();
 
     if (eventSource) { eventSource.close(); eventSource = null; }
 
@@ -714,6 +877,7 @@ function resetManualSession() {
     document.getElementById('manualStartCard').classList.remove('hidden');
     document.getElementById('manualSceneCard').classList.add('hidden');
     document.getElementById('manualStreamArea')?.classList.add('hidden');
+    document.getElementById('manualTypedScenePanel')?.classList.add('hidden');
     setStatus('online', 'Ready');
 }
 
@@ -874,11 +1038,12 @@ function handleSSE(event) {
 
         case 'chapter_complete':
             completedChapters += 1;
+            const planDisplay = plannedChapters === -1 ? 'Entire Story' : plannedChapters;
             showToast(
-                `Chapter ${data.chapter_number} complete! ${completedChapters}/${plannedChapters}`,
+                `Chapter ${data.chapter_number} complete! ${completedChapters}/${planDisplay}`,
                 'success',
             );
-            updateStats({ status: `Completed chapter ${completedChapters}/${plannedChapters}` });
+            updateStats({ status: `Completed chapter ${completedChapters}/${planDisplay}` });
             loadChapters(); // Update status from 'writing' to 'completed'
             break;
 
@@ -1055,19 +1220,102 @@ function renderChapterList(chapters) {
     }).join('');
 }
 
+let readerCurrentChapter = null;
+let readerRawContent = '';
+let readerEditMode = false;
+
 async function readChapter(num, el = null) {
     // Highlight active
     document.querySelectorAll('.chapter-item').forEach(i => i.classList.remove('active'));
     if (el) el.classList.add('active');
 
+    // Cancel edit mode if active
+    if (readerEditMode) cancelReaderEdit();
+
     try {
         const res = await fetch(`/api/project/${currentProject}/chapter/${num}`);
         const data = await res.json();
         if (data.content) {
+            readerCurrentChapter = num;
+            readerRawContent = data.content;
             document.getElementById('readerContent').innerHTML = markdownToHtml(data.content);
+
+            // Show card header with chapter info
+            const header = document.getElementById('readerCardHeader');
+            header.style.display = '';
+            document.getElementById('readerChapterTitle').innerHTML = `<span class="icon">📖</span> Chapter ${num}`;
+            document.getElementById('btnReaderEdit').classList.remove('hidden');
         }
     } catch (e) {
         showToast('Failed to load chapter', 'error');
+    }
+}
+
+function toggleReaderEdit() {
+    if (readerCurrentChapter === null) {
+        showToast('Open a chapter first', 'error');
+        return;
+    }
+    readerEditMode = true;
+
+    // Hide rendered content, show editor textarea
+    document.getElementById('readerContent').classList.add('hidden');
+    const editor = document.getElementById('readerEditor');
+    editor.classList.remove('hidden');
+    editor.value = readerRawContent;
+    editor.focus();
+
+    // Toggle buttons
+    document.getElementById('btnReaderEdit').classList.add('hidden');
+    document.getElementById('btnReaderSave').classList.remove('hidden');
+    document.getElementById('btnReaderCancel').classList.remove('hidden');
+}
+
+function cancelReaderEdit() {
+    readerEditMode = false;
+    document.getElementById('readerContent').classList.remove('hidden');
+    document.getElementById('readerEditor').classList.add('hidden');
+    document.getElementById('btnReaderEdit').classList.remove('hidden');
+    document.getElementById('btnReaderSave').classList.add('hidden');
+    document.getElementById('btnReaderCancel').classList.add('hidden');
+}
+
+async function saveReaderEdit() {
+    if (readerCurrentChapter === null) return;
+
+    const editor = document.getElementById('readerEditor');
+    const content = editor.value.trim();
+    if (!content) {
+        showToast('Chapter content cannot be empty', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('btnReaderSave');
+    btn.disabled = true;
+    btn.textContent = '⏳ Saving...';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/chapter/${readerCurrentChapter}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to save chapter');
+        }
+
+        // Update stored raw content and re-render
+        readerRawContent = content;
+        document.getElementById('readerContent').innerHTML = markdownToHtml(content);
+        cancelReaderEdit();
+        loadChapters(); // Refresh word counts in sidebar
+        showToast(`Chapter ${readerCurrentChapter} saved (${data.words} words)`, 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.textContent = '💾 Save';
     }
 }
 
@@ -1279,29 +1527,96 @@ function escHtml(str) {
 }
 
 function markdownToHtml(md) {
-    return String(md || '')
-        .split(/\n{2,}/)
-        .map(block => renderMarkdownBlock(block.trim()))
-        .filter(Boolean)
-        .join('');
-}
+    if (!md) return '';
+    
+    // Normalize newlines
+    const lines = String(md).replace(/\r\n/g, '\n').split('\n');
+    let html = [];
+    let inList = false;
+    let listType = null; // 'ul' or 'ol'
+    let currentParagraph = [];
 
-function renderMarkdownBlock(block) {
-    if (!block) return '';
-    if (/^\* \* \*$/.test(block)) {
-        return '<hr style="border:none;border-top:1px solid var(--border);margin:24px 0">';
+    function closeList() {
+        if (inList) {
+            html.push(`</${listType}>`);
+            inList = false;
+            listType = null;
+        }
     }
 
-    const h3 = block.match(/^###\s+(.+)$/s);
-    if (h3) return `<h3>${inlineMarkdown(h3[1])}</h3>`;
+    function closeParagraph() {
+        if (currentParagraph.length > 0) {
+            html.push(`<p>${inlineMarkdown(currentParagraph.join('<br>'))}</p>`);
+            currentParagraph = [];
+        }
+    }
 
-    const h2 = block.match(/^##\s+(.+)$/s);
-    if (h2) return `<h2>${inlineMarkdown(h2[1])}</h2>`;
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const trimmed = line.trim();
 
-    const h1 = block.match(/^#\s+(.+)$/s);
-    if (h1) return `<h1>${inlineMarkdown(h1[1])}</h1>`;
+        // Handle empty line (paragraph/list break)
+        if (!trimmed) {
+            closeList();
+            closeParagraph();
+            continue;
+        }
 
-    return `<p>${inlineMarkdown(block).replace(/\n/g, '<br>')}</p>`;
+        // Handle scene separator / horizontal rule
+        if (trimmed === '* * *' || trimmed === '---' || trimmed === '***') {
+            closeList();
+            closeParagraph();
+            html.push('<hr style="border:none;border-top:1px solid var(--border);margin:24px 0">');
+            continue;
+        }
+
+        // Handle headings
+        const hHeading = trimmed.match(/^(#{1,6})\s+(.+)$/);
+        if (hHeading) {
+            closeList();
+            closeParagraph();
+            const level = hHeading[1].length;
+            html.push(`<h${level}>${inlineMarkdown(hHeading[2])}</h${level}>`);
+            continue;
+        }
+
+        // Handle bullet lists (lines starting with -, *, or + followed by space)
+        const bulletMatch = line.match(/^(\s*)([-*+])\s+(.+)$/);
+        if (bulletMatch) {
+            closeParagraph();
+            if (!inList || listType !== 'ul') {
+                closeList();
+                html.push('<ul class="markdown-list">');
+                inList = true;
+                listType = 'ul';
+            }
+            html.push(`<li>${inlineMarkdown(bulletMatch[3])}</li>`);
+            continue;
+        }
+
+        // Handle numbered lists (lines starting with digits followed by dot and space)
+        const numberMatch = line.match(/^(\s*)(\d+)\.\s+(.+)$/);
+        if (numberMatch) {
+            closeParagraph();
+            if (!inList || listType !== 'ol') {
+                closeList();
+                html.push('<ol class="markdown-list">');
+                inList = true;
+                listType = 'ol';
+            }
+            html.push(`<li>${inlineMarkdown(numberMatch[3])}</li>`);
+            continue;
+        }
+
+        // It's a standard text line, append to paragraph
+        closeList();
+        currentParagraph.push(trimmed);
+    }
+
+    closeList();
+    closeParagraph();
+
+    return html.join('\n');
 }
 
 function inlineMarkdown(text) {
@@ -1494,13 +1809,47 @@ function stopCombine() {
     isCombining = false;
     const btn = document.getElementById('btnCombine');
     const progress = document.getElementById('combineProgress');
+    const btnCancel = document.getElementById('btnCancelCombine');
     if (btn) {
         btn.disabled = false;
         btn.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
     }
+    if (btnCancel) {
+        btnCancel.disabled = false;
+        btnCancel.textContent = '🛑 Stop';
+    }
     if (progress) progress.classList.add('hidden');
     setStatus('online', 'Ready');
     if (combineEventSource) { combineEventSource.close(); combineEventSource = null; }
+}
+
+async function cancelCombine() {
+    if (!currentProject) return;
+    const btnCancel = document.getElementById('btnCancelCombine');
+    if (btnCancel) {
+        btnCancel.disabled = true;
+        btnCancel.textContent = '⏳ Stopping...';
+    }
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/cancel`, {
+            method: 'POST'
+        });
+        if (res.ok) {
+            showToast('Cancellation requested', 'info');
+        } else {
+            showToast('Failed to request cancellation', 'error');
+            if (btnCancel) {
+                btnCancel.disabled = false;
+                btnCancel.textContent = '🛑 Stop';
+            }
+        }
+    } catch (e) {
+        showToast('Error requesting cancellation', 'error');
+        if (btnCancel) {
+            btnCancel.disabled = false;
+            btnCancel.textContent = '🛑 Stop';
+        }
+    }
 }
 
 function downloadCombined(type) {
@@ -1771,7 +2120,7 @@ function populateSettings(data) {
         const options = models.map(model =>
             `<option value="${escHtml(model)}" ${model === active ? 'selected' : ''}>${escHtml(model)}</option>`
         );
-        if (active && active !== GROQ_MODEL_OPTION && !models.includes(active)) {
+        if (active && active !== GROQ_MODEL_OPTION && active !== OPENROUTER_MODEL_OPTION && !models.includes(active)) {
             options.unshift(`<option value="${escHtml(active)}" selected>${escHtml(active)}</option>`);
         }
         activeModel.innerHTML = options.length
@@ -1817,6 +2166,7 @@ async function saveSettings() {
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || 'Failed to save settings');
         populateSettings(data);
+        loadModels();  // refresh header model selector with new backend
         showToast('Settings saved. New generations will use them.', 'success');
     } catch (e) {
         showToast(e.message || 'Failed to save settings', 'error');
@@ -1839,7 +2189,7 @@ async function loadModels() {
             return;
         }
         select.innerHTML = data.models.map(m =>
-            `<option value="${escHtml(m)}" ${m === data.active ? 'selected' : ''}>${escHtml(modelOptionLabel(m, data.groq_model, data.gemini_model))}</option>`
+            `<option value="${escHtml(m)}" ${m === data.active ? 'selected' : ''}>${escHtml(modelOptionLabel(m, data.groq_model, data.gemini_model, data.openrouter_model))}</option>`
         ).join('');
     } catch (e) {
         select.innerHTML = '<option>Error loading models</option>';
@@ -1859,6 +2209,8 @@ async function switchModel(model) {
                 showToast(`Switched to Groq API (${data.groq_model || 'default'})`, 'success');
             } else if ((data.active || model) === GEMINI_MODEL_OPTION) {
                 showToast(`Switched to Gemini API (${data.gemini_model || 'default'})`, 'success');
+            } else if ((data.active || model) === OPENROUTER_MODEL_OPTION) {
+                showToast(`Switched to OpenRouter API (${data.openrouter_model || 'default'})`, 'success');
             } else {
                 showToast(`Switched to ${data.active || model}`, 'success');
             }
@@ -1869,6 +2221,166 @@ async function switchModel(model) {
     } catch (e) {
         showToast('Failed to switch model', 'error');
     }
+}
+
+// ─── Polished Story Reader Toolbar ───────────────────────────────
+let readerFontSize = 17;
+const readerThemes = ['obsidian', 'parchment', 'midnight'];
+let readerThemeIndex = 0;
+let readerIsSerif = false;
+let readerIsFullscreen = false;
+
+function adjustReaderFontSize(delta) {
+    const el = readerIsFullscreen
+        ? document.getElementById('fullscreenReaderContent')
+        : document.getElementById('combinePolished');
+    if (!el) return;
+    readerFontSize = Math.max(12, Math.min(28, readerFontSize + delta));
+    el.style.fontSize = readerFontSize + 'px';
+    showToast(`Font size: ${readerFontSize}px`, 'info');
+}
+
+function toggleReaderTheme() {
+    const el = readerIsFullscreen
+        ? document.getElementById('fullscreenReaderContent')
+        : document.getElementById('combinePolished');
+    if (!el) return;
+    readerThemes.forEach(t => el.classList.remove('theme-' + t));
+    readerThemeIndex = (readerThemeIndex + 1) % readerThemes.length;
+    el.classList.add('theme-' + readerThemes[readerThemeIndex]);
+    const themeNames = { obsidian: '🌑 Obsidian', parchment: '📜 Parchment', midnight: '🌌 Midnight' };
+    showToast(`Theme: ${themeNames[readerThemes[readerThemeIndex]]}`, 'info');
+}
+
+function toggleReaderFont() {
+    const el = readerIsFullscreen
+        ? document.getElementById('fullscreenReaderContent')
+        : document.getElementById('combinePolished');
+    if (!el) return;
+    readerIsSerif = !readerIsSerif;
+    el.classList.toggle('font-serif', readerIsSerif);
+    el.classList.toggle('font-sans', !readerIsSerif);
+    showToast(readerIsSerif ? 'Font: Serif (Lora)' : 'Font: Sans-Serif (Inter)', 'info');
+}
+
+function toggleReaderFullscreen() {
+    if (readerIsFullscreen) {
+        exitReaderFullscreen();
+        return;
+    }
+
+    const source = document.getElementById('combinePolished');
+    if (!source) return;
+
+    // Build fullscreen overlay appended to <body> (bypasses parent backdrop-filter/transform)
+    const overlay = document.createElement('div');
+    overlay.id = 'readerFullscreenOverlay';
+    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;display:flex;flex-direction:column;animation:readerFadeIn 0.3s ease;';
+
+    // Toolbar at top
+    const toolbar = document.createElement('div');
+    toolbar.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:10px 20px;background:rgba(10,10,15,0.95);border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0;backdrop-filter:blur(12px);';
+    toolbar.innerHTML = `
+        <button class="btn btn-sm" onclick="adjustReaderFontSize(-1)" style="padding:4px 10px;font-size:12px;">A-</button>
+        <button class="btn btn-sm" onclick="adjustReaderFontSize(1)" style="padding:4px 10px;font-size:12px;">A+</button>
+        <button class="btn btn-sm" onclick="toggleReaderTheme()" style="padding:4px 10px;font-size:12px;">🎨 Theme</button>
+        <button class="btn btn-sm" onclick="toggleReaderFont()" style="padding:4px 10px;font-size:12px;">🔤 Font</button>
+        <div style="flex:1"></div>
+        <span style="color:#888;font-size:12px;font-family:Inter,sans-serif;">↑↓ Scroll · Esc to exit</span>
+        <button class="btn btn-sm" onclick="exitReaderFullscreen()" style="padding:4px 14px;font-size:12px;border-color:rgba(239,68,68,0.3);color:#ef4444;">✕ Exit</button>
+    `;
+    overlay.appendChild(toolbar);
+
+    // Content area — clone the reader content
+    const content = document.createElement('div');
+    content.id = 'fullscreenReaderContent';
+    content.className = source.className; // copy all theme/font classes
+    content.innerHTML = source.innerHTML;
+    content.style.cssText = 'flex:1;overflow-y:auto;max-height:none;padding:60px 80px;font-size:' + readerFontSize + 'px;';
+    content.tabIndex = 0; // make focusable for keyboard
+    overlay.appendChild(content);
+
+    document.body.appendChild(overlay);
+    document.body.style.overflow = 'hidden'; // prevent page scroll behind overlay
+    content.focus(); // focus for keyboard scrolling
+
+    readerIsFullscreen = true;
+    document.addEventListener('keydown', readerFullscreenKeyHandler);
+}
+
+function exitReaderFullscreen() {
+    const overlay = document.getElementById('readerFullscreenOverlay');
+    if (overlay) overlay.remove();
+    document.body.style.overflow = '';
+    readerIsFullscreen = false;
+    document.removeEventListener('keydown', readerFullscreenKeyHandler);
+}
+
+function readerFullscreenKeyHandler(e) {
+    if (e.key === 'Escape') {
+        exitReaderFullscreen();
+        return;
+    }
+    const content = document.getElementById('fullscreenReaderContent');
+    if (!content) return;
+    const scrollAmount = 80;
+    const pageScrollAmount = content.clientHeight * 0.85;
+
+    if (e.key === 'ArrowDown') { e.preventDefault(); content.scrollBy({ top: scrollAmount, behavior: 'smooth' }); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); content.scrollBy({ top: -scrollAmount, behavior: 'smooth' }); }
+    else if (e.key === 'PageDown' || e.key === ' ') { e.preventDefault(); content.scrollBy({ top: pageScrollAmount, behavior: 'smooth' }); }
+    else if (e.key === 'PageUp') { e.preventDefault(); content.scrollBy({ top: -pageScrollAmount, behavior: 'smooth' }); }
+    else if (e.key === 'Home') { e.preventDefault(); content.scrollTo({ top: 0, behavior: 'smooth' }); }
+    else if (e.key === 'End') { e.preventDefault(); content.scrollTo({ top: content.scrollHeight, behavior: 'smooth' }); }
+}
+
+// ─── Arrow Key Scrolling for Inline Reader ───────────────────────
+// When the Combine view is active and polished story is visible,
+// arrow keys scroll the story reader instead of the page.
+document.addEventListener('keydown', function(e) {
+    // Only intercept when not in fullscreen (fullscreen has its own handler)
+    if (readerIsFullscreen) return;
+    // Only when Combine view is active
+    const combineView = document.getElementById('viewCombine');
+    if (!combineView || !combineView.classList.contains('active')) return;
+    // Only when polished story is visible
+    const polished = document.getElementById('combinePolished');
+    const polishedCard = document.getElementById('combinePolishedCard');
+    if (!polished || !polishedCard || polishedCard.classList.contains('hidden')) return;
+    // Don't intercept if user is in an input/textarea
+    const tag = document.activeElement?.tagName?.toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+
+    const scrollAmount = 80;
+    const pageScrollAmount = polished.clientHeight * 0.85;
+
+    if (e.key === 'ArrowDown') { e.preventDefault(); polished.scrollBy({ top: scrollAmount, behavior: 'smooth' }); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); polished.scrollBy({ top: -scrollAmount, behavior: 'smooth' }); }
+    else if (e.key === 'PageDown') { e.preventDefault(); polished.scrollBy({ top: pageScrollAmount, behavior: 'smooth' }); }
+    else if (e.key === 'PageUp') { e.preventDefault(); polished.scrollBy({ top: -pageScrollAmount, behavior: 'smooth' }); }
+});
+
+function switchToEntireStoryGeneration() {
+    // 1. Switch view to generate
+    switchView('generate');
+    
+    // 2. Set chapter count option to -1
+    const chapterCountSelect = document.getElementById('genChapterCount');
+    if (chapterCountSelect) {
+        chapterCountSelect.value = '-1';
+    }
+    
+    // 3. Set the active model to Gemini API if available
+    const modelSelect = document.getElementById('modelSelect');
+    if (modelSelect) {
+        // Try to find the __gemini_api__ option
+        const geminiOption = Array.from(modelSelect.options).find(opt => opt.value === '__gemini_api__');
+        if (geminiOption) {
+            modelSelect.value = '__gemini_api__';
+            switchModel('__gemini_api__');
+        }
+    }
+    showToast('Switched to Auto-Generation. Select "Entire Story" and click Generate!', 'info');
 }
 
 // ─── Init ────────────────────────────────────────────────────────

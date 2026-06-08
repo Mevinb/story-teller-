@@ -3,7 +3,7 @@
    Dark theme with glassmorphism, gradients, and micro-animations
    ═══════════════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Playfair+Display:ital,wght@0,500;0,700;1,500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&family=Lora:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=Playfair+Display:ital,wght@0,500;0,700;1,500&display=swap');
 
 /* ─── CSS Variables ──────────────────────────────────────────────── */
 :root {
@@ -1077,7 +1077,7 @@ body::before {
     font-weight: 500;
 }
 
-/* Combine Analysis */
+/* Combine Analysis (used for the continuity analysis card) */
 .combine-analysis {
     padding: 20px;
     background: var(--bg-input);
@@ -1105,6 +1105,313 @@ body::before {
 .combine-analysis strong { color: #06b6d4; }
 
 .combine-analysis em { color: var(--text-secondary); }
+
+/* ─── Polished Story Reader (Premium Reading Experience) ─────────── */
+.polished-story-reader {
+    padding: 48px 56px;
+    border-radius: 0 0 var(--radius-md) var(--radius-md);
+    line-height: 2;
+    font-size: 17px;
+    letter-spacing: 0.015em;
+    max-height: 80vh;
+    overflow-y: auto;
+    scroll-behavior: smooth;
+    transition: background 0.4s ease, color 0.4s ease, font-family 0.3s ease, font-size 0.2s ease;
+    position: relative;
+}
+
+/* Scrollbar styling for reader */
+.polished-story-reader::-webkit-scrollbar { width: 8px; }
+.polished-story-reader::-webkit-scrollbar-track { background: transparent; }
+.polished-story-reader::-webkit-scrollbar-thumb {
+    border-radius: 4px;
+    background: rgba(139, 92, 246, 0.2);
+}
+.polished-story-reader::-webkit-scrollbar-thumb:hover {
+    background: rgba(139, 92, 246, 0.4);
+}
+
+/* ── Font Families ── */
+.polished-story-reader.font-serif {
+    font-family: 'Lora', 'Georgia', 'Times New Roman', serif;
+}
+
+.polished-story-reader.font-sans {
+    font-family: 'Inter', -apple-system, 'Segoe UI', sans-serif;
+    letter-spacing: 0.01em;
+}
+
+/* ── Theme: Obsidian (default dark) ── */
+.polished-story-reader.theme-obsidian {
+    background: linear-gradient(180deg, #0c0c14 0%, #10101c 100%);
+    color: #d4d4e0;
+    border: 1px solid rgba(139, 92, 246, 0.08);
+}
+
+.polished-story-reader.theme-obsidian h1 {
+    color: #e2d6ff;
+    border-bottom-color: rgba(139, 92, 246, 0.2);
+}
+
+.polished-story-reader.theme-obsidian h2 { color: #c4b5fd; }
+.polished-story-reader.theme-obsidian h3 { color: #a78bfa; }
+.polished-story-reader.theme-obsidian strong { color: #c4b5fd; }
+.polished-story-reader.theme-obsidian em { color: #a5b4fc; font-style: italic; }
+
+.polished-story-reader.theme-obsidian hr {
+    border-color: rgba(139, 92, 246, 0.15) !important;
+}
+
+.polished-story-reader.theme-obsidian::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 120px;
+    background: linear-gradient(180deg, rgba(139, 92, 246, 0.04) 0%, transparent 100%);
+    pointer-events: none;
+    border-radius: var(--radius-md) var(--radius-md) 0 0;
+}
+
+/* ── Theme: Parchment (warm light) ── */
+.polished-story-reader.theme-parchment {
+    background: linear-gradient(180deg, #f5f0e8 0%, #ede4d4 100%);
+    color: #3d3529;
+    border: 1px solid rgba(180, 160, 120, 0.3);
+}
+
+.polished-story-reader.theme-parchment h1 {
+    color: #2c1810;
+    border-bottom-color: rgba(139, 92, 60, 0.2);
+}
+
+.polished-story-reader.theme-parchment h2 { color: #4a3020; }
+.polished-story-reader.theme-parchment h3 { color: #5a4030; }
+.polished-story-reader.theme-parchment strong { color: #6b3a2e; }
+.polished-story-reader.theme-parchment em { color: #5a5040; font-style: italic; }
+
+.polished-story-reader.theme-parchment hr {
+    border-color: rgba(139, 92, 60, 0.2) !important;
+}
+
+.polished-story-reader.theme-parchment::-webkit-scrollbar-thumb {
+    background: rgba(139, 92, 60, 0.25);
+}
+
+/* ── Theme: Midnight (deep blue dark) ── */
+.polished-story-reader.theme-midnight {
+    background: linear-gradient(180deg, #0a1628 0%, #0d1a30 100%);
+    color: #c8d6e8;
+    border: 1px solid rgba(56, 189, 248, 0.08);
+}
+
+.polished-story-reader.theme-midnight h1 {
+    color: #e0ecff;
+    border-bottom-color: rgba(56, 189, 248, 0.15);
+}
+
+.polished-story-reader.theme-midnight h2 { color: #93c5fd; }
+.polished-story-reader.theme-midnight h3 { color: #60a5fa; }
+.polished-story-reader.theme-midnight strong { color: #93c5fd; }
+.polished-story-reader.theme-midnight em { color: #7dd3fc; font-style: italic; }
+
+.polished-story-reader.theme-midnight hr {
+    border-color: rgba(56, 189, 248, 0.12) !important;
+}
+
+.polished-story-reader.theme-midnight::-webkit-scrollbar-thumb {
+    background: rgba(56, 189, 248, 0.2);
+}
+
+/* ── Typography — Headings ── */
+.polished-story-reader h1 {
+    font-size: 1.85em;
+    font-weight: 700;
+    margin: 36px 0 20px;
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    line-height: 1.3;
+    letter-spacing: -0.01em;
+    text-align: center;
+}
+
+.polished-story-reader h1:first-child {
+    margin-top: 0;
+}
+
+.polished-story-reader h2 {
+    font-size: 1.4em;
+    font-weight: 600;
+    margin: 32px 0 14px;
+    line-height: 1.35;
+    letter-spacing: 0.02em;
+}
+
+.polished-story-reader h3 {
+    font-size: 1.15em;
+    font-weight: 600;
+    margin: 24px 0 10px;
+    line-height: 1.4;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    font-size: 0.85em;
+}
+
+/* ── Typography — Body Text ── */
+.polished-story-reader p {
+    margin-bottom: 18px;
+    text-align: justify;
+    text-justify: inter-word;
+    hyphens: auto;
+    -webkit-hyphens: auto;
+    word-break: break-word;
+}
+
+/* Drop cap on first paragraph after a heading */
+.polished-story-reader h1 + p::first-letter,
+.polished-story-reader h2 + p::first-letter {
+    font-size: 3.2em;
+    float: left;
+    line-height: 0.85;
+    margin-right: 8px;
+    margin-top: 4px;
+    font-weight: 700;
+    color: inherit;
+    opacity: 0.8;
+}
+
+.polished-story-reader.font-sans h1 + p::first-letter,
+.polished-story-reader.font-sans h2 + p::first-letter {
+    font-size: 2.8em;
+    margin-top: 5px;
+}
+
+/* ── Typography — Inline Elements ── */
+.polished-story-reader strong {
+    font-weight: 700;
+}
+
+.polished-story-reader em {
+    font-style: italic;
+}
+
+/* ── Horizontal Rules (scene breaks) ── */
+.polished-story-reader hr {
+    border: none !important;
+    margin: 36px auto !important;
+    text-align: center;
+    height: auto !important;
+    position: relative;
+}
+
+.polished-story-reader hr::after {
+    content: '· · ·';
+    display: block;
+    text-align: center;
+    letter-spacing: 8px;
+    font-size: 18px;
+    opacity: 0.4;
+}
+
+/* ── Lists ── */
+.polished-story-reader .markdown-list {
+    margin: 12px 0 18px 24px;
+    padding: 0;
+    line-height: 1.9;
+}
+
+.polished-story-reader ul.markdown-list {
+    list-style-type: none;
+}
+
+.polished-story-reader ul.markdown-list li {
+    position: relative;
+    padding-left: 20px;
+    margin-bottom: 6px;
+}
+
+.polished-story-reader ul.markdown-list li::before {
+    content: '—';
+    position: absolute;
+    left: 0;
+    opacity: 0.5;
+}
+
+.polished-story-reader ol.markdown-list {
+    list-style-type: decimal;
+    padding-left: 20px;
+}
+
+.polished-story-reader ol.markdown-list li {
+    margin-bottom: 6px;
+    padding-left: 6px;
+}
+
+/* ── Fullscreen Mode ── */
+.polished-story-reader-fullscreen {
+    position: fixed !important;
+    top: 0 !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: 0 !important;
+    max-height: 100vh !important;
+    z-index: 9999;
+    border-radius: 0 !important;
+    border: none !important;
+    padding: 60px 80px !important;
+    animation: readerFadeIn 0.3s ease;
+}
+
+@media (max-width: 768px) {
+    .polished-story-reader-fullscreen {
+        padding: 32px 24px !important;
+    }
+}
+
+.reader-fullscreen-close {
+    position: fixed;
+    top: 16px;
+    right: 24px;
+    z-index: 10000;
+    background: rgba(0, 0, 0, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: #fff;
+    padding: 8px 16px;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-family: 'Inter', sans-serif;
+    backdrop-filter: blur(8px);
+    transition: all 0.2s ease;
+}
+
+.reader-fullscreen-close:hover {
+    background: rgba(239, 68, 68, 0.6);
+    border-color: rgba(239, 68, 68, 0.4);
+}
+
+@keyframes readerFadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+}
+
+/* ── Responsive Reader ── */
+@media (max-width: 768px) {
+    .polished-story-reader {
+        padding: 28px 20px;
+        font-size: 15px;
+        line-height: 1.85;
+    }
+
+    .polished-story-reader h1 { font-size: 1.5em; }
+    .polished-story-reader h2 { font-size: 1.25em; }
+
+    .reader-toolbar {
+        display: none !important;
+    }
+}
+
+/* Gap utility for toolbar */
+.gap-1 { gap: 4px; }
 
 /* Combine Stats */
 .combine-stats {

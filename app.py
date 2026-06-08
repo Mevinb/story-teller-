@@ -19,6 +19,7 @@ import config
 from pipeline.orchestrator import PipelineOrchestrator, normalize_project_name
 from pipeline.gemini_combiner import combine_chapters, analyze_and_polish
 from models.groq_model import GroqModel
+from models.openrouter_model import OpenRouterModel
 from models.llm import LlamaCPP, list_gguf_models, resolve_model_path, to_model_id
 
 logger = logging.getLogger(__name__)
@@ -33,25 +34,29 @@ _initial_backend_mode = os.getenv(
     "BACKEND_MODE",
     "hybrid" if config.USE_CLOUD_MODEL else ("groq" if config.GROQ_API_KEY else "local"),
 ).strip().lower()
-if _initial_backend_mode not in {"local", "hybrid", "groq", "gemini"}:
+if _initial_backend_mode not in {"local", "hybrid", "groq", "gemini", "openrouter"}:
     _initial_backend_mode = "groq" if config.GROQ_API_KEY else "local"
 config.USE_CLOUD_MODEL = _initial_backend_mode == "hybrid"
 if _initial_backend_mode == "gemini":
     _selected_backend = "gemini"
 elif _initial_backend_mode == "groq":
     _selected_backend = "groq"
+elif _initial_backend_mode == "openrouter":
+    _selected_backend = "openrouter"
 else:
     _selected_backend = "local"
 _model_health_cache = {}
 _combine_queues = {}
 _active_combines = {}
 _combine_results = {}
+_combine_cancel_requests = set()
 _manual_sessions = {}  # project_name -> {"pipeline": ..., "session": ..., "eq": ...}
 _CHAPTER_FILE_RE = re.compile(r"^chapter_(\d{3,})\.md$")
 _GROQ_MODEL_OPTION = "__groq_api__"
 _GEMINI_MODEL_OPTION = "__gemini_api__"
+_OPENROUTER_MODEL_OPTION = "__openrouter_api__"
 _ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
-_SENSITIVE_SETTING_KEYS = {"GROQ_API_KEY", "GROQ_API_KEYS", "GEMINI_API_KEY"}
+_SENSITIVE_SETTING_KEYS = {"GROQ_API_KEY", "GROQ_API_KEYS", "GEMINI_API_KEY", "OPENROUTER_API_KEY"}
 _REDACTED_VALUE = "********"
 
 _SETTING_DEFS = {
@@ -61,6 +66,9 @@ _SETTING_DEFS = {
     "GROQ_MODEL": {"type": "str", "default": "qwen/qwen3-32b"},
     "GEMINI_API_KEY": {"type": "str", "default": ""},
     "GEMINI_MODEL": {"type": "str", "default": "gemini-2.5-flash-lite"},
+    "OPENROUTER_API_KEY": {"type": "str", "default": ""},
+    "OPENROUTER_MODEL": {"type": "str", "default": "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"},
+    "OPENROUTER_MIN_REQUEST_INTERVAL": {"type": "float", "default": 1.0},
     "USE_CLOUD_MODEL": {"type": "bool", "default": False},
     "LLAMA_MODELS_DIR": {"type": "str", "default": config.LLAMA_MODELS_DIR},
     "LLAMA_MODEL_PATH": {"type": "str", "default": config.LLAMA_MODEL_PATH},
@@ -184,6 +192,8 @@ def _queue_event(eq: queue.Queue, message: dict, force: bool = False) -> bool:
 def _active_model_selection() -> str:
     if _selected_backend == "gemini":
         return _GEMINI_MODEL_OPTION
+    if _selected_backend == "openrouter":
+        return _OPENROUTER_MODEL_OPTION
     return _GROQ_MODEL_OPTION if _selected_backend == "groq" else to_model_id(_selected_local_model_path)
 
 
@@ -192,6 +202,8 @@ def _active_generation_mode() -> str:
         return "groq"
     if _selected_backend == "gemini":
         return "gemini"
+    if _selected_backend == "openrouter":
+        return "openrouter"
     return "hybrid" if config.USE_CLOUD_MODEL else "local"
 
 
@@ -203,6 +215,9 @@ def _current_pipeline_kwargs() -> dict:
     elif _selected_backend == "gemini":
         kwargs["backend"] = "gemini"
         kwargs["gemini_model"] = config.GEMINI_MODEL
+    elif _selected_backend == "openrouter":
+        kwargs["backend"] = "openrouter"
+        kwargs["openrouter_model"] = config.OPENROUTER_MODEL
     return kwargs
 
 
@@ -289,6 +304,12 @@ def _apply_runtime_settings(settings: dict) -> None:
     config.GROQ_MODEL = settings.get("GROQ_MODEL", config.GROQ_MODEL)
     config.GEMINI_API_KEY = settings.get("GEMINI_API_KEY", config.GEMINI_API_KEY)
     config.GEMINI_MODEL = settings.get("GEMINI_MODEL", config.GEMINI_MODEL)
+    config.OPENROUTER_API_KEY = settings.get("OPENROUTER_API_KEY", config.OPENROUTER_API_KEY)
+    config.OPENROUTER_MODEL = settings.get("OPENROUTER_MODEL", config.OPENROUTER_MODEL)
+    config.OPENROUTER_MIN_REQUEST_INTERVAL = settings.get(
+        "OPENROUTER_MIN_REQUEST_INTERVAL",
+        config.OPENROUTER_MIN_REQUEST_INTERVAL,
+    )
     config.USE_CLOUD_MODEL = bool(settings.get("USE_CLOUD_MODEL", config.USE_CLOUD_MODEL))
 
     config.LLAMA_MODELS_DIR = os.path.abspath(settings.get("LLAMA_MODELS_DIR", config.LLAMA_MODELS_DIR))
@@ -347,6 +368,8 @@ def _apply_runtime_settings(settings: dict) -> None:
             _selected_backend = "gemini"
         elif mode == "groq":
             _selected_backend = "groq"
+        elif mode == "openrouter":
+            _selected_backend = "openrouter"
         else:
             _selected_backend = "local"
         config.USE_CLOUD_MODEL = mode == "hybrid"
@@ -402,6 +425,13 @@ def create_app():
             _selected_backend = "gemini"
             return pipeline_kwargs, None, None
 
+        if selected == _OPENROUTER_MODEL_OPTION:
+            if not config.OPENROUTER_API_KEY:
+                return None, jsonify({"error": "OPENROUTER_API_KEY not set. Add it to .env before using OpenRouter."}), 400
+            pipeline_kwargs.update({"backend": "openrouter", "openrouter_model": config.OPENROUTER_MODEL})
+            _selected_backend = "openrouter"
+            return pipeline_kwargs, None, None
+
         requested_model_path = resolve_model_path(selected)
         if not requested_model_path.lower().endswith(".gguf"):
             return None, jsonify({"error": "Model must be a .gguf file"}), 400
@@ -443,8 +473,8 @@ def create_app():
             return jsonify({"error": "settings must be an object"}), 400
 
         mode = str(raw_settings.get("BACKEND_MODE", _active_generation_mode())).strip().lower()
-        if mode not in {"local", "hybrid", "groq", "gemini"}:
-            return jsonify({"error": "BACKEND_MODE must be local, hybrid, groq, or gemini"}), 400
+        if mode not in {"local", "hybrid", "groq", "gemini", "openrouter"}:
+            return jsonify({"error": "BACKEND_MODE must be local, hybrid, groq, gemini, or openrouter"}), 400
 
         updates = {}
         errors = {}
@@ -462,14 +492,14 @@ def create_app():
             return jsonify({"error": "Invalid setting value", "details": errors}), 400
 
         selected_model = str(raw_settings.get("ACTIVE_MODEL", "") or "").strip()
-        if selected_model and selected_model not in {_GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION} and mode not in {"groq", "gemini"}:
+        if selected_model and selected_model not in {_GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION, _OPENROUTER_MODEL_OPTION} and mode not in {"groq", "gemini", "openrouter"}:
             resolved = resolve_model_path(selected_model)
             if not resolved.lower().endswith(".gguf"):
-                return jsonify({"error": "ACTIVE_MODEL must be a .gguf local model, Groq API, or Gemini API"}), 400
+                return jsonify({"error": "ACTIVE_MODEL must be a .gguf local model, Groq API, Gemini API, or OpenRouter API"}), 400
             if not os.path.isfile(resolved):
                 return jsonify({"error": f"Model file not found: {resolved}"}), 400
             updates["LLAMA_MODEL_PATH"] = resolved
-        elif mode not in {"groq", "gemini"} and "LLAMA_MODEL_PATH" in updates and updates["LLAMA_MODEL_PATH"]:
+        elif mode not in {"groq", "gemini", "openrouter"} and "LLAMA_MODEL_PATH" in updates and updates["LLAMA_MODEL_PATH"]:
             resolved = resolve_model_path(updates["LLAMA_MODEL_PATH"])
             if not resolved.lower().endswith(".gguf"):
                 return jsonify({"error": "LLAMA_MODEL_PATH must point to a .gguf file"}), 400
@@ -482,6 +512,10 @@ def create_app():
         has_groq_key = bool(primary_key or raw_keys.strip())
         if mode in {"hybrid", "groq"} and not has_groq_key:
             return jsonify({"error": "Groq API key is required for hybrid or full Groq mode"}), 400
+
+        openrouter_key = updates.get("OPENROUTER_API_KEY", config.OPENROUTER_API_KEY)
+        if mode == "openrouter" and not openrouter_key:
+            return jsonify({"error": "OpenRouter API key is required for OpenRouter mode"}), 400
 
         updates["BACKEND_MODE"] = mode
         updates["USE_CLOUD_MODEL"] = mode == "hybrid"
@@ -504,10 +538,10 @@ def create_app():
             active_local = to_model_id(_selected_local_model_path)
             if active_local not in models:
                 _selected_local_model_path = resolve_model_path(models[0])
-        elif _selected_backend not in {"groq", "gemini"}:
+        elif _selected_backend not in {"groq", "gemini", "openrouter"}:
             _selected_backend = "local"
 
-        available_models = [*models, _GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION]
+        available_models = [*models, _GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION, _OPENROUTER_MODEL_OPTION]
         active = _active_model_selection()
         if active not in available_models:
             if models:
@@ -523,12 +557,13 @@ def create_app():
             "active": active,
             "groq_model": config.GROQ_MODEL,
             "gemini_model": config.GEMINI_MODEL,
+            "openrouter_model": config.OPENROUTER_MODEL,
             "backend_mode": _active_generation_mode(),
         })
 
     @app.route("/api/models/switch", methods=["POST"])
     def switch_model():
-        """Switch active model between local GGUF, Groq API, and Gemini API."""
+        """Switch active model between local GGUF, Groq API, Gemini API, and OpenRouter API."""
         global _selected_local_model_path, _selected_backend
         data = request.json or {}
         model = (data.get("model", "") or "").strip()
@@ -572,6 +607,25 @@ def create_app():
                 "active": _GEMINI_MODEL_OPTION,
                 "provider": "gemini",
                 "gemini_model": config.GEMINI_MODEL,
+            })
+
+        if model == _OPENROUTER_MODEL_OPTION:
+            if not config.OPENROUTER_API_KEY:
+                return jsonify({
+                    "error": "OPENROUTER_API_KEY not set. Add it to .env before selecting OpenRouter.",
+                }), 400
+            orouter = OpenRouterModel(model=config.OPENROUTER_MODEL)
+            if not orouter.is_available():
+                return jsonify({
+                    "error": "OpenRouter API is unavailable right now. Check internet and API key.",
+                }), 400
+            _selected_backend = "openrouter"
+            logger.info("Switched backend to OpenRouter API (%s)", config.OPENROUTER_MODEL)
+            return jsonify({
+                "status": "ok",
+                "active": _OPENROUTER_MODEL_OPTION,
+                "provider": "openrouter",
+                "openrouter_model": config.OPENROUTER_MODEL,
             })
 
         resolved = resolve_model_path(model)
@@ -767,6 +821,24 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 404
 
+    @app.route("/api/project/<name>/chapter/<int:num>", methods=["PUT"])
+    def update_chapter(name, num):
+        """Update the content of a chapter (direct text editing from reader)."""
+        name = normalize_project_name(name)
+        data = request.json or {}
+        content = (data.get("content", "") or "").strip()
+        if not content:
+            return jsonify({"error": "content is required and cannot be empty"}), 400
+        try:
+            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline.load_project()
+            result = pipeline.update_chapter_content(num, content)
+            return jsonify({"status": "ok", **result})
+        except FileNotFoundError as e:
+            return jsonify({"error": str(e)}), 404
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     @app.route("/api/project/<name>/chapters/delete", methods=["POST"])
     def delete_chapters(name):
         """
@@ -801,7 +873,8 @@ def create_app():
             chapter_count = int(data.get("chapter_count", 1))
         except (TypeError, ValueError):
             chapter_count = 1
-        chapter_count = max(1, min(chapter_count, 20))  # Clamp 1-20
+        if chapter_count != -1:
+            chapter_count = max(1, min(chapter_count, 20))  # Clamp 1-20
         requested_model = (data.get("model", "") or "").strip()
         pipeline_kwargs, err_resp, err_code = _resolve_generation_pipeline_kwargs(requested_model)
         if err_resp is not None:
@@ -836,7 +909,7 @@ def create_app():
                         "message": "Generation cancelled before it started.",
                     }), force=True)
                     return
-                if chapter_count > 1:
+                if chapter_count > 1 or chapter_count == -1:
                     results = pipeline.generate_chapters(count=chapter_count, pacing=pacing)
                     _queue_event(eq, _normalize_event("done", results[-1] if results else {}), force=True)
                 else:
@@ -1035,6 +1108,41 @@ def create_app():
         scene_number = session["scene_counter"] + 1
         return jsonify({"status": "started", "scene_number": scene_number})
 
+    @app.route("/api/project/<name>/generate/manual/scene/typed", methods=["POST"])
+    def add_typed_scene_api(name):
+        """Add a user-typed scene directly to the manual session (no AI generation)."""
+        name = normalize_project_name(name)
+        data = request.json or {}
+        text = (data.get("text", "") or "").strip()
+
+        if not text:
+            return jsonify({"error": "text is required and cannot be empty"}), 400
+
+        with _generation_lock:
+            ms = _manual_sessions.get(name)
+            if not ms:
+                return jsonify({"error": "No active manual session. Call /manual/start first."}), 404
+            if name in _active_pipelines:
+                return jsonify({"error": "A scene is currently being generated. Wait for it to finish."}), 409
+
+        pipeline = ms["pipeline"]
+        session = ms["session"]
+
+        try:
+            pipeline.add_typed_scene(session, text)
+            words = len(text.split())
+            return jsonify({
+                "status": "added",
+                "scene_number": session["scene_counter"],
+                "words": words,
+                "scenes_completed": session["scene_counter"],
+                "completed_scenes": session["completed_scenes"],
+            })
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return jsonify({"error": str(e)}), 400
+
     @app.route("/api/project/<name>/generate/manual/cancel_scene", methods=["POST"])
     def cancel_manual_scene_api(name):
         """Cancel only the currently generating scene."""
@@ -1151,6 +1259,38 @@ def create_app():
                 traceback.print_exc()
                 return jsonify({"error": str(e)}), 400
 
+    @app.route("/api/project/<name>/generate/manual/scene/<int:index>", methods=["PUT"])
+    def update_manual_scene_api(name, index):
+        """Update the text of a scene in the active manual session."""
+        name = normalize_project_name(name)
+        data = request.json or {}
+        new_text = (data.get("text", "") or "").strip()
+        if not new_text:
+            return jsonify({"error": "text is required and cannot be empty"}), 400
+
+        with _generation_lock:
+            ms = _manual_sessions.get(name)
+            if not ms:
+                return jsonify({"error": "No active manual session."}), 404
+            if name in _active_pipelines:
+                return jsonify({"error": "A scene is currently being generated. Wait for it to finish."}), 409
+
+            pipeline = ms["pipeline"]
+            session = ms["session"]
+            try:
+                pipeline.update_manual_scene(session, index, new_text)
+                return jsonify({
+                    "status": "updated",
+                    "scene_index": index,
+                    "words": len(new_text.split()),
+                    "scenes_completed": session["scene_counter"],
+                    "completed_scenes": session["completed_scenes"],
+                })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return jsonify({"error": str(e)}), 400
+
     @app.route("/api/project/<name>/generate/manual/status", methods=["GET"])
     def manual_session_status(name):
         """Get the current state of the manual session."""
@@ -1236,6 +1376,7 @@ def create_app():
                 return jsonify({"error": "Combine already in progress"}), 409
             eq = queue.Queue(maxsize=100)
             _combine_queues[name] = eq
+            _combine_cancel_requests.discard(name)
 
         def progress_cb(event, data=None, **kwargs):
             msg = _normalize_event(event, data)
@@ -1285,7 +1426,8 @@ def create_app():
                 # blueprint to ensure the story is complete and cohesive
                 story_premise = metadata.get("premise", "")
                 result = analyze_and_polish(
-                    combined, progress_cb, premise=story_premise, model_name=requested_model
+                    combined, progress_cb, premise=story_premise, model_name=requested_model,
+                    is_cancelled=lambda: name in _combine_cancel_requests
                 )
 
                 # Save polished file
@@ -1321,10 +1463,23 @@ def create_app():
             finally:
                 with _generation_lock:
                     _active_combines.pop(name, None)
+                    _combine_cancel_requests.discard(name)
 
         thread = threading.Thread(target=run_combine, daemon=True)
         thread.start()
         return jsonify({"status": "started"})
+
+    @app.route("/api/project/<name>/combine/cancel", methods=["POST"])
+    def cancel_combine(name):
+        """Cancel the active story combination process."""
+        name = normalize_project_name(name)
+        _combine_cancel_requests.add(name)
+        eq = _combine_queues.get(name)
+        if eq:
+            _queue_event(eq, _normalize_event("combine_error", {
+                "error": "Cancellation requested by user",
+            }), force=True)
+        return jsonify({"status": "cancel_requested"})
 
     @app.route("/api/project/<name>/combine/stream", methods=["GET"])
     def stream_combine(name):

@@ -14,6 +14,7 @@ import config
 from models.llm import LlamaCPP, to_model_id
 from models.groq_model import GroqModel
 from models.gemini_model import GeminiModel
+from models.openrouter_model import OpenRouterModel
 from memory.state_manager import StateManager
 from memory.vector_store import VectorStore
 from memory.retriever import Retriever
@@ -72,6 +73,9 @@ MANUAL_SCENE_ENHANCER_SYSTEM = (
     "Do NOT invent new story events, new scenes, or story progression beyond what the user wrote. "
     "Your job is to add HOW-TO-WRITE detail (mood, sensory cues, tone), NOT to advance the story further. "
     "The scene ends exactly where the user's brief ends — no continuation, no aftermath, no next steps. "
+    "ANTI-REPETITION: Check the 'Previously completed scenes' section carefully. "
+    "Do NOT produce a summary or key_events that overlap with events already written. "
+    "Your scene must start where the previous scene ended and cover NEW ground only. "
     "Return JSON only."
 )
 
@@ -96,7 +100,12 @@ Requirements:
 - Keep the user's wording in the summary where possible — refine, don't replace.
 - Add only HOW-TO-WRITE detail: mood cues, sensory notes, character actions, dialogue hints.
 - Use exact known character names when applicable.
-- If previous scenes are listed, ensure continuity with them (do not repeat events).
+- ANTI-REPETITION RULE: Read the 'Previously completed scenes' section VERY carefully.
+  If a scene ending is listed, the new scene MUST start from that exact moment.
+  Do NOT produce key_events that describe events already covered in previous scenes.
+  Do NOT re-introduce characters, locations, or situations that were already established.
+- If previous scenes are listed, ensure strict continuity: this scene picks up exactly
+  where the last scene's ending left off. No recap, no re-introduction.
 - Keep the user's core action on-page in this scene. Do NOT convert the brief into aftermath-only framing.
 - Do not add meta text or commentary.
 - key_events must map 1:1 to user-provided beats. Do not invent extra key events.
@@ -139,6 +148,7 @@ class PipelineOrchestrator:
         backend: str = "local",
         groq_model: Optional[str] = None,
         gemini_model: Optional[str] = None,
+        openrouter_model: Optional[str] = None,
     ):
         self.project_name, self.project_dir = _safe_project_dir(project_name)
         self.chapters_dir = os.path.join(self.project_dir, "chapters")
@@ -147,13 +157,14 @@ class PipelineOrchestrator:
         self._cancelled = False
         self._scene_cancelled = False
         self._backend = (backend or "local").strip().lower()
-        if self._backend not in {"local", "groq", "gemini"}:
+        if self._backend not in {"local", "groq", "gemini", "openrouter"}:
             raise ValueError(f"Unsupported backend: {backend}")
         selected_local = (local_model or config.LLAMA_MODEL_PATH).strip()
         self._local_model_ref = selected_local
         self._local_model_id = to_model_id(selected_local)
         self._groq_model_id = (groq_model or config.GROQ_MODEL).strip()
         self._gemini_model_id = (gemini_model or config.GEMINI_MODEL).strip()
+        self._openrouter_model_id = (openrouter_model or config.OPENROUTER_MODEL).strip()
         self._active_backend = "local"
         self._active_model_id = self._local_model_id
 
@@ -215,6 +226,26 @@ class PipelineOrchestrator:
             self._log(f"Gemini model ready: {self.cloud_model.get_name()}", level="success")
             return
 
+        if self._backend == "openrouter":
+            if not config.OPENROUTER_API_KEY:
+                raise RuntimeError(
+                    "OPENROUTER_API_KEY not set. Add it to your .env file before using OpenRouter mode."
+                )
+            self.cloud_model = OpenRouterModel(model=self._openrouter_model_id)
+            self._log("Checking OpenRouter API connectivity...", details={"model": self._openrouter_model_id})
+            if not self._has_internet():
+                raise RuntimeError("Internet unavailable. OpenRouter mode requires network access.")
+            if not self.cloud_model.is_available():
+                raise RuntimeError(
+                    f"OpenRouter model '{self._openrouter_model_id}' is unavailable. Verify API key and model name."
+                )
+            self._cloud_available = True
+            self._active_backend = "openrouter"
+            self._active_model_id = self._openrouter_model_id
+            self._emit("status", f"OpenRouter model ready: {self.cloud_model.get_name()}")
+            self._log(f"OpenRouter model ready: {self.cloud_model.get_name()}", level="success")
+            return
+
         # Local-only by default. Cloud can be enabled explicitly with USE_CLOUD_MODEL=true.
         if config.USE_CLOUD_MODEL and config.GROQ_API_KEY:
             self.cloud_model = GroqModel()
@@ -273,7 +304,7 @@ class PipelineOrchestrator:
         self.retriever = Retriever(self.state_manager, self.vector_store)
 
     def _init_agents(self):
-        if self._backend in {"groq", "gemini"}:
+        if self._backend in {"groq", "gemini", "openrouter"}:
             if not self.cloud_model:
                 raise RuntimeError(f"{self._backend.title()} backend selected but cloud model is not initialized.")
             self.architect = StoryArchitect(self.cloud_model, self.state_manager)
@@ -1986,7 +2017,7 @@ class PipelineOrchestrator:
             pacing=pacing,
             character_names=", ".join(character_names) if character_names else "None specified",
             previous_scenes_summary=previous_scenes_summary or "None (this is the first scene).",
-            context=context[:1400],
+            context=context[:10000],
         )
         schema = {
             "type": "object",
@@ -2347,7 +2378,7 @@ class PipelineOrchestrator:
         chapter_num = session["chapter_num"]
         chapter_title = session["chapter_title"]
         pacing = session["pacing"]
-        context = session["context"]
+        base_context = session["context"]
         character_names = session["character_names"]
         previous_ending = session["previous_ending"]
         trace_entries = session["trace_entries"]
@@ -2360,11 +2391,59 @@ class PipelineOrchestrator:
             details={"brief": brief[:120]},
         )
 
-        # Build summary of previously completed scenes for continuity
+        # ── Build rich previous-scenes summary for the enhancer ──────────
+        # Include both the plan summary AND the actual ending of each
+        # completed scene so the enhancer knows exactly what was written
+        # and can avoid generating repeated content.
         prev_summaries = []
-        for i, sp in enumerate(session["completed_scene_plans"]):
-            prev_summaries.append(f"Scene {i + 1}: {sp.get('summary', '')[:120]}")
+        completed_scenes = session.get("completed_scenes", [])
+        completed_plans = session.get("completed_scene_plans", [])
+        for i in range(max(len(completed_plans), len(completed_scenes))):
+            plan_summary = ""
+            plan_location = ""
+            if i < len(completed_plans):
+                plan_summary = completed_plans[i].get("summary", "")[:120]
+                plan_location = completed_plans[i].get("location", "")
+            loc_str = f" (Location: {plan_location})" if plan_location else ""
+            scene_ending = ""
+            if i < len(completed_scenes):
+                scene_ending = self._extract_ending(completed_scenes[i], max_chars=200)
+            if plan_summary and scene_ending:
+                prev_summaries.append(
+                    f"Scene {i + 1}{loc_str}: {plan_summary}\n  [Ended with]: \"{scene_ending}\""
+                )
+            elif plan_summary:
+                prev_summaries.append(f"Scene {i + 1}{loc_str}: {plan_summary}")
+            elif scene_ending:
+                prev_summaries.append(f"Scene {i + 1}{loc_str}: [Ended with]: \"{scene_ending}\"")
         previous_scenes_summary = "\n".join(prev_summaries) if prev_summaries else "None (this is the first scene)."
+
+        # ── Enrich context with completed-scene recap ────────────────────
+        # The base session context was captured once at session start. We
+        # append a recap of what was actually written so the enhancer and
+        # writer don't re-generate already-covered events.
+        context = base_context
+        if completed_scenes:
+            recap_parts = []
+            for i, scene_text in enumerate(completed_scenes):
+                ending = self._extract_ending(scene_text, max_chars=180)
+                plan_sum = ""
+                plan_loc = ""
+                if i < len(completed_plans):
+                    plan_sum = completed_plans[i].get("summary", "")[:100]
+                    plan_loc = completed_plans[i].get("location", "")
+                label = plan_sum or f"Scene {i + 1}"
+                loc_label = f" [at {plan_loc}]" if plan_loc else ""
+                recap_parts.append(f"  Scene {i + 1}{loc_label} — {label}: ...{ending}")
+            recap_block = "\n".join(recap_parts)
+            context = (
+                f"{context.rstrip()}\n\n"
+                "=== ALREADY WRITTEN IN THIS CHAPTER (do NOT repeat these events) ===\n"
+                f"{recap_block}\n"
+                "=== END OF ALREADY WRITTEN SCENES ===\n"
+                "The next scene must continue FROM where the last scene ended. "
+                "Do NOT re-introduce, recap, or re-describe events from the scenes above."
+            )
 
         # Enhance the scene brief (lightly — preserving user intent)
         scene = self._enhance_manual_scene(
@@ -2398,11 +2477,14 @@ class PipelineOrchestrator:
         )
 
         # Inject continuity metadata so the writer can detect location changes
-        scene["prev_location"] = self._extract_scene_location(
-            session["completed_scenes"][-1] if session.get("completed_scenes") else previous_ending
-        )
+        # Use the actual plan location of the previous scene if available, otherwise fall back to parsing text.
+        prev_plans = session.get("completed_scene_plans", [])
+        if prev_plans:
+            scene["prev_location"] = prev_plans[-1].get("location", "")
+        else:
+            scene["prev_location"] = self._extract_scene_location(previous_ending)
+
         if not scene.get("narrative_bridge"):
-            prev_plans = session.get("completed_scene_plans", [])
             if prev_plans:
                 prev_s = prev_plans[-1].get("summary", "")
                 if prev_s:
@@ -2424,6 +2506,37 @@ class PipelineOrchestrator:
             top_k=2 if self._backend in {"groq", "gemini"} else None,
             max_chars=2200 if self._backend in {"groq", "gemini"} else None,
         )
+
+        # ── Enrich writer context with completed-scene recap ─────────────
+        # The retriever returns generic vector-store context. We append a
+        # summary of scenes already written in THIS chapter so the writer
+        # can avoid repeating them.
+        if completed_scenes:
+            scene_recap_parts = []
+            for i, st in enumerate(completed_scenes):
+                plan_label = ""
+                plan_loc = ""
+                if i < len(completed_plans):
+                    plan_label = completed_plans[i].get("summary", "")[:80]
+                    plan_loc = completed_plans[i].get("location", "")
+                loc_str = f" [at {plan_loc}]" if plan_loc else ""
+                ending_snip = self._extract_ending(st, max_chars=150)
+                scene_recap_parts.append(
+                    f"  Scene {i + 1}{loc_str} ({plan_label}): ...{ending_snip}"
+                )
+            scene_context = (
+                f"{scene_context.rstrip()}\n\n"
+                "=== SCENES ALREADY WRITTEN IN THIS CHAPTER ===\n"
+                + "\n".join(scene_recap_parts)
+                + "\n=== END ===\n"
+                "CRITICAL: Do NOT repeat, recap, or re-describe any of the events above. "
+                "Continue the story from where Scene " + str(len(completed_scenes)) + " ended."
+            )
+
+        # For scene 2+, use a richer previous_ending from the actual last
+        # completed scene text (the session cache may be a shorter extract)
+        if completed_scenes:
+            previous_ending = self._extract_ending(completed_scenes[-1])
 
         # Run the full scene graph (writer → critic → decision → editor)
         self._emit("scene_start", {
@@ -2573,6 +2686,105 @@ class PipelineOrchestrator:
             f.write(full_chapter)
 
         self._log(f"Deleted scene {index + 1} from manual session.", level="info")
+        return session
+
+    def update_manual_scene(self, session: dict, index: int, new_text: str) -> dict:
+        """
+        Replace the text of a scene in the active manual session.
+        Updates WIP and chapter file on disk.
+        """
+        if index < 0 or index >= len(session["completed_scenes"]):
+            raise IndexError("Scene index out of range.")
+
+        new_text = (new_text or "").strip()
+        if not new_text:
+            raise ValueError("Scene text cannot be empty.")
+
+        session["completed_scenes"][index] = new_text
+
+        # Recalculate previous_ending if this is the last scene
+        if index == len(session["completed_scenes"]) - 1:
+            session["previous_ending"] = self._extract_ending(new_text)
+
+        # Update WIP file
+        chapter_num = session["chapter_num"]
+        chapter_title = session["chapter_title"]
+        character_names = session["character_names"]
+        pacing = session["pacing"]
+
+        chapter_plan = self._build_manual_chapter_plan_stub(
+            chapter_num, chapter_title, session["completed_scene_plans"], character_names, pacing,
+        )
+        completed_wip = [{"scene": s + 1, "text": t} for s, t in enumerate(session["completed_scenes"])]
+        self._save_wip(chapter_num, completed_wip, chapter_plan, session["completed_scene_plans"])
+
+        # Update the chapter text file
+        separator = "\n\n* * *\n\n"
+        chapter_text = separator.join(session["completed_scenes"])
+        full_chapter = self._sanitize_generated_text(
+            f"# Chapter {chapter_num}: {chapter_title}\n\n{chapter_text}"
+        )
+        chapter_path = os.path.join(self.chapters_dir, f"chapter_{chapter_num:03d}.md")
+        with open(chapter_path, "w", encoding="utf-8") as f:
+            f.write(full_chapter)
+
+        self._log(f"Updated scene {index + 1} text in manual session ({len(new_text.split())} words).", level="info")
+        return session
+
+    def add_typed_scene(self, session: dict, text: str) -> dict:
+        """
+        Add a user-typed scene to the manual session without any AI generation.
+        Creates a minimal scene plan stub and updates WIP + chapter file.
+        """
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("Scene text cannot be empty.")
+
+        chapter_num = session["chapter_num"]
+        chapter_title = session["chapter_title"]
+        character_names = session["character_names"]
+        pacing = session["pacing"]
+        scene_number = session["scene_counter"] + 1
+
+        # Create a minimal scene plan for the typed scene
+        words = len(text.split())
+        scene_plan = {
+            "scene_number": scene_number,
+            "type": "custom",
+            "summary": f"[User-typed scene] {text[:120]}...",
+            "characters_present": list(character_names),
+            "key_events": ["User-provided content"],
+            "word_target": words,
+            "mood": "custom",
+        }
+
+        # Update session state
+        session["completed_scenes"].append(text)
+        session["completed_scene_plans"].append(scene_plan)
+        session["previous_ending"] = self._extract_ending(text)
+        session["scene_counter"] = scene_number
+
+        # Save WIP checkpoint
+        chapter_plan = self._build_manual_chapter_plan_stub(
+            chapter_num, chapter_title, session["completed_scene_plans"], character_names, pacing,
+        )
+        completed_wip = [{"scene": s + 1, "text": t} for s, t in enumerate(session["completed_scenes"])]
+        self._save_wip(chapter_num, completed_wip, chapter_plan, session["completed_scene_plans"])
+
+        # Save chapter file progressively
+        separator = "\n\n* * *\n\n"
+        chapter_text = separator.join(session["completed_scenes"])
+        full_chapter = self._sanitize_generated_text(
+            f"# Chapter {chapter_num}: {chapter_title}\n\n{chapter_text}"
+        )
+        chapter_path = os.path.join(self.chapters_dir, f"chapter_{chapter_num:03d}.md")
+        with open(chapter_path, "w", encoding="utf-8") as f:
+            f.write(full_chapter)
+
+        self._log(
+            f"Added typed scene {scene_number} to manual session ({words} words).",
+            level="success",
+        )
         return session
 
     def finish_manual_chapter(self, session: dict) -> dict:
@@ -3070,9 +3282,12 @@ class PipelineOrchestrator:
                 # 4a: Inject continuity metadata into scene plan
                 # prev_location enables the writer prompt to detect location changes
                 # and mandate a transition paragraph automatically.
-                scene["prev_location"] = self._extract_scene_location(
-                    chapter_text_parts[-1] if chapter_text_parts else previous_ending
-                )
+                # Use the actual plan location of the previous scene if available, otherwise fall back to parsing text.
+                if i > 0 and i - 1 < len(scenes):
+                    scene["prev_location"] = scenes[i - 1].get("location", "")
+                else:
+                    scene["prev_location"] = self._extract_scene_location(previous_ending)
+
                 # narrative_bridge explains WHY this scene follows the previous one.
                 # Pull it from the planner-generated field or build a minimal default.
                 if not scene.get("narrative_bridge"):
@@ -3102,6 +3317,33 @@ class PipelineOrchestrator:
                     top_k=2 if self._backend in {"groq", "gemini"} else None,
                     max_chars=2200 if self._backend in {"groq", "gemini"} else None,
                 )
+
+                # ── Enrich writer context with completed-scene recap ─────────────
+                # The retriever returns generic vector-store context. We append a
+                # summary of scenes already written in THIS chapter so the writer
+                # can avoid repeating them.
+                if chapter_text_parts:
+                    scene_recap_parts = []
+                    for idx, st in enumerate(chapter_text_parts):
+                        plan_label = ""
+                        plan_loc = ""
+                        if idx < len(scenes):
+                            plan_label = scenes[idx].get("summary", "")[:80]
+                            plan_loc = scenes[idx].get("location", "")
+                        loc_str = f" [at {plan_loc}]" if plan_loc else ""
+                        ending_snip = self._extract_ending(st, max_chars=150)
+                        scene_recap_parts.append(
+                            f"  Scene {idx + 1}{loc_str} ({plan_label}): ...{ending_snip}"
+                        )
+                    scene_context = (
+                        f"{scene_context.rstrip()}\n\n"
+                        "=== SCENES ALREADY WRITTEN IN THIS CHAPTER ===\n"
+                        + "\n".join(scene_recap_parts)
+                        + "\n=== END ===\n"
+                        "CRITICAL: Do NOT repeat, recap, or re-describe any of the events above. "
+                        "Continue the story from where Scene " + str(len(chapter_text_parts)) + " ended."
+                    )
+
                 self._log(f"Context retrieved: {len(scene_context)} chars",
                           details={"top_k": config.TOP_K_RETRIEVAL})
 
@@ -3378,6 +3620,29 @@ class PipelineOrchestrator:
             
         return None
 
+    def update_chapter_content(self, chapter_num: int, content: str) -> dict:
+        """
+        Overwrite the text of a completed chapter file on disk.
+        Returns a summary with word count.
+        """
+        content = (content or "").strip()
+        if not content:
+            raise ValueError("Chapter content cannot be empty.")
+
+        path = os.path.join(self.chapters_dir, f"chapter_{chapter_num:03d}.md")
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Chapter {chapter_num} does not exist.")
+
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        words = len(content.split())
+        self._log(
+            f"Chapter {chapter_num} updated via editor ({words} words).",
+            level="info",
+        )
+        return {"chapter": chapter_num, "words": words}
+
     def delete_chapters_from(self, from_chapter: int) -> dict:
         """
         Delete chapter files from `from_chapter` onward and synchronize state, WIP, logs, and vectors.
@@ -3642,10 +3907,23 @@ class PipelineOrchestrator:
     def generate_chapters(self, count: int = 1, pacing: str = "moderate") -> list:
         """Generate multiple chapters in sequence."""
         results = []
-        for i in range(count):
+        state = self.state_manager.load()
+        steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
+        
+        is_entire = (count == -1)
+        limit = 50 if is_entire else count
+        
+        for i in range(limit):
             if self._cancelled:
                 break
-            self._log(f"═══ Batch: chapter {i + 1}/{count} ═══", level="header")
+                
+            current_ch = self.state_manager.get_current_chapter()
+            if is_entire and self._premise_exhausted(current_ch + 1, steps):
+                self._log("Entire story premise has been successfully covered. Stopping batch generation.", level="success")
+                break
+                
+            display_count = " (Entire Story)" if is_entire else f" {i + 1}/{count}"
+            self._log(f"═══ Batch: chapter{display_count} ═══", level="header")
             try:
                 result = self.generate_chapter(pacing=pacing)
             except Exception as e:
