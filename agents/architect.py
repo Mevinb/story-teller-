@@ -282,7 +282,17 @@ Return JSON fields: chapter_number, chapter_title, plot_direction, character_arc
 # ─── Chapter 2+: AI continues the story autonomously ──────────────
 PLAN_CHAPTER_CONTINUE = """Plan Chapter {chapter_num} for the story.
 
-=== ORIGINAL PREMISE (for reference — DO NOT repeat these events) ===
+╔══════════════════════════════════════════════════════════════╗
+║  MANDATORY PREMISE STEPS — THIS CHAPTER MUST COVER ALL OF:  ║
+╚══════════════════════════════════════════════════════════════╝
+{required_steps}
+
+These steps ARE the plot of this chapter. Your key_events MUST be these steps rephrased — do NOT replace them with different events.
+
+=== ALREADY COVERED IN PREVIOUS CHAPTERS — DO NOT REPEAT ===
+{completed_steps}
+
+=== ORIGINAL FULL PREMISE (for reference only) ===
 {premise}
 
 === WHAT HAS HAPPENED SO FAR ===
@@ -294,49 +304,51 @@ PLAN_CHAPTER_CONTINUE = """Plan Chapter {chapter_num} for the story.
 === UNRESOLVED THREADS ===
 {unresolved_threads}
 
-=== STORY CONTEXT ===
+=== STORY CONTEXT (latest continuity) ===
 {context}
 
 === INSTRUCTIONS ===
-This is Chapter {chapter_num}. The premise describes the FULL story arc.
-Previous chapters covered SOME of the premise steps (see summaries above).
-Your job: pick up the NEXT steps from the premise that haven't been covered yet.
+This is Chapter {chapter_num}. You MUST plan this chapter to execute the MANDATORY STEPS above.
 
 Rules:
-- Read the premise and the chapter summaries carefully
-- Identify which premise steps have ALREADY been covered
-- Plan this chapter to cover the NEXT 1-2 steps from the premise
-- Do NOT repeat any events from previous chapters
-- Do NOT skip ahead — follow the premise's order
-- Treat the LAST WRITTEN ENDING in story context, if present, as hard continuity.
-- Do NOT assume an event happened off-page just because it appears later in the premise.
-- If the next premise step requires a location change, include that transition as a key event.
-- The listed characters are the main cast/known characters; use exact names when they appear
-- Do NOT force every listed character into every scene or chapter beat
-- Keep the protagonist or active main character involved in the chapter
-- You may introduce a new named supporting character if the story needs one
-- If the premise steps are exhausted, continue the story naturally with consequences and escalation
+- Your key_events MUST include each of the MANDATORY STEPS above, in order
+- Each mandatory step becomes exactly one key event — do not merge or split them
+- Do NOT invent events outside the mandatory steps
+- Do NOT repeat any ALREADY COVERED steps
+- Do NOT skip ahead to premise steps beyond the mandatory window
+- Treat the LAST WRITTEN ENDING in story context as hard continuity
+- If a step requires a location change, include that transition in the key event's phrasing
+- Keep the protagonist or active main character involved
 - Pacing: {pacing}
 
 Respond with this exact JSON structure:
 {{
     "chapter_number": {chapter_num},
-    "chapter_title": "A compelling chapter title",
-    "plot_direction": "What NEW things happen in this chapter",
+    "chapter_title": "A compelling chapter title that reflects the mandatory steps",
+    "plot_direction": "Exactly what happens this chapter based on the mandatory steps",
     "character_arcs": {{
-        "character_name": "How this character develops or changes"
+        "character_name": "How this character develops through the mandatory events"
     }},
-    "key_events": ["New Event 1", "New Event 2", "New Event 3"],
-    "constraints": ["Things to preserve from earlier chapters"],
+    "key_events": [
+        "Mandatory step 1 rephrased as a concrete scene action",
+        "Mandatory step 2 rephrased as a concrete scene action"
+    ],
+    "constraints": ["Do not repeat already-covered steps", "Follow mandatory steps exactly"],
     "tone": "The emotional tone",
     "estimated_scenes": {scene_count},
     "unresolved_threads_to_address": ["Thread to resolve or advance"],
-    "new_threads_to_introduce": ["New plot thread or complication"]
+    "new_threads_to_introduce": []
 }}"""
 
 PLAN_CHAPTER_CONTINUE_COMPACT = """Plan chapter {chapter_num}.
 
-Premise:
+MANDATORY STEPS FOR THIS CHAPTER (your key_events MUST be these, in order):
+{required_steps}
+
+Already covered (DO NOT repeat):
+{completed_steps}
+
+Premise (reference only):
 {premise}
 
 Covered so far:
@@ -345,18 +357,14 @@ Covered so far:
 Characters:
 {character_names}
 
-Unresolved threads:
-{unresolved_threads}
-
 Context:
 {context}
 
 Rules:
-- Continue from next uncovered premise steps in order.
-- No repetition of prior chapter events.
+- key_events = the mandatory steps above rephrased as scene actions, one per step
+- Do NOT invent events outside the mandatory steps
+- Do NOT repeat already-covered steps
 - Keep continuity with latest ending.
-- Use only characters already introduced on-page unless this chapter explicitly introduces/meets them first.
-- Do not let characters text/chat/call/flirt/coordinate before they have met or been introduced.
 - Pacing: {pacing}.
 
 Return JSON fields: chapter_number, chapter_title, plot_direction, character_arcs, key_events, constraints, tone, estimated_scenes, unresolved_threads_to_address, new_threads_to_introduce."""
@@ -422,6 +430,9 @@ class StoryArchitect(AgentContract):
             context=state.get("context", ""),
             pacing=state.get("pacing", "moderate"),
             scene_count=state.get("scene_count"),
+            premise_steps=state.get("premise_steps"),
+            current_step=state.get("current_step"),
+            used_titles=state.get("used_titles"),
         )
         return {
             "output": plan,
@@ -509,6 +520,27 @@ class StoryArchitect(AgentContract):
             max_threads = 4 if self._compact_mode else 8
             threads_text = ", ".join(dict.fromkeys(threads[:max_threads])) if threads else "None yet."
 
+            # ── Build explicit required/completed step lists ───────────────
+            # required_steps: the exact premise steps this chapter window covers
+            # completed_steps: steps before the window that must NOT be repeated
+            n = config.PREMISE_STEPS_PER_CHAPTER
+            if all_steps:
+                lo = max(0, active_step - n)  # first step index in window
+                hi = min(len(all_steps), active_step)  # last step index (exclusive for slice)
+                window_steps = all_steps[lo:hi]
+                prior_steps = all_steps[:lo]
+            else:
+                window_steps = []
+                prior_steps = []
+
+            required_steps_text = "\n".join(
+                f"  {i + 1}. {step}" for i, step in enumerate(window_steps)
+            ) or "  (No premise steps remain — continue the story with consequences and escalation)"
+
+            completed_steps_text = "\n".join(
+                f"  {i + 1}. {step}" for i, step in enumerate(prior_steps[-6:])
+            ) or "  None yet."
+
             template = PLAN_CHAPTER_CONTINUE_COMPACT if self._compact_mode else PLAN_CHAPTER_CONTINUE
             prompt = position_block + template.format(
                 chapter_num=chapter_num,
@@ -519,6 +551,8 @@ class StoryArchitect(AgentContract):
                 context=prompt_context,
                 pacing=pacing,
                 scene_count=scene_count,
+                required_steps=required_steps_text,
+                completed_steps=completed_steps_text,
             )
 
         schema = {
@@ -673,23 +707,77 @@ class StoryArchitect(AgentContract):
             )
 
         if allowed_steps:
-            allowed_lower = [s.strip().lower() for s in allowed_steps]
             key_events = plan.get("key_events", [])
-            for event in key_events:
-                event_lower = str(event).lower()
-                # Heuristic: event must share meaningful words with at least one allowed step
-                matched = any(
-                    any(
-                        word in event_lower
-                        for word in step.split()
-                        if len(word) > 4
-                    )
-                    for step in allowed_lower
+            if not isinstance(key_events, list):
+                key_events = [key_events]
+
+            # We expect at least one key event per allowed step
+            if len(key_events) < len(allowed_steps):
+                violations.append(
+                    f"Generated plan has only {len(key_events)} key_events, but we need at least "
+                    f"{len(allowed_steps)} to cover all allowed steps: {allowed_steps}"
                 )
-                if not matched and len(allowed_lower) > 0:
+
+            # Build character name set to filter out of content words
+            char_names_lower = {str(name).strip().lower() for name in (introduced_chars or [])}
+            # Add common words from character names
+            split_char_names = set()
+            for name in char_names_lower:
+                split_char_names.update(name.split())
+            char_names_lower.update(split_char_names)
+
+            stopwords = {
+                'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', 'arent', 
+                'as', 'at', 'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by', 
+                'cant', 'cannot', 'could', 'couldnt', 'did', 'didnt', 'do', 'does', 'doesnt', 'doing', 'dont', 
+                'down', 'during', 'each', 'few', 'for', 'from', 'further', 'had', 'hadnt', 'has', 'hasnt', 'have', 
+                'havent', 'having', 'he', 'hed', 'hell', 'hes', 'her', 'here', 'heres', 'hers', 'herself', 'him', 
+                'himself', 'his', 'how', 'hows', 'i', 'id', 'ill', 'im', 'ive', 'if', 'in', 'into', 'is', 'isnt', 
+                'it', 'its', 'itself', 'lets', 'me', 'more', 'most', 'mustnt', 'my', 'myself', 'no', 'nor', 'not', 
+                'of', 'off', 'on', 'once', 'only', 'or', 'other', 'ought', 'our', 'ours', 'ourselves', 'out', 'over', 
+                'own', 'same', 'shant', 'she', 'shed', 'shell', 'shes', 'should', 'shouldnt', 'so', 'some', 'such', 
+                'than', 'that', 'thats', 'the', 'their', 'theirs', 'them', 'themselves', 'then', 'there', 'theres', 
+                'these', 'they', 'theyd', 'theyll', 'theyre', 'theyve', 'this', 'those', 'through', 'to', 'too', 
+                'under', 'until', 'up', 'very', 'was', 'wasnt', 'we', 'wed', 'well', 'were', 'weve', 'werent', 
+                'what', 'whats', 'when', 'whens', 'where', 'wheres', 'which', 'while', 'who', 'whos', 'whom', 
+                'why', 'whys', 'with', 'wont', 'would', 'wouldnt', 'you', 'youd', 'youll', 'youre', 'youve', 
+                'your', 'yours', 'yourself', 'yourselves', 'story', 'chapter', 'event', 'character', 'characters'
+            }
+
+            # For each allowed step, verify that at least one key_event covers it
+            for step_idx, step in enumerate(allowed_steps):
+                step_lower = step.strip().lower()
+                step_words = [
+                    re.sub(r'[^a-z0-9]', '', w)
+                    for w in step_lower.split()
+                ]
+                step_content_words = {
+                    w for w in step_words
+                    if len(w) > 4 and w not in stopwords and w not in char_names_lower
+                }
+
+                # Find a matching key event
+                matched = False
+                for event in key_events:
+                    event_lower = str(event).strip().lower()
+                    event_words = [
+                        re.sub(r'[^a-z0-9]', '', w)
+                        for w in event_lower.split()
+                    ]
+                    event_content_words = {
+                        w for w in event_words
+                        if len(w) > 4 and w not in stopwords and w not in char_names_lower
+                    }
+
+                    # Match if they share at least one non-trivial content word
+                    if step_content_words & event_content_words:
+                        matched = True
+                        break
+
+                if not matched:
                     violations.append(
-                        f"key_event '{event}' does not map to an allowed premise step. "
-                        f"Allowed steps: {allowed_steps}"
+                        f"Premise step {step_idx + 1} ('{step[:60]}...') is NOT covered by any key event in the plan. "
+                        f"Your key_events must map to and cover all of: {allowed_steps}"
                     )
 
         if introduced_chars:

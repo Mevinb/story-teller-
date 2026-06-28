@@ -3,6 +3,10 @@ Story Teller — Web UI Server
 Flask application with REST API and Server-Sent Events for live generation.
 """
 import os
+os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["DISABLE_TQDM"] = "1"
+os.environ["TQDM_DISABLE"] = "1"
 import sys
 import json
 import threading
@@ -195,6 +199,28 @@ def _active_model_selection() -> str:
     if _selected_backend == "openrouter":
         return _OPENROUTER_MODEL_OPTION
     return _GROQ_MODEL_OPTION if _selected_backend == "groq" else to_model_id(_selected_local_model_path)
+
+
+def _get_llm_for_premise(requested_model=None):
+    selected = (requested_model or "").strip() or _active_model_selection()
+    if selected == _GROQ_MODEL_OPTION:
+        if not config.GROQ_API_KEY:
+            raise RuntimeError("GROQ_API_KEY not set. Add it to .env before using Groq.")
+        return GroqModel(model=config.GROQ_MODEL)
+    if selected == _GEMINI_MODEL_OPTION:
+        if not config.GEMINI_API_KEY:
+            raise RuntimeError("GEMINI_API_KEY not set. Add it to .env before using Gemini.")
+        from models.gemini_model import GeminiModel
+        return GeminiModel(model=config.GEMINI_MODEL)
+    if selected == _OPENROUTER_MODEL_OPTION:
+        if not config.OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY not set. Add it to .env before using OpenRouter.")
+        return OpenRouterModel(model=config.OPENROUTER_MODEL)
+    
+    requested_model_path = resolve_model_path(selected)
+    if not os.path.isfile(requested_model_path):
+        raise RuntimeError(f"Local model not found at: {requested_model_path}")
+    return LlamaCPP(model_path=requested_model_path)
 
 
 def _active_generation_mode() -> str:
@@ -750,6 +776,153 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    @app.route("/api/project/<name>/premise/generate", methods=["POST"])
+    def generate_premise(name):
+        name = normalize_project_name(name)
+        try:
+            data = request.json or {}
+            characters = data.get("characters", {})
+            setting = data.get("setting", "")
+            themes = data.get("themes", "")
+            idea = data.get("idea", "")
+            requested_model = data.get("model")
+
+            llm = _get_llm_for_premise(requested_model)
+
+            # Build characters context
+            chars_txt = ""
+            if isinstance(characters, dict):
+                for cname, cinfo in characters.items():
+                    desc = cinfo.get("description", "")
+                    traits = ", ".join(cinfo.get("traits", []))
+                    chars_txt += f"- {cname}: {desc} (Traits: {traits})\n"
+            elif isinstance(characters, list):
+                for c in characters:
+                    chars_txt += f"- {c.get('name')}: {c.get('description')} (Traits: {', '.join(c.get('traits', []))})\n"
+
+            prompt = (
+                "You are a master story architect. Your task is to transform a rough story idea/timeline and character/setting details "
+                "into a clean, highly structured, sequential story premise outline.\n\n"
+                "=== INPUT DETAILS ===\n"
+                f"CHARACTERS:\n{chars_txt}\n"
+                f"SETTING: {setting}\n"
+                f"THEMES: {themes}\n\n"
+                f"ROUGH STORY IDEA / TIMELINE:\n{idea}\n\n"
+                "=== REQUIREMENTS ===\n"
+                "1. Output the premise as a clean list of sequential story steps (one step per line).\n"
+                "2. Ensure the steps flow in strict chronological order, starting from the introduction and building logically to the climax and resolution.\n"
+                "3. Do NOT include act divisions, chapter headings, metadata, commentary, or short lines with colons.\n"
+                "4. Each step should be a clear, concrete event or scene (about 1-3 sentences describing who does what and the consequence).\n"
+                "5. Aim for 8 to 20 steps, depending on the complexity of the story.\n"
+                "6. Output ONLY the story steps list. Do not write any introduction (like 'Here is the premise') or wrap the output in markdown code blocks."
+            )
+
+            response = llm.generate(prompt=prompt, system="You are an expert developer and novelist planning a structured outline.")
+            content = response.content or ""
+            
+            # Parse content into steps
+            steps = PipelineOrchestrator._premise_steps(content)
+            return jsonify({"status": "ok", "steps": steps})
+        except Exception as e:
+            logger.exception("Error in generate_premise")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/project/<name>/premise/refine", methods=["POST"])
+    def refine_premise(name):
+        name = normalize_project_name(name)
+        try:
+            data = request.json or {}
+            steps = data.get("steps", [])
+            characters = data.get("characters", {})
+            setting = data.get("setting", "")
+            themes = data.get("themes", "")
+            requested_model = data.get("model")
+
+            llm = _get_llm_for_premise(requested_model)
+
+            # Build characters and current steps context
+            chars_txt = ""
+            if isinstance(characters, dict):
+                for cname, cinfo in characters.items():
+                    desc = cinfo.get("description", "")
+                    traits = ", ".join(cinfo.get("traits", []))
+                    chars_txt += f"- {cname}: {desc} (Traits: {traits})\n"
+            
+            steps_txt = "\n".join(f"{i+1}. {step}" for i, step in enumerate(steps))
+
+            prompt = (
+                "You are a developmental editor. Your task is to refine, correct, and optimize the chronological flow of a story premise.\n\n"
+                "=== INPUT DETAILS ===\n"
+                f"CHARACTERS:\n{chars_txt}\n"
+                f"SETTING: {setting}\n"
+                f"THEMES: {themes}\n\n"
+                f"CURRENT STORY PREMISE STEPS:\n{steps_txt}\n\n"
+                "=== REQUIREMENTS ===\n"
+                "1. Analyze the steps for narrative drift, logical gaps, pacing issues, or premature conflict resolutions.\n"
+                "2. Correct any character inconsistencies, rename errors, or spelling issues based on the character profiles.\n"
+                "3. Ensure the events are in the absolute correct chronological order of how they must be generated.\n"
+                "4. Output the refined premise as a clean list of sequential story steps (one step per line).\n"
+                "5. Do NOT include headings, act divisions, metadata, or commentary.\n"
+                "6. Output ONLY the story steps list. Do not write any introductory/concluding text or wrap in code blocks."
+            )
+
+            response = llm.generate(prompt=prompt, system="You are an expert developmental editor focusing on pacing and continuity.")
+            content = response.content or ""
+            
+            refined_steps = PipelineOrchestrator._premise_steps(content)
+            return jsonify({"status": "ok", "steps": refined_steps})
+        except Exception as e:
+            logger.exception("Error in refine_premise")
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/project/<name>/premise/expand", methods=["POST"])
+    def expand_premise(name):
+        name = normalize_project_name(name)
+        try:
+            data = request.json or {}
+            steps = data.get("steps", [])
+            characters = data.get("characters", {})
+            setting = data.get("setting", "")
+            themes = data.get("themes", "")
+            requested_model = data.get("model")
+
+            llm = _get_llm_for_premise(requested_model)
+
+            # Build characters and current steps context
+            chars_txt = ""
+            if isinstance(characters, dict):
+                for cname, cinfo in characters.items():
+                    desc = cinfo.get("description", "")
+                    traits = ", ".join(cinfo.get("traits", []))
+                    chars_txt += f"- {cname}: {desc} (Traits: {traits})\n"
+            
+            steps_txt = "\n".join(f"{i+1}. {step}" for i, step in enumerate(steps))
+
+            prompt = (
+                "You are a creative writer. Your task is to expand an existing story premise by introducing new intermediate events, scenes, or beats.\n\n"
+                "=== INPUT DETAILS ===\n"
+                f"CHARACTERS:\n{chars_txt}\n"
+                f"SETTING: {setting}\n"
+                f"THEMES: {themes}\n\n"
+                f"CURRENT STORY PREMISE STEPS:\n{steps_txt}\n\n"
+                "=== REQUIREMENTS ===\n"
+                "1. Creatively invent and insert new intermediate steps/scenes between the existing steps to flesh out the narrative arc.\n"
+                "2. Focus on character relationships, build suspense/conflict gradually, and add detailed pacing beats.\n"
+                "3. Maintain absolute continuity with the existing steps — do NOT alter their key outcomes, but insert setup or reaction scenes between them.\n"
+                "4. Output the expanded premise as a clean list of sequential story steps (one step per line).\n"
+                "5. Do NOT include headings, act divisions, metadata, or commentary.\n"
+                "6. Output ONLY the story steps list. Do not write any introductory/concluding text or wrap in code blocks."
+            )
+
+            response = llm.generate(prompt=prompt, system="You are an expert creative novelist fleshing out outlines.")
+            content = response.content or ""
+            
+            expanded_steps = PipelineOrchestrator._premise_steps(content)
+            return jsonify({"status": "ok", "steps": expanded_steps})
+        except Exception as e:
+            logger.exception("Error in expand_premise")
+            return jsonify({"error": str(e)}), 500
+
     # ─── API: Chapters ────────────────────────────────────────────
     @app.route("/api/project/<name>/chapters", methods=["GET"])
     def list_chapters(name):
@@ -873,7 +1046,7 @@ def create_app():
             chapter_count = int(data.get("chapter_count", 1))
         except (TypeError, ValueError):
             chapter_count = 1
-        if chapter_count != -1:
+        if chapter_count not in (-1, -2):
             chapter_count = max(1, min(chapter_count, 20))  # Clamp 1-20
         requested_model = (data.get("model", "") or "").strip()
         pipeline_kwargs, err_resp, err_code = _resolve_generation_pipeline_kwargs(requested_model)
@@ -909,7 +1082,7 @@ def create_app():
                         "message": "Generation cancelled before it started.",
                     }), force=True)
                     return
-                if chapter_count > 1 or chapter_count == -1:
+                if chapter_count > 1 or chapter_count in (-1, -2):
                     results = pipeline.generate_chapters(count=chapter_count, pacing=pacing)
                     _queue_event(eq, _normalize_event("done", results[-1] if results else {}), force=True)
                 else:
@@ -1422,12 +1595,13 @@ def create_app():
                 }))
 
                 # Step 2: Analyze and polish with Gemini
-                # Pass the premise so Gemini can use it as the master
-                # blueprint to ensure the story is complete and cohesive
+                # Pass the premise and full state so Gemini can use canonical
+                # character/world data as ground truth during polish
                 story_premise = metadata.get("premise", "")
                 result = analyze_and_polish(
                     combined, progress_cb, premise=story_premise, model_name=requested_model,
-                    is_cancelled=lambda: name in _combine_cancel_requests
+                    is_cancelled=lambda: name in _combine_cancel_requests,
+                    state=state,
                 )
 
                 # Save polished file
@@ -1445,6 +1619,8 @@ def create_app():
                     "model": result["model"],
                     "original_chars": len(combined),
                     "revised_chars": len(result["final_story"]),
+                    "coverage_gaps": result.get("coverage_gaps", []),
+                    "inserted_sections": result.get("inserted_sections", []),
                 }
 
                 _queue_event(eq, _normalize_event("combine_done", {
@@ -1453,6 +1629,8 @@ def create_app():
                     "model": result["model"],
                     "original_chars": len(combined),
                     "revised_chars": len(result["final_story"]),
+                    "coverage_gaps": result.get("coverage_gaps", []),
+                    "inserted_sections": result.get("inserted_sections", []),
                 }), force=True)
 
             except Exception as e:

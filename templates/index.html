@@ -38,6 +38,7 @@
             <button class="nav-tab active" data-view="dashboard" onclick="switchView('dashboard')">📚 Projects</button>
             <button class="nav-tab" data-view="create" onclick="switchView('create')">✨ New Story</button>
             <button class="nav-tab hidden" data-view="generate" onclick="switchView('generate')" id="tabGenerate">⚡ Generate</button>
+            <button class="nav-tab hidden" data-view="premise" onclick="switchView('premise')" id="tabPremise">🎬 Premise Generator</button>
             <button class="nav-tab hidden" data-view="manual" onclick="switchView('manual')" id="tabManual">🧩 Manual Page</button>
             <button class="nav-tab hidden" data-view="reader" onclick="switchView('reader')" id="tabReader">📖 Reader</button>
             <button class="nav-tab hidden" data-view="logs" onclick="switchView('logs')" id="tabLogs">📋 Logs</button>
@@ -177,6 +178,88 @@
             </div>
         </div>
 
+        <!-- Premise Generator View -->
+        <div class="view" id="viewPremise">
+            <div class="premise-view-grid" style="display:grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+                <!-- Left: Inputs -->
+                <div class="card" style="display:flex; flex-direction:column; gap:16px;">
+                    <div class="card-header" style="border-bottom: 1px solid var(--border); padding-bottom:12px;">
+                        <span class="card-title"><span class="icon">🎬</span> Story Premise Context</span>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Setting</label>
+                        <input class="form-input" id="premiseSetting" placeholder="e.g., Victorian London, 1888">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Themes (comma-separated)</label>
+                        <input class="form-input" id="premiseThemes" placeholder="e.g., betrayal, redemption, power">
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label">Active Characters</label>
+                        <div id="premiseCharactersList" class="character-list" style="max-height:120px; overflow-y:auto; background:rgba(0,0,0,0.15); padding:10px; border-radius:6px; border:1px solid var(--border);">
+                            <span class="text-dim text-sm">No characters loaded.</span>
+                        </div>
+                    </div>
+
+                    <div class="form-group">
+                        <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                            <span>Rough Story Idea / Timeline Dump</span>
+                            <span class="text-xs text-dim">Write your timeline/outlines in any order</span>
+                        </label>
+                        <textarea class="form-textarea" id="premiseIdeaText" rows="12" style="font-family:'Lora', serif; font-size:0.9rem;"
+                            placeholder="Dump your thoughts, character roles, chapter breakdowns, or rough timeline of events here. The AI will analyze this unstructured data and arrange it into a logical, sequential storyline..."></textarea>
+                    </div>
+
+                    <div style="margin-top:auto;">
+                        <button class="btn btn-primary" id="btnPremiseGenerate" onclick="aiGeneratePremise()" style="width:100%;">
+                            ✨ Generate Structured Beats from Outline
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Right: Timeline beats -->
+                <div class="card" style="display:flex; flex-direction:column; gap:16px; min-height:600px;">
+                    <div class="card-header" style="border-bottom: 1px solid var(--border); padding-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+                        <span class="card-title"><span class="icon">📋</span> Narrative Timeline Beats</span>
+                        <div class="flex gap-2">
+                            <button class="btn btn-sm" onclick="addBlankPremiseStep()" style="font-size:0.8rem; padding: 4px 10px;">➕ Add Step</button>
+                        </div>
+                    </div>
+
+                    <p class="text-sm text-dim" style="margin-bottom:0;">
+                        Arrange the story events below in the exact chronological order they should occur. Each step represents a distinct segment of the narrative.
+                    </p>
+
+                    <!-- Timeline container -->
+                    <div id="premiseTimelineContainer" style="flex:1; overflow-y:auto; max-height:500px; display:flex; flex-direction:column; gap:12px; padding-right:4px;">
+                        <div class="empty-state">
+                            <span class="icon">📋</span>
+                            <h3>No beats defined</h3>
+                            <p>Dump a rough outline on the left and click "Generate Structured beats" or add steps manually.</p>
+                        </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div style="border-top:1px solid var(--border); padding-top:16px; display:flex; flex-direction:column; gap:12px;">
+                        <div class="flex gap-2" style="width:100%;">
+                            <button class="btn" id="btnPremiseRefine" onclick="aiRefinePremiseFlow()" style="flex:1; background:var(--accent-secondary); color:#fff;">
+                                ⚖️ Refine Pacing & Flow
+                            </button>
+                            <button class="btn" id="btnPremiseExpand" onclick="aiExpandPremiseBeats()" style="flex:1; background:var(--accent-secondary); color:#fff;">
+                                🚀 Expand (Add Scenes)
+                            </button>
+                        </div>
+                        <button class="btn btn-primary" id="btnPremiseSave" onclick="savePremiseToProject()" style="width:100%;">
+                            💾 Save Premise to Project
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
         <!-- Generate View -->
         <div class="view" id="viewGenerate">
             <div class="gen-container">
@@ -198,6 +281,7 @@
                                 <option value="5">5 Chapters</option>
                                 <option value="10">10 Chapters</option>
                                 <option value="-1">📖 Entire Story (All Remaining Chapters)</option>
+                                <option value="-2">🎬 Until Premise Completed (Complete Story)</option>
                             </select>
                             <button class="btn btn-primary" onclick="startGeneration()" id="btnGenerate">
                                 ▶ Generate

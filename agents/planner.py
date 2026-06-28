@@ -183,7 +183,11 @@ Constraints: {constraints}
 {context}
 
 === INSTRUCTIONS ===
-Create one scene per key event. If there are 3 key events, create 3 scenes. Do NOT add filler or padding scenes.
+You must create EXACTLY one scene per key event listed above. No more, no fewer.
+If there are {scene_count} key events, create EXACTLY {scene_count} scenes.
+Do NOT add filler, bridging, or padding scenes that are not tied to a key event.
+Do NOT invent new story events, new character meetings, or new plot beats beyond what the key events describe.
+Each scene covers one key event — nothing else.
 The listed characters are the main cast/known characters. Use their exact names when they appear.
 Do NOT force every listed character into every scene. Include only characters who are actually needed.
 The protagonist or active main character should remain involved in the chapter.
@@ -233,7 +237,8 @@ Context:
 {context}
 
 Rules:
-- One scene per key event, no filler.
+- EXACTLY one scene per key event — create EXACTLY {scene_count} scenes. No filler, no extra scenes.
+- Do NOT invent new story beats beyond what the key events describe.
 - Keep continuity and explicit transitions for location changes.
 - Do not put a character in messages/calls/private scenes before the chapter plan has introduced them on-page.
 - Scene types: setup, build_tension, peak, resolution, transition.
@@ -315,6 +320,7 @@ class ScenePlanner(AgentContract):
             constraints=", ".join((chapter_plan.get("constraints", []) or [])[:4] if self._compact_mode else chapter_plan.get("constraints", [])),
             character_names=char_list,
             context=prompt_context,
+            scene_count=scene_count,
         )
 
         schema = {
@@ -373,6 +379,22 @@ class ScenePlanner(AgentContract):
             character_names=character_names or [],
             scene_count=scene_count,
         )
+
+        # ── Hard scene count enforcement ───────────────────────────────────
+        # The LLM may generate more scenes than premise key events allow.
+        # We truncate to scene_count (== len(key_events)) to ensure no
+        # invented/filler scenes slip through and drift the narrative.
+        # The minimum floor (SCENES_PER_CHAPTER_MIN) is still respected by
+        # _coerce_scene_plan above which pads if the LLM returned too few.
+        max_premise_scenes = max(scene_count, config.SCENES_PER_CHAPTER_MIN)
+        if len(plan["scenes"]) > max_premise_scenes:
+            logger.warning(
+                "Scene Planner generated %d scenes but only %d are allowed "
+                "(one per premise key event). Truncating extra scenes.",
+                len(plan["scenes"]),
+                max_premise_scenes,
+            )
+            plan["scenes"] = plan["scenes"][:max_premise_scenes]
 
         # Validate and fix scene numbers
         user_scene_descriptions = user_scene_descriptions or {}

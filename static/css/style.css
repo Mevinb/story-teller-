@@ -1495,3 +1495,72 @@ body::before {
     transform: translateY(-2px);
     background: linear-gradient(135deg, #06b6d4, #8b5cf6);
 }
+
+/* ─── Premise Timeline ────────────────────────────────────────────── */
+.premise-step-card {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 12px;
+    transition: all var(--transition-normal);
+}
+
+.premise-step-card:hover {
+    border-color: var(--accent-primary);
+    background: rgba(139, 92, 246, 0.04);
+}
+
+.premise-step-badge {
+    background: var(--gradient-1);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 8px;
+    border-radius: 4px;
+    white-space: nowrap;
+    box-shadow: 0 2px 8px rgba(139, 92, 246, 0.3);
+}
+
+.premise-step-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text-primary);
+    font-family: 'Lora', serif;
+    font-size: 0.95rem;
+    resize: none;
+    height: auto;
+    padding: 0;
+    line-height: 1.4;
+}
+
+.premise-step-actions {
+    display: flex;
+    gap: 4px;
+}
+
+.premise-step-btn {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 4px;
+    border-radius: 4px;
+    transition: all var(--transition-fast);
+}
+
+.premise-step-btn:hover {
+    color: var(--text-primary);
+    background: rgba(255, 255, 255, 0.05);
+}
+
+.premise-step-btn.btn-delete:hover {
+    color: var(--error);
+    background: rgba(239, 68, 68, 0.1);
+}
+

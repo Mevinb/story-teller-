@@ -7,6 +7,9 @@ Runs on local model for cheap validation.
 """
 import logging
 import re
+from typing import List, Optional
+
+import numpy as np
 
 from models.base import LLMInterface
 from .contract import AgentContract
@@ -154,6 +157,7 @@ class ConsistencyEngine(AgentContract):
         self.name = "critic"
         self.model = model
         self._compact_mode = False
+        self._semantic_encoder = None  # Lazy-loaded SentenceTransformer
         self._transition_markers = {
             "emotion", "aroused", "arousal", "predatory", "hungry", "possessive",
             "satisfied", "personality", "state shift", "state change", "character development",
@@ -230,15 +234,57 @@ class ConsistencyEngine(AgentContract):
         # 1. Check Character Mismatch (Missing required characters)
         scene_chars = scene_plan.get("characters_present", []) if scene_plan else []
         text_lower = scene_text.lower()
+
+        # Pronoun sets for pronoun-aware detection
+        _PRONOUNS_SHE = {"she", "her", "hers", "herself"}
+        _PRONOUNS_HE = {"he", "him", "his", "himself"}
+        _PRONOUNS_THEY = {"they", "them", "their", "themselves"}
+        _ALL_PRONOUNS = _PRONOUNS_SHE | _PRONOUNS_HE | _PRONOUNS_THEY
+
+        # Count how many characters are missing by name
+        missing_by_name = []
         for char in scene_chars:
-            if len(char) > 3 and char.lower() not in text_lower:
+            if len(char) <= 3:
+                continue
+            name_variants = self._character_name_variants(char)
+            found = any(variant in text_lower for variant in name_variants)
+            if not found:
+                missing_by_name.append(char)
+
+        # Smart pronoun-aware filtering:
+        # - If only 1 character is in the scene and the prose has pronouns,
+        #   the writer likely used pronouns throughout. Allow it.
+        # - If multiple characters are listed but only 1 is missing, and the
+        #   prose has enough pronoun density, allow it (likely pronoun reference).
+        if missing_by_name:
+            prose_words = set(re.findall(r"[a-z']+", text_lower))
+            has_pronouns = bool(prose_words & _ALL_PRONOUNS)
+
+            if len(scene_chars) == 1 and has_pronouns:
+                # Single-character scene with pronoun usage — not truly missing
+                missing_by_name = []
+            elif len(missing_by_name) == 1 and len(scene_chars) >= 2 and has_pronouns:
+                # Only 1 character missing by name in a multi-char scene,
+                # and pronouns are present — likely pronoun reference.
+                # Downgrade from blocking to non-blocking.
+                char = missing_by_name[0]
                 fast_issues.append({
                     "type": "character_contradiction",
-                    "detail": f"Required character '{char}' is completely missing from the generated scene text.",
-                    "severity": "high",
-                    "blocking": True,
-                    "suggestion": f"Rewrite to include '{char}'."
+                    "detail": f"Character '{char}' may only be referenced by pronouns (name not found explicitly).",
+                    "severity": "low",
+                    "blocking": False,
+                    "suggestion": f"Consider adding a direct name reference to '{char}' for clarity."
                 })
+                missing_by_name = []
+
+        for char in missing_by_name:
+            fast_issues.append({
+                "type": "character_contradiction",
+                "detail": f"Required character '{char}' is completely missing from the generated scene text.",
+                "severity": "high",
+                "blocking": True,
+                "suggestion": f"Rewrite to include '{char}' (use their name or clear reference)."
+            })
                 
         # 2. Check Missing Beats (Logic Error)
         beat_issues = self._check_beat_presence(scene_text, scene_plan or {})
@@ -471,42 +517,122 @@ class ConsistencyEngine(AgentContract):
         ]
         return beats
 
+    def _get_semantic_encoder(self):
+        """Lazy-load a SentenceTransformer for semantic beat matching."""
+        if self._semantic_encoder is None:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self._semantic_encoder = SentenceTransformer(config.EMBEDDING_MODEL)
+                logger.info("Loaded semantic encoder for beat validation: %s", config.EMBEDDING_MODEL)
+            except Exception as e:
+                logger.warning("Could not load semantic encoder: %s. Falling back to keyword matching.", e)
+                self._semantic_encoder = False  # Sentinel: tried and failed
+        return self._semantic_encoder if self._semantic_encoder is not False else None
+
     def _check_beat_presence(self, scene_text: str, scene_plan: dict) -> list[dict]:
         """
-        Deterministic check: for each beat derived from scene.summary (or
-        required_beats / original_user_brief), verify that the key phrases from
-        that beat appear somewhere in the generated prose.
+        Hybrid beat presence check:
+          1. Try semantic similarity (embedding cosine) per paragraph.
+          2. Fall back to keyword overlap if embeddings are unavailable.
         Returns a list of blocking issues for any beat not found.
         """
         beats = self._extract_beats(scene_plan)
         if not beats:
             return []
 
-        prose_lower = scene_text.lower()
+        # Try semantic matching first
+        encoder = self._get_semantic_encoder()
+        if encoder is not None:
+            return self._check_beat_presence_semantic(beats, scene_text, encoder)
+
+        # Fallback: keyword matching
+        return self._check_beat_presence_keyword(beats, scene_text)
+
+    def _check_beat_presence_semantic(
+        self,
+        beats: list[str],
+        scene_text: str,
+        encoder,
+        similarity_threshold: float = 0.55,
+    ) -> list[dict]:
+        """
+        Use embedding cosine similarity to check if each beat is
+        semantically represented in at least one paragraph of the prose.
+        """
+        # Split prose into paragraphs for granular matching
+        paragraphs = [p.strip() for p in scene_text.split("\n\n") if len(p.strip()) > 30]
+        if not paragraphs:
+            paragraphs = [scene_text]
+
+        try:
+            beat_embeddings = encoder.encode(
+                beats, convert_to_numpy=True, normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            para_embeddings = encoder.encode(
+                paragraphs, convert_to_numpy=True, normalize_embeddings=True,
+                show_progress_bar=False,
+            )
+            # Cosine similarity matrix: (num_beats, num_paragraphs)
+            similarity_matrix = np.dot(beat_embeddings, para_embeddings.T)
+        except Exception as e:
+            logger.warning("Semantic beat check failed: %s. Falling back to keywords.", e)
+            return self._check_beat_presence_keyword(beats, scene_text)
+
         missing_issues = []
+        for i, beat in enumerate(beats):
+            max_sim = float(similarity_matrix[i].max()) if similarity_matrix.shape[1] > 0 else 0.0
+            if max_sim < similarity_threshold:
+                # Double-check with keyword fallback before blocking
+                if not self._keyword_beat_match(beat, scene_text):
+                    nearest_para = ""
+                    if similarity_matrix.shape[1] > 0:
+                        best_idx = similarity_matrix[i].argmax()
+                        nearest_para = paragraphs[best_idx]
 
+                    missing_issues.append({
+                        "type": "logic_error",
+                        "detail": (
+                            f"Required beat not found in prose (semantic score {max_sim:.2f} "
+                            f"< {similarity_threshold}): {beat}"
+                        ),
+                        "severity": "high",
+                        "blocking": True,
+                        "suggestion": (
+                            f"Add on-page prose that explicitly covers this beat: '{beat}'. "
+                            "Do not summarise it in passing — show it happening."
+                        ),
+                        "nearest_paragraph": nearest_para,
+                    })
+
+        return missing_issues
+
+    @staticmethod
+    def _keyword_beat_match(beat: str, scene_text: str) -> bool:
+        """Legacy keyword-based beat matching as a secondary fallback."""
+        beat_lower = beat.lower()
+        prose_lower = scene_text.lower()
+        _STOP = {
+            "then", "after", "before", "during", "while", "with", "from", "into",
+            "they", "them", "this", "that", "their", "scene", "event", "chapter",
+            "have", "does", "will", "when", "where", "what", "which", "also",
+        }
+        keywords = [
+            token for token in re.findall(r"[a-z0-9']+", beat_lower)
+            if len(token) >= 4 and token not in _STOP
+        ]
+        if beat_lower in prose_lower:
+            return True
+        if keywords:
+            matched = sum(1 for kw in keywords if kw in prose_lower)
+            return matched >= max(1, len(keywords) // 2)
+        return False
+
+    def _check_beat_presence_keyword(self, beats: list[str], scene_text: str) -> list[dict]:
+        """Original keyword-only beat presence check."""
+        missing_issues = []
         for beat in beats:
-            beat_lower = beat.lower()
-            # Tokenise the beat into meaningful keywords (≥4 chars, skip stop-words)
-            _STOP = {
-                "then", "after", "before", "during", "while", "with", "from", "into",
-                "they", "them", "this", "that", "their", "scene", "event", "chapter",
-                "have", "does", "will", "when", "where", "what", "which", "also",
-            }
-            keywords = [
-                token for token in re.findall(r"[a-z0-9']+", beat_lower)
-                if len(token) >= 4 and token not in _STOP
-            ]
-
-            # A beat is considered present if:
-            #   (a) its full lowercased text is a substring of the prose, OR
-            #   (b) at least half of its meaningful keywords appear in the prose.
-            full_match = beat_lower in prose_lower
-            if not full_match and keywords:
-                matched = sum(1 for kw in keywords if kw in prose_lower)
-                full_match = matched >= max(1, len(keywords) // 2)
-
-            if not full_match:
+            if not self._keyword_beat_match(beat, scene_text):
                 missing_issues.append({
                     "type": "logic_error",
                     "detail": f"Required beat not found in prose: {beat}",
@@ -517,7 +643,6 @@ class ConsistencyEngine(AgentContract):
                         "Do not summarise it in passing — show it happening."
                     ),
                 })
-
         return missing_issues
 
     def has_blocking_issues(self, report: dict) -> bool:
@@ -681,6 +806,40 @@ class ConsistencyEngine(AgentContract):
         return has_virgin and has_experienced and (
             "listed as both" in detail_blob or "described as both" in detail_blob
         )
+
+    @staticmethod
+    def _character_name_variants(full_name: str) -> List[str]:
+        """Extract searchable name variants from a character name.
+
+        For a name like 'Zorath (The Demon)', returns:
+          ['zorath (the demon)', 'zorath', 'demon']
+
+        This prevents false-positive blocking when the writer naturally
+        refers to a character by their base name or descriptor rather
+        than the full parenthetical-tagged name.
+        """
+        full_lower = full_name.strip().lower()
+        variants = [full_lower]
+
+        # Extract base name (everything before parenthetical)
+        paren_match = re.match(r'^(.+?)\s*\(', full_lower)
+        if paren_match:
+            base = paren_match.group(1).strip()
+            if len(base) >= 3:
+                variants.append(base)
+
+        # Extract descriptor from inside parentheses
+        inside_match = re.search(r'\(([^)]+)\)', full_lower)
+        if inside_match:
+            descriptor = inside_match.group(1).strip()
+            # Add individual meaningful words from the descriptor (skip articles)
+            skip_words = {'the', 'a', 'an', 'of', 'and', 'or'}
+            for word in descriptor.split():
+                word = word.strip()
+                if len(word) >= 3 and word not in skip_words:
+                    variants.append(word)
+
+        return variants
 
     @staticmethod
     def _format_scene_plan(scene_plan: dict) -> str:

@@ -23,6 +23,12 @@ _REASONING_BLOCK_RE = re.compile(
     flags=re.IGNORECASE | re.DOTALL,
 )
 _REASONING_TAG_RE = re.compile(r"</?(?:think|analysis|reasoning)>", flags=re.IGNORECASE)
+_META_OUTPUT_RE = re.compile(
+    r"(?im)^\s*(?:thinking process|analysis|step[- ]by[- ]step|analyze the request|"
+    r"professional fiction editor|task:|goals:|constraints:|output:|"
+    r"\d+\.\s+\*\*analyze|\*\s+\*\*role:|here is the rewritten scene:?|"
+    r"here is the expanded scene:?|here is the rewritten paragraph:?|here is the scene:?)"
+)
 EXPLICIT_ACTION_TERMS = {
     "sex", "sexual", "fuck", "fucking", "intercourse", "threesome", "orgy", "oral",
     "blowjob", "deepthroat", "handjob", "fingering", "penetration", "double penetration",
@@ -282,7 +288,7 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
             parts.append(f'"""{previous_ending}"""')
             parts.append("")
             parts.append("MANDATORY OPENING STRUCTURE — your first paragraph MUST:")
-            parts.append("  1. Signal time or continuity ('The next morning,' / 'An hour later,' / 'That same night,' etc.)")
+            parts.append("  1. Signal time or continuity. Mix it up (e.g. 'Later that day', 'Three hours passed', 'As evening fell', 'By the time she arrived'). DO NOT default to 'The next morning' every time.")
             parts.append("  2. Ground the reader in WHERE the character is — the room, place, light, sounds.")
             parts.append("  3. Show the character's EMOTIONAL STATE carrying over from the previous chapter's ending.")
             parts.append("  4. Only AFTER doing 1-3, begin action or dialogue.")
@@ -392,8 +398,11 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
     # fall back to simple comma-separated names otherwise.
     character_profiles = str(scene_plan.get("character_profiles", "")).strip()
     if character_profiles:
+        # Strip parentheticals to avoid unnatural prose/dialogue tags
+        character_profiles = re.sub(r"\s*\([^)]*\)", "", character_profiles)
         parts.append(character_profiles)
     elif characters:
+        characters = re.sub(r"\s*\([^)]*\)", "", characters)
         parts.append(f"Characters: {characters}")
     if location:
         parts.append(f"Setting: {location}")
@@ -642,13 +651,26 @@ class SceneWriter(AgentContract):
             required_action = scene_plan["key_events"][0]
         elif scene_plan.get("summary"):
             required_action = scene_plan["summary"]
-            
+
+        characters = ", ".join(scene_plan.get("characters_present", []))
+        characters = re.sub(r"\s*\([^)]*\)", "", characters)
+        location = scene_plan.get("location", "")
+
         prompt = (
             f"Generate a 2-3 sentence paragraph explicitly showing this required event:\n"
             f"{required_action}\n\n"
-            f"Write ONLY the paragraph text. Do not add metadata or conversational intro."
         )
-        system = "You are an expert writer generating a specific missing beat."
+        if characters:
+            prompt += f"Characters in this scene: {characters}\n"
+        if location:
+            prompt += f"Setting: {location}\n"
+            
+        prompt += f"\nFor context, the preceding text is:\n...{original_text[-400:]}\n\n"
+        prompt += (
+            "Use the exact character names listed above. Continue naturally from the preceding text. "
+            "Write ONLY the paragraph text. Do not add metadata or conversational intro."
+        )
+        system = "You are an expert writer generating a specific missing beat. Use the exact character names provided."
         new_para = self._generate_with_fallback(prompt, system, temperature=0.7)
         new_para = self._sanitize_scene_text(new_para)
         
@@ -915,7 +937,17 @@ class SceneWriter(AgentContract):
     def _sanitize_scene_text(text: str) -> str:
         cleaned = _REASONING_BLOCK_RE.sub("", text or "")
         cleaned = _REASONING_TAG_RE.sub("", cleaned)
+        cleaned = _META_OUTPUT_RE.sub("", cleaned)
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+        
+        # Deduplicate paragraphs
+        paragraphs = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
+        deduped = []
+        for p in paragraphs:
+            # Check if this paragraph is already in the last 4 paragraphs
+            if not deduped or p not in deduped[-4:]:
+                deduped.append(p)
+        cleaned = "\n\n".join(deduped)
         return cleaned.strip()
 
     @staticmethod

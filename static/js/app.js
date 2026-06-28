@@ -24,6 +24,10 @@ let manualScenesCompleted = 0;
 let manualChapterNum = 0;
 let manualIsGeneratingScene = false;
 
+// Premise Generator State
+let premiseSteps = [];
+let premiseCharacters = {};
+
 function isGroqProvider(provider) {
     return String(provider || '').toLowerCase().includes('groq');
 }
@@ -70,6 +74,7 @@ function switchView(viewName) {
     if (viewName === 'state' && currentProject) refreshState();
     if (viewName === 'combine' && currentProject) loadCombineVersions();
     if (viewName === 'edit' && currentProject) loadProjectForEdit();
+    if (viewName === 'premise' && currentProject) loadProjectPremise();
     if (viewName === 'dashboard') loadProjects();
     if (viewName === 'settings') loadSettings();
     if (viewName === 'manual' && currentProject) {
@@ -303,6 +308,7 @@ async function saveManualSceneEdit(index) {
 
 function showProjectTabs() {
     document.getElementById('tabGenerate').classList.remove('hidden');
+    document.getElementById('tabPremise').classList.remove('hidden');
     document.getElementById('tabManual').classList.remove('hidden');
     document.getElementById('tabReader').classList.remove('hidden');
     document.getElementById('tabLogs').classList.remove('hidden');
@@ -1038,7 +1044,7 @@ function handleSSE(event) {
 
         case 'chapter_complete':
             completedChapters += 1;
-            const planDisplay = plannedChapters === -1 ? 'Entire Story' : plannedChapters;
+            const planDisplay = plannedChapters < 0 ? 'Entire Story' : plannedChapters;
             showToast(
                 `Chapter ${data.chapter_number} complete! ${completedChapters}/${planDisplay}`,
                 'success',
@@ -2394,3 +2400,293 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     setStatus('online', 'Ready');
 });
+
+// ─── Premise Generator View Logic ────────────────────────────────
+async function loadProjectPremise() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}`);
+        const data = await res.json();
+        
+        const metadata = data.state.metadata || {};
+        document.getElementById('premiseSetting').value = metadata.setting || '';
+        document.getElementById('premiseThemes').value = (metadata.themes || []).join(', ');
+        
+        // Load characters
+        const charsObj = data.state.characters || {};
+        premiseCharacters = charsObj;
+        renderPremiseCharacters(charsObj);
+
+        // Load premise steps
+        const rawPremise = metadata.premise || '';
+        premiseSteps = parsePremiseSteps(rawPremise);
+        renderPremiseTimeline();
+    } catch (e) {
+        showToast('Failed to load project premise data', 'error');
+    }
+}
+
+function parsePremiseSteps(rawText) {
+    if (!rawText) return [];
+    const lines = rawText.split('\n');
+    const steps = [];
+    const HEADING_RE = /^(?:#+\s*|act\s+|chapter\s+|part\s+|section\s+|phase\s+|prologue|epilogue)/i;
+    for (let rawLine of lines) {
+        let line = rawLine.trim();
+        if (!line) continue;
+        if (HEADING_RE.test(line)) continue;
+        if (line.endsWith(':') && line.split(/\s+/).length <= 5) continue;
+        line = line.replace(/^(?:[-*]|\d+[\).\:-])\s*/, '').trim();
+        if (!line) continue;
+        steps.push(line);
+    }
+    return steps;
+}
+
+function renderPremiseCharacters(charsObj) {
+    const container = document.getElementById('premiseCharactersList');
+    const keys = Object.keys(charsObj);
+    if (keys.length === 0) {
+        container.innerHTML = '<span class="text-dim text-sm">No characters defined.</span>';
+        return;
+    }
+    container.innerHTML = keys.map(name => {
+        const traits = (charsObj[name].traits || []).join(', ');
+        return `
+            <div style="background:rgba(255,255,255,0.03); border:1px solid var(--border); padding:6px 10px; border-radius:4px; font-size:12px; display:flex; justify-content:space-between;">
+                <span style="font-weight:600; color:var(--accent-primary);">${escHtml(name)}</span>
+                <span class="text-dim" style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escHtml(traits)}</span>
+            </div>
+        `;
+    }).join('');
+}
+
+function renderPremiseTimeline() {
+    const container = document.getElementById('premiseTimelineContainer');
+    if (premiseSteps.length === 0) {
+        container.innerHTML = `
+            <div class="empty-state">
+                <span class="icon">📋</span>
+                <h3>No beats defined</h3>
+                <p>Dump a rough outline on the left and click "Generate Structured beats" or add steps manually.</p>
+            </div>
+        `;
+        return;
+    }
+
+    container.innerHTML = premiseSteps.map((step, idx) => {
+        return `
+            <div class="premise-step-card" data-index="${idx}">
+                <span class="premise-step-badge">Step ${idx + 1}</span>
+                <textarea class="premise-step-input" rows="2" oninput="syncStepText(${idx}, this.value)" placeholder="Describe this beat...">${escHtml(step)}</textarea>
+                <div class="premise-step-actions">
+                    <button class="premise-step-btn" onclick="reorderPremiseStep(${idx}, -1)" ${idx === 0 ? 'disabled' : ''} title="Move Up">▲</button>
+                    <button class="premise-step-btn" onclick="reorderPremiseStep(${idx}, 1)" ${idx === premiseSteps.length - 1 ? 'disabled' : ''} title="Move Down">▼</button>
+                    <button class="premise-step-btn btn-delete" onclick="deletePremiseStep(${idx})" title="Delete Beat">🗑️</button>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function syncStepText(index, val) {
+    if (premiseSteps[index] !== undefined) {
+        premiseSteps[index] = val;
+    }
+}
+
+function addBlankPremiseStep() {
+    syncAllStepsFromUI();
+    premiseSteps.push("");
+    renderPremiseTimeline();
+    
+    setTimeout(() => {
+        const textareas = document.querySelectorAll('.premise-step-input');
+        if (textareas.length > 0) {
+            textareas[textareas.length - 1].focus();
+        }
+    }, 50);
+}
+
+function syncAllStepsFromUI() {
+    const textareas = document.querySelectorAll('.premise-step-input');
+    textareas.forEach((ta, idx) => {
+        if (premiseSteps[idx] !== undefined) {
+            premiseSteps[idx] = ta.value;
+        }
+    });
+}
+
+function reorderPremiseStep(index, direction) {
+    syncAllStepsFromUI();
+    const targetIdx = index + direction;
+    if (targetIdx < 0 || targetIdx >= premiseSteps.length) return;
+    
+    const temp = premiseSteps[index];
+    premiseSteps[index] = premiseSteps[targetIdx];
+    premiseSteps[targetIdx] = temp;
+    
+    renderPremiseTimeline();
+}
+
+function deletePremiseStep(index) {
+    syncAllStepsFromUI();
+    premiseSteps.splice(index, 1);
+    renderPremiseTimeline();
+}
+
+async function aiGeneratePremise() {
+    const idea = document.getElementById('premiseIdeaText').value.trim();
+    if (!idea) {
+        showToast('Please enter a rough story idea or timeline dump first.', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('btnPremiseGenerate');
+    const oldText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="stage-spinner"></span> Generating beats...';
+
+    const selectedModel = document.getElementById('modelSelect')?.value || '';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/premise/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                characters: premiseCharacters,
+                setting: document.getElementById('premiseSetting').value.trim(),
+                themes: document.getElementById('premiseThemes').value.trim(),
+                idea: idea,
+                model: selectedModel
+            })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate premise');
+
+        premiseSteps = data.steps || [];
+        renderPremiseTimeline();
+        showToast(`Successfully generated ${premiseSteps.length} story beats!`, 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+    }
+}
+
+async function aiRefinePremiseFlow() {
+    syncAllStepsFromUI();
+    if (premiseSteps.length === 0) {
+        showToast('Please add or generate some beats first.', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('btnPremiseRefine');
+    const oldText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="stage-spinner"></span> Refining pacing...';
+
+    const selectedModel = document.getElementById('modelSelect')?.value || '';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/premise/refine`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                steps: premiseSteps,
+                characters: premiseCharacters,
+                setting: document.getElementById('premiseSetting').value.trim(),
+                themes: document.getElementById('premiseThemes').value.trim(),
+                model: selectedModel
+            })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to refine premise');
+
+        premiseSteps = data.steps || [];
+        renderPremiseTimeline();
+        showToast(`Successfully refined story flow!`, 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+    }
+}
+
+async function aiExpandPremiseBeats() {
+    syncAllStepsFromUI();
+    if (premiseSteps.length === 0) {
+        showToast('Please add or generate some beats first.', 'error');
+        return;
+    }
+
+    const btn = document.getElementById('btnPremiseExpand');
+    const oldText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '<span class="stage-spinner"></span> Expanding scenes...';
+
+    const selectedModel = document.getElementById('modelSelect')?.value || '';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/premise/expand`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                steps: premiseSteps,
+                characters: premiseCharacters,
+                setting: document.getElementById('premiseSetting').value.trim(),
+                themes: document.getElementById('premiseThemes').value.trim(),
+                model: selectedModel
+            })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to expand premise');
+
+        premiseSteps = data.steps || [];
+        renderPremiseTimeline();
+        showToast(`Successfully expanded timeline to ${premiseSteps.length} beats!`, 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+    }
+}
+
+async function savePremiseToProject() {
+    syncAllStepsFromUI();
+    if (!currentProject) return;
+
+    const btn = document.getElementById('btnPremiseSave');
+    const oldText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Saving...';
+
+    const formatted = premiseSteps.map((step, idx) => `${idx + 1}. ${step}`).join('\n');
+    const themesStr = document.getElementById('premiseThemes').value.trim();
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/state`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                metadata: {
+                    premise: formatted,
+                    setting: document.getElementById('premiseSetting').value.trim(),
+                    themes: themesStr ? themesStr.split(',').map(t => t.trim()).filter(Boolean) : []
+                }
+            })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save premise');
+
+        showToast('Story premise saved to project successfully!', 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+    }
+}

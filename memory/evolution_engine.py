@@ -24,6 +24,8 @@ from .arc_tracker import ArcTracker
 from .event_extractor import EventExtractor
 from .importance_ranker import ImportanceRanker
 from .memory_compressor import MemoryCompressor
+from .tension_tracker import TensionTracker
+from .motif_tracker import MotifTracker
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +223,8 @@ class EvolutionEngine:
             "events_extracted": 0,
             "arcs_updated": 0,
             "legend_promoted": 0,
+            "tension_recorded": False,
+            "motifs_found": 0,
             "narrative_phase": None,
             "pending_updates": [],
         }
@@ -318,15 +322,37 @@ class EvolutionEngine:
         if promoted:
             state_manager.save()
 
+        # Step 11: Record narrative tension
+        cb("Recording narrative tension...")
+        tension_score = TensionTracker.estimate_tension_from_text(scene_text)
+        phase_label = summary.get("narrative_phase", "") or ""
+        TensionTracker.record_chapter_tension(
+            state_manager.state, chapter_num, tension_score, label=phase_label,
+        )
+        state_manager.save()
+        summary["tension_recorded"] = True
+        logger.debug("Tension recorded: %.3f for chapter %d", tension_score, chapter_num)
+
+        # Step 12: Update motif tracking
+        cb("Scanning for recurring motifs...")
+        motifs_found = MotifTracker.update_motifs_after_scene(
+            state_manager.state, scene_text, chapter_num,
+        )
+        if motifs_found:
+            state_manager.save()
+        summary["motifs_found"] = motifs_found
+
         logger.info(
             "Evolution complete: %d entities, %d emotions, %d relationships, "
-            "%d events, %d arcs, %d legends",
+            "%d events, %d arcs, %d legends, tension=%.2f, %d motifs",
             summary["entities_found"],
             summary["emotions_updated"],
             summary["relationships_updated"],
             summary["events_extracted"],
             summary["arcs_updated"],
             summary["legend_promoted"],
+            tension_score,
+            motifs_found,
         )
 
         return summary

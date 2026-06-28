@@ -183,6 +183,9 @@ def _empty_state() -> dict:
             "total_scenes_written": 0,
             "state_version": 0,
             "narrative_phase": "introduction",
+            # Tracks the 0-based index of the last premise step fully covered.
+            # -1 means no steps have been covered yet (fresh story).
+            "premise_step_completed": -1,
             "created_at": datetime.now().isoformat(),
             "updated_at": datetime.now().isoformat(),
         },
@@ -339,6 +342,7 @@ class StateManager:
             current["metadata"]["current_chapter"] = 0
             current["metadata"]["total_scenes_written"] = 0
             current["metadata"]["narrative_phase"] = "introduction"
+            current["metadata"]["premise_step_completed"] = -1
             # Strip all AI-generated runtime fields from every character
             for char in current.get("characters", {}).values():
                 if not isinstance(char, dict):
@@ -608,19 +612,40 @@ class StateManager:
 
         self._transition("add_event", entry, mutator)
 
-    def add_chapter_summary(self, chapter_num: int, summary: str) -> None:
+    def add_chapter_summary(self, chapter_num: int, summary: str, title: str = "") -> None:
         """Store a chapter summary for re-anchoring."""
         payload = {"chapter": chapter_num}
 
         def mutator(current: dict) -> dict:
             current["plot"]["chapter_summaries"].append({
                 "chapter": chapter_num,
+                "chapter_title": title,
                 "summary": summary,
             })
             current["metadata"]["current_chapter"] = chapter_num
             return current
 
         self._transition("add_chapter_summary", payload, mutator)
+
+    def set_premise_step_completed(self, step_index: int) -> None:
+        """Record the 0-based index of the last premise step fully covered.
+
+        This is persisted after each chapter so the next chapter can start
+        the premise cursor from exactly where the previous chapter ended,
+        regardless of how many steps were actually covered vs the arithmetic
+        estimate (chapter_num × PREMISE_STEPS_PER_CHAPTER).
+        """
+        step_index = int(step_index)
+
+        def mutator(current: dict) -> dict:
+            current["metadata"]["premise_step_completed"] = step_index
+            return current
+
+        self._transition(
+            "set_premise_step_completed",
+            {"step_index": step_index},
+            mutator,
+        )
 
     def increment_scene_count(self, count: int = 1) -> None:
         """Increment the total scenes written counter."""
@@ -694,9 +719,14 @@ class StateManager:
             metadata = current.setdefault("metadata", {})
             metadata["current_chapter"] = max_chapter
             metadata["total_scenes_written"] = total_scenes_written
-            # Also reset narrative phase to introduction if rewinding to zero
+            # Reset narrative phase and premise cursor when rewinding.
+            # On full reset, always reset phase to introduction.
+            # On any prune/rollback, reset the premise cursor so the
+            # orchestrator re-derives the correct window for the remaining
+            # chapters via the arithmetic fallback.
             if max_chapter == 0:
                 metadata["narrative_phase"] = "introduction"
+            metadata["premise_step_completed"] = -1
 
             plot = current.setdefault("plot", {})
 

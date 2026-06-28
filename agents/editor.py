@@ -120,7 +120,7 @@ class Editor(AgentContract):
                 prompt=prompt,
                 system=system,
                 temperature=config.AGENT_TEMPERATURES["editor"],
-                max_tokens=900 if self._compact_mode else None,
+                max_tokens=1800 if self._compact_mode else None,
                 max_retries=2,
             )
 

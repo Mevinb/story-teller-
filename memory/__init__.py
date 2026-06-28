@@ -7,6 +7,8 @@ from .arc_tracker import ArcTracker
 from .event_extractor import EventExtractor
 from .importance_ranker import ImportanceRanker
 from .memory_compressor import MemoryCompressor
+from .tension_tracker import TensionTracker
+from .motif_tracker import MotifTracker
 
 __all__ = [
     "StateManager",
@@ -19,4 +21,7 @@ __all__ = [
     "EventExtractor",
     "ImportanceRanker",
     "MemoryCompressor",
+    "TensionTracker",
+    "MotifTracker",
 ]
+

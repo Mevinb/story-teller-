@@ -18,11 +18,15 @@ from models.openrouter_model import OpenRouterModel
 from memory.state_manager import StateManager
 from memory.vector_store import VectorStore
 from memory.retriever import Retriever
+from memory.tension_tracker import TensionTracker
+from memory.motif_tracker import MotifTracker
 from agents.architect import StoryArchitect
 from agents.planner import ScenePlanner
 from agents.writer import SceneWriter
 from agents.consistency import ConsistencyEngine
 from agents.editor import Editor
+from agents.pacing import PacingAgent
+from agents.voice import VoiceAgent
 from memory.evolution_engine import evolve_after_scene
 
 logger = logging.getLogger(__name__)
@@ -312,6 +316,8 @@ class PipelineOrchestrator:
             self.writer = SceneWriter(self.cloud_model, self.cloud_model)
             self.consistency = ConsistencyEngine(self.cloud_model)
             self.editor = Editor(self.cloud_model)
+            self.pacing = PacingAgent()
+            self.voice = VoiceAgent()
             self._enable_compact_agent_prompts()
             return
 
@@ -322,6 +328,8 @@ class PipelineOrchestrator:
         self.writer = SceneWriter(primary_writer, self.local_model)
         self.consistency = ConsistencyEngine(self.local_model)
         self.editor = Editor(self.local_model)
+        self.pacing = PacingAgent()
+        self.voice = VoiceAgent()
         self._enable_compact_local_planning_prompts()
 
     def _enable_compact_agent_prompts(self):
@@ -616,6 +624,36 @@ class PipelineOrchestrator:
                     state["last_blocking_fingerprint"] = ""
 
                 stuck_on_same_issues = blocking and state["blocking_repeat_count"] >= 2
+
+                # ── Oscillation breaker ──────────────────────────────
+                # If the exact same set of blocking issues has appeared
+                # 3+ times, the writer cannot fix them. Downgrade to
+                # non-blocking so the pipeline can proceed.
+                if blocking and state["blocking_repeat_count"] >= 3:
+                    self._log(
+                        f"Scene {scene_num}: oscillation detected — same issues "
+                        f"repeated {state['blocking_repeat_count']} times. "
+                        "Downgrading remaining blockers to non-blocking.",
+                        level="warn",
+                        details={
+                            "issues": [
+                                i.get("detail", "")
+                                for i in state.get("blocking_issues", [])[:3]
+                            ]
+                        },
+                    )
+                    # Move all remaining blocking issues into non-blocking
+                    for issue in state.get("blocking_issues", []):
+                        issue["blocking"] = False
+                        issue["severity"] = "low"
+                        issue["detail"] = (
+                            f"[auto-downgraded after {state['blocking_repeat_count']} "
+                            f"rewrite attempts] {issue.get('detail', '')}"
+                        )
+                    state["non_blocking_issues"].extend(state["blocking_issues"])
+                    state["blocking_issues"] = []
+                    blocking = False
+
                 if step_counter["steps"] >= config.MAX_PIPELINE_STEPS:
                     raise RuntimeError(
                         f"Pipeline step budget exceeded ({config.MAX_PIPELINE_STEPS})"
@@ -706,22 +744,33 @@ class PipelineOrchestrator:
                         level="warn",
                         details={"reason": str(e)},
                     )
-                    state["scene_text"] = pre_edit_text
-                    # Validate the fallback draft but only WARN — never abort a
-                    # chapter because the writer produced a short best-effort draft.
+                    # Try to fix the editor output's truncation before giving up
+                    fixed_editor = self._fix_truncated_ending(state["scene_text"], scene)
                     try:
                         self._validate_scene_completion(
-                            scene_text=state["scene_text"],
-                            scene=scene,
-                            chapter_num=chapter_num,
+                            scene_text=fixed_editor, scene=scene, chapter_num=chapter_num,
                         )
-                    except RuntimeError as fallback_err:
-                        self._log(
-                            f"Scene {scene_num} fallback draft also below minimum; "
-                            "continuing with best available text",
-                            level="warn",
-                            details={"reason": str(fallback_err)},
-                        )
+                        state["scene_text"] = fixed_editor
+                    except RuntimeError:
+                        # Editor output unfixable — fall back to writer draft
+                        state["scene_text"] = pre_edit_text
+                        # Try to fix truncation on the writer draft too
+                        state["scene_text"] = self._fix_truncated_ending(state["scene_text"], scene)
+                        # Validate the fallback draft but only WARN — never abort a
+                        # chapter because the writer produced a short best-effort draft.
+                        try:
+                            self._validate_scene_completion(
+                                scene_text=state["scene_text"],
+                                scene=scene,
+                                chapter_num=chapter_num,
+                            )
+                        except RuntimeError as fallback_err:
+                            self._log(
+                                f"Scene {scene_num} fallback draft also below minimum; "
+                                "continuing with best available text",
+                                level="warn",
+                                details={"reason": str(fallback_err)},
+                            )
                 graph_node = SCENE_GRAPH["editor"][0]
 
         return {
@@ -1015,6 +1064,27 @@ class PipelineOrchestrator:
         return start_idx >= len(steps)
 
     @staticmethod
+    def _premise_exhausted_from_state(steps: list[str], state: dict) -> bool:
+        """Return True if all premise steps have already been covered.
+
+        Uses the persisted ``premise_step_completed`` cursor when available so
+        that the test stays accurate even when chapters have covered varying
+        numbers of steps.  Falls back to the arithmetic estimate for projects
+        that pre-date the cursor field (premise_step_completed == -1 means
+        'never set; use arithmetic fallback via the chapter number').
+        """
+        if not steps:
+            return False
+        completed_idx = int(
+            (state.get("metadata") or {}).get("premise_step_completed", -1)
+        )
+        if completed_idx < 0:
+            # Legacy / fresh project — no cursor yet.  Not exhausted.
+            return False
+        # All steps covered once we've passed the last index.
+        return completed_idx >= len(steps) - 1
+
+    @staticmethod
     def _allowed_premise_step_index(chapter_num: int, steps: list[str]) -> int:
         """Return the LAST (inclusive) premise-step index this chapter may cover.
 
@@ -1022,6 +1092,10 @@ class PipelineOrchestrator:
         consecutive steps.  Returning the *last* index of that window keeps the
         existing call-sites correct: anything beyond this index is "future" and
         anything at-or-before it is "allowed or completed".
+
+        This is the *arithmetic* fallback used only by legacy / zero-state code
+        paths.  Prefer ``_allowed_premise_step_index_from_state`` in the main
+        pipeline so the cursor is driven by what was actually written.
         """
         if not steps:
             return -1
@@ -1030,11 +1104,41 @@ class PipelineOrchestrator:
         end_idx = chapter_num * n - 1
         return max(0, min(end_idx, len(steps) - 1))
 
+    @staticmethod
+    def _allowed_premise_step_index_from_state(
+        chapter_num: int, steps: list[str], state: dict
+    ) -> int:
+        """Return the LAST (inclusive) premise-step index the current chapter may cover.
+
+        Reads the persisted ``premise_step_completed`` cursor so the window
+        always starts exactly where the previous chapter left off, regardless
+        of how many steps that chapter actually covered.
+
+        Fallback: if the cursor has never been set (value == -1, i.e. a fresh
+        project or one that pre-dates this field), the arithmetic estimate is
+        used so old projects keep working.
+        """
+        if not steps:
+            return -1
+        n = config.PREMISE_STEPS_PER_CHAPTER
+        completed_idx = int(
+            (state.get("metadata") or {}).get("premise_step_completed", -1)
+        )
+        if completed_idx < 0:
+            # No cursor yet — use arithmetic estimate (chapter 1 window: steps 0..n-1)
+            end_idx = chapter_num * n - 1
+        else:
+            # Cursor is the LAST step that was covered in the PREVIOUS chapter.
+            # This chapter's window starts right after and covers `n` steps.
+            end_idx = completed_idx + n
+        return max(0, min(end_idx, len(steps) - 1))
+
+
     def _append_premise_step_anchor(self, context: str, chapter_num: int, state: dict) -> str:
         steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
         if not steps:
             return context
-        if self._premise_exhausted(chapter_num, steps):
+        if self._premise_exhausted_from_state(steps, state):
             # Build a specific list of the last few completed beats as forbidden repetition ground
             last_beats = steps[-3:] if len(steps) >= 3 else steps
             last_beats_text = "\n".join(f"  - {s}" for s in last_beats)
@@ -1051,7 +1155,7 @@ class PipelineOrchestrator:
                 "The story is entering its final arc. Raise the stakes."
             )
         n = config.PREMISE_STEPS_PER_CHAPTER
-        allowed_idx = self._allowed_premise_step_index(chapter_num, steps)
+        allowed_idx = self._allowed_premise_step_index_from_state(chapter_num, steps, state)
         start_idx = max(0, allowed_idx - n + 1)  # first step in this chapter's window
         completed = steps[:start_idx]
         current_steps = steps[start_idx: allowed_idx + 1]  # window for this chapter
@@ -1066,6 +1170,7 @@ class PipelineOrchestrator:
             "Hard rule: do not introduce events, locations, relationships, private contact, or characters "
             "whose first premise appearance belongs to a future step."
         )
+
 
     def _append_used_titles_anchor(self, context: str, state: dict) -> str:
         """Inject previously used chapter titles so the Architect cannot repeat them.
@@ -1185,9 +1290,9 @@ class PipelineOrchestrator:
         steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
         if not steps:
             return []
-        if self._premise_exhausted(chapter_num, steps):
+        if self._premise_exhausted_from_state(steps, state):
             return []
-        allowed_idx = self._allowed_premise_step_index(chapter_num, steps)
+        allowed_idx = self._allowed_premise_step_index_from_state(chapter_num, steps, state)
         lowered = self._normalized_text_for_marker_checks(text)
         allowed_and_prior = self._normalized_text_for_marker_checks(" ".join(steps[:allowed_idx + 1]))
         violations = []
@@ -1409,10 +1514,10 @@ class PipelineOrchestrator:
         state: dict,
     ) -> dict:
         steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
-        if not steps or self._premise_exhausted(chapter_num, steps):
+        if not steps or self._premise_exhausted_from_state(steps, state):
             return chapter_plan
         n = config.PREMISE_STEPS_PER_CHAPTER
-        allowed_idx = self._allowed_premise_step_index(chapter_num, steps)
+        allowed_idx = self._allowed_premise_step_index_from_state(chapter_num, steps, state)
         start_idx = max(0, allowed_idx - n + 1)
         # Collect ALL steps in this chapter's window
         window_steps = steps[start_idx: allowed_idx + 1]
@@ -1477,12 +1582,12 @@ class PipelineOrchestrator:
         ordered_names = list(state.get("characters", {}).keys())
         all_names = set(ordered_names)
         steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
-        premise_active = bool(steps) and not self._premise_exhausted(chapter_num, steps)
+        premise_active = bool(steps) and not self._premise_exhausted_from_state(steps, state)
         allowed_idx = None
         safe_step = ""
         allowed_names = set(all_names)
         if premise_active:
-            allowed_idx = self._allowed_premise_step_index(chapter_num, steps)
+            allowed_idx = self._allowed_premise_step_index_from_state(chapter_num, steps, state)
             safe_step = steps[allowed_idx]
             char_first = self._character_first_premise_steps(ordered_names, steps)
             allowed_names = {
@@ -1615,6 +1720,78 @@ class PipelineOrchestrator:
                 + ". Planner must follow the premise cursor."
             )
 
+        # Check if it missed the required premise steps
+        steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
+        premise_active = bool(steps) and not self._premise_exhausted_from_state(steps, state)
+        if premise_active:
+            n = config.PREMISE_STEPS_PER_CHAPTER
+            allowed_idx = self._allowed_premise_step_index_from_state(chapter_num, steps, state)
+            start_idx = max(0, allowed_idx - n + 1)
+            window_steps = steps[start_idx: allowed_idx + 1]
+
+            key_events = chapter_plan.get("key_events", [])
+            if not isinstance(key_events, list):
+                key_events = [key_events]
+            key_events_lower = [str(e).lower() for e in key_events]
+
+            # Build character name set to filter out of content words
+            char_names_lower = {str(name).strip().lower() for name in list(state.get("characters", {}).keys())}
+            split_char_names = set()
+            for name in char_names_lower:
+                split_char_names.update(name.split())
+            char_names_lower.update(split_char_names)
+
+            stopwords = {
+                'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', 'arent', 
+                'as', 'at', 'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by', 
+                'cant', 'cannot', 'could', 'couldnt', 'did', 'didnt', 'do', 'does', 'doesnt', 'doing', 'dont', 
+                'down', 'during', 'each', 'few', 'for', 'from', 'further', 'had', 'hadnt', 'has', 'hasnt', 'have', 
+                'havent', 'having', 'he', 'hed', 'hell', 'hes', 'her', 'here', 'heres', 'hers', 'herself', 'him', 
+                'himself', 'his', 'how', 'hows', 'i', 'id', 'ill', 'im', 'ive', 'if', 'in', 'into', 'is', 'isnt', 
+                'it', 'its', 'itself', 'lets', 'me', 'more', 'most', 'mustnt', 'my', 'myself', 'no', 'nor', 'not', 
+                'of', 'off', 'on', 'once', 'only', 'or', 'other', 'ought', 'our', 'ours', 'ourselves', 'out', 'over', 
+                'own', 'same', 'shant', 'she', 'shed', 'shell', 'shes', 'should', 'shouldnt', 'so', 'some', 'such', 
+                'than', 'that', 'thats', 'the', 'their', 'theirs', 'them', 'themselves', 'then', 'there', 'theres', 
+                'these', 'they', 'theyd', 'theyll', 'theyre', 'theyve', 'this', 'those', 'through', 'to', 'too', 
+                'under', 'until', 'up', 'very', 'was', 'wasnt', 'we', 'wed', 'well', 'were', 'weve', 'werent', 
+                'what', 'whats', 'when', 'whens', 'where', 'wheres', 'which', 'while', 'who', 'whos', 'whom', 
+                'why', 'whys', 'with', 'wont', 'would', 'wouldnt', 'you', 'youd', 'youll', 'youre', 'youve', 
+                'your', 'yours', 'yourself', 'yourselves', 'story', 'chapter', 'event', 'character', 'characters'
+            }
+
+            for step_idx, step in enumerate(window_steps):
+                step_lower = step.strip().lower()
+                step_words = [
+                    re.sub(r'[^a-z0-9]', '', w)
+                    for w in step_lower.split()
+                ]
+                step_content_words = {
+                    w for w in step_words
+                    if len(w) > 4 and w not in stopwords and w not in char_names_lower
+                }
+
+                # Find a matching key event
+                matched = False
+                for event in key_events_lower:
+                    event_words = [
+                        re.sub(r'[^a-z0-9]', '', w)
+                        for w in event.split()
+                    ]
+                    event_content_words = {
+                        w for w in event_words
+                        if len(w) > 4 and w not in stopwords and w not in char_names_lower
+                    }
+
+                    # Match if they share at least one non-trivial content word
+                    if step_content_words & event_content_words:
+                        matched = True
+                        break
+
+                if not matched:
+                    raise RuntimeError(
+                        f"Chapter plan key_events missed mandatory premise step {start_idx + step_idx + 1}: '{step[:60]}...'"
+                    )
+
     def _validate_scene_premise_order(self, scenes: list, chapter_num: int, state: dict) -> None:
         for scene in scenes or []:
             scene_blob = " ".join(
@@ -1633,6 +1810,76 @@ class PipelineOrchestrator:
                     + "; ".join(violations[:4])
                     + ". Regenerate chapter scenes from the allowed premise step."
                 )
+
+        # Check if the scenes missed the required steps
+        steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
+        premise_active = bool(steps) and not self._premise_exhausted_from_state(steps, state)
+        if premise_active:
+            n = config.PREMISE_STEPS_PER_CHAPTER
+            allowed_idx = self._allowed_premise_step_index_from_state(chapter_num, steps, state)
+            start_idx = max(0, allowed_idx - n + 1)
+            window_steps = steps[start_idx: allowed_idx + 1]
+
+            # Build character name set to filter out of content words
+            char_names_lower = {str(name).strip().lower() for name in list(state.get("characters", {}).keys())}
+            split_char_names = set()
+            for name in char_names_lower:
+                split_char_names.update(name.split())
+            char_names_lower.update(split_char_names)
+
+            stopwords = {
+                'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', 'arent', 
+                'as', 'at', 'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by', 
+                'cant', 'cannot', 'could', 'couldnt', 'did', 'didnt', 'do', 'does', 'doesnt', 'doing', 'dont', 
+                'down', 'during', 'each', 'few', 'for', 'from', 'further', 'had', 'hadnt', 'has', 'hasnt', 'have', 
+                'havent', 'having', 'he', 'hed', 'hell', 'hes', 'her', 'here', 'heres', 'hers', 'herself', 'him', 
+                'himself', 'his', 'how', 'hows', 'i', 'id', 'ill', 'im', 'ive', 'if', 'in', 'into', 'is', 'isnt', 
+                'it', 'its', 'itself', 'lets', 'me', 'more', 'most', 'mustnt', 'my', 'myself', 'no', 'nor', 'not', 
+                'of', 'off', 'on', 'once', 'only', 'or', 'other', 'ought', 'our', 'ours', 'ourselves', 'out', 'over', 
+                'own', 'same', 'shant', 'she', 'shed', 'shell', 'shes', 'should', 'shouldnt', 'so', 'some', 'such', 
+                'than', 'that', 'thats', 'the', 'their', 'theirs', 'them', 'themselves', 'then', 'there', 'theres', 
+                'these', 'they', 'theyd', 'theyll', 'theyre', 'theyve', 'this', 'those', 'through', 'to', 'too', 
+                'under', 'until', 'up', 'very', 'was', 'wasnt', 'we', 'wed', 'well', 'were', 'weve', 'werent', 
+                'what', 'whats', 'when', 'whens', 'where', 'wheres', 'which', 'while', 'who', 'whos', 'whom', 
+                'why', 'whys', 'with', 'wont', 'would', 'wouldnt', 'you', 'youd', 'youll', 'youre', 'youve', 
+                'your', 'yours', 'yourself', 'yourselves', 'story', 'chapter', 'event', 'character', 'characters'
+            }
+
+            for step_idx, step in enumerate(window_steps):
+                step_lower = step.strip().lower()
+                step_words = [
+                    re.sub(r'[^a-z0-9]', '', w)
+                    for w in step_lower.split()
+                ]
+                step_content_words = {
+                    w for w in step_words
+                    if len(w) > 4 and w not in stopwords and w not in char_names_lower
+                }
+
+                matched = False
+                for scene in scenes or []:
+                    scene_blob = " ".join([
+                        str(scene.get("summary", "")),
+                        " ".join(str(e) for e in scene.get("key_events", []) or []),
+                    ]).lower()
+                    
+                    scene_words = [
+                        re.sub(r'[^a-z0-9]', '', w)
+                        for w in scene_blob.split()
+                    ]
+                    scene_content_words = {
+                        w for w in scene_words
+                        if len(w) > 4 and w not in stopwords and w not in char_names_lower
+                    }
+
+                    if step_content_words & scene_content_words:
+                        matched = True
+                        break
+
+                if not matched:
+                    raise RuntimeError(
+                        f"Scene plan missed required premise step {start_idx + step_idx + 1}: '{step[:60]}...'"
+                    )
 
     def _introduced_character_names(self, chapter_num: int, state: dict = None) -> set[str]:
         """Characters that have appeared in completed chapters or persisted plot history."""
@@ -2828,8 +3075,26 @@ class PipelineOrchestrator:
         )
         plan_summary = chapter_plan.get("plot_direction", "")
         summary = f"{plan_summary} | Written content: {actual_summary[:400]}"
-        self.state_manager.add_chapter_summary(chapter_num, summary)
+        title = chapter_plan.get("chapter_title", "")
+        self.state_manager.add_chapter_summary(chapter_num, summary, title)
         self.state_manager.increment_scene_count(completed_scene_count)
+
+        # ── Persist the premise step cursor ──────────────────────────────
+        # Advance the cursor so the NEXT auto-generated chapter starts from
+        # where this manual chapter left off.
+        _manual_state = self.state_manager.load()
+        _manual_steps = self._premise_steps(
+            _manual_state.get("metadata", {}).get("premise", "")
+        )
+        if _manual_steps:
+            _manual_cursor = self._allowed_premise_step_index_from_state(
+                chapter_num, _manual_steps, _manual_state
+            )
+            self.state_manager.set_premise_step_completed(_manual_cursor)
+            self._log(
+                f"Premise cursor (manual) advanced to step {_manual_cursor + 1}/{len(_manual_steps)}",
+                level="info",
+            )
 
         # Add events
         for event in chapter_plan.get("key_events", []):
@@ -3058,6 +3323,15 @@ class PipelineOrchestrator:
                 plan_context,
                 state,
             )
+
+            # Inject tension curve and motif summaries for architect awareness
+            tension_summary = TensionTracker.get_tension_summary(state)
+            if tension_summary:
+                plan_context = f"{plan_context.rstrip()}\n\n{tension_summary}\n"
+            motif_summary = MotifTracker.get_motif_summary(state)
+            if motif_summary:
+                plan_context = f"{plan_context.rstrip()}\n\n{motif_summary}\n"
+
             self._log(f"Context assembled: {len(plan_context)} chars",
                       details={"characters": list(state.get('characters', {}).keys())})
 
@@ -3074,10 +3348,14 @@ class PipelineOrchestrator:
                 self._log("Manual chapter plan accepted", level="success")
                 arch_time = 0.0
             else:
+                steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
                 architect_input = {
                     "chapter_num": chapter_num,
                     "context": plan_context,
                     "pacing": pacing,
+                    "premise_steps": steps,
+                    "current_step": self._allowed_premise_step_index_from_state(chapter_num, steps, state) + 1,
+                    "used_titles": [s.get("chapter_title") for s in state.get("plot", {}).get("chapter_summaries", []) if s.get("chapter_title")],
                 }
                 architect_result = self._run_agent_step(
                     chapter_num=chapter_num,
@@ -3347,6 +3625,14 @@ class PipelineOrchestrator:
                 self._log(f"Context retrieved: {len(scene_context)} chars",
                           details={"top_k": config.TOP_K_RETRIEVAL})
 
+                # Inject character voice guidance into scene context
+                voice_guidance = self.voice.build_voice_guidance(
+                    scene.get("characters_present", []),
+                    state.get("characters", {}),
+                )
+                if voice_guidance:
+                    scene_context = f"{scene_context.rstrip()}\n\n{voice_guidance}\n"
+
                 # 4b-4f: Explicit scene execution graph
                 scene_result = self._run_scene_graph(
                     chapter_num=chapter_num,
@@ -3382,6 +3668,25 @@ class PipelineOrchestrator:
                 chapter_text_parts.append(scene_text)
                 previous_ending = self._extract_ending(scene_text)
                 self._ensure_scene_characters_known(scene)
+
+                # Post-scene pacing analysis (deterministic, no LLM)
+                pacing_report = self.pacing.analyze(scene_text, scene)
+                pacing_issues = pacing_report.get("issues", [])
+                if pacing_issues:
+                    self._log(
+                        f"Pacing analysis: {pacing_report['overall_pace']} pace, "
+                        f"{len(pacing_issues)} issue(s)",
+                        level="info",
+                        details={
+                            "issues": [i.get("type", "") for i in pacing_issues],
+                            "word_count": pacing_report.get("word_count", 0),
+                        },
+                    )
+                else:
+                    self._log(
+                        f"Pacing analysis: {pacing_report['overall_pace']} pace ✓",
+                        level="success",
+                    )
 
                 # Post-scene narrative evolution
                 try:
@@ -3499,8 +3804,26 @@ class PipelineOrchestrator:
             )
             plan_summary = chapter_plan.get("plot_direction", "")
             summary = f"{plan_summary} | Written content: {actual_summary[:400]}"
-            self.state_manager.add_chapter_summary(chapter_num, summary)
+            title = chapter_plan.get("chapter_title", "")
+            self.state_manager.add_chapter_summary(chapter_num, summary, title)
             self.state_manager.increment_scene_count(completed_scene_count)
+
+            # ── Persist the premise step cursor ──────────────────────────────
+            # Record which premise step index was covered last so the NEXT
+            # chapter's planning starts exactly from the correct position.
+            _steps_for_cursor = self._premise_steps(
+                state.get("metadata", {}).get("premise", "")
+            )
+            if _steps_for_cursor and not manual_mode:
+                _cursor = self._allowed_premise_step_index_from_state(
+                    chapter_num, _steps_for_cursor, state
+                )
+                self.state_manager.set_premise_step_completed(_cursor)
+                self._log(
+                    f"Premise cursor advanced to step {_cursor + 1}/{len(_steps_for_cursor)}",
+                    level="info",
+                    details={"step": _steps_for_cursor[_cursor][:80] if _cursor < len(_steps_for_cursor) else "premise complete"},
+                )
 
             # Add events
             for event in chapter_plan.get("key_events", []):
@@ -3910,17 +4233,26 @@ class PipelineOrchestrator:
         state = self.state_manager.load()
         steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
         
-        is_entire = (count == -1)
+        is_entire = (count in (-1, -2))
         limit = 50 if is_entire else count
         
         for i in range(limit):
             if self._cancelled:
                 break
                 
+            # Reload state to get latest cursors and current chapter count
+            state = self.state_manager.load()
             current_ch = self.state_manager.get_current_chapter()
-            if is_entire and self._premise_exhausted(current_ch + 1, steps):
-                self._log("Entire story premise has been successfully covered. Stopping batch generation.", level="success")
-                break
+            
+            if is_entire:
+                # 1. State-based completed cursor check
+                if self._premise_exhausted_from_state(steps, state):
+                    self._log("Entire story premise has been successfully covered (state check). Stopping batch generation.", level="success")
+                    break
+                # 2. Arithmetic fallback estimate check
+                if self._premise_exhausted(current_ch + 1, steps):
+                    self._log("Entire story premise has been successfully covered (arithmetic estimate). Stopping batch generation.", level="success")
+                    break
                 
             display_count = " (Entire Story)" if is_entire else f" {i + 1}/{count}"
             self._log(f"═══ Batch: chapter{display_count} ═══", level="header")
