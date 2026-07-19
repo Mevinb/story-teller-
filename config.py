@@ -82,6 +82,9 @@ CHUNK_SIZE = 400          # tokens per chunk
 CHUNK_OVERLAP = 50        # token overlap between chunks
 TOP_K_RETRIEVAL = 4       # number of chunks to retrieve
 CONTEXT_TOKEN_BUDGET = 2048  # max tokens for assembled context
+# Maximum number of query embeddings to cache in memory (LRU eviction).
+# Each entry is ~1.5KB (384-dim float32 vector). 1024 entries ≈ 1.5MB.
+EMBEDDING_CACHE_MAX_SIZE = int(os.getenv("EMBEDDING_CACHE_MAX_SIZE", "1024"))
 
 # ─── Quality Thresholds ─────────────────────────────────────────────
 MIN_SCENE_WORDS = 500

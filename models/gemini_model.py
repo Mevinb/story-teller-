@@ -178,10 +178,9 @@ class GeminiModel(LLMInterface):
                 # Extract retry-after if available
                 match = re.search(r"retry after (\d+)", error_str)
                 wait = float(match.group(1)) if match else 30.0
-                logger.warning(f"[Gemini] Rate limited — waiting {wait}s...")
+                logger.warning(f"[Gemini] Rate limited — waiting {wait}s before propagating error...")
                 time.sleep(wait)
-                # Retry once
-                return self.generate(prompt, system, schema, temperature, max_tokens, stream=False)
+                raise
             raise
 
     def generate_streaming(
@@ -211,43 +210,80 @@ class GeminiModel(LLMInterface):
             **gen_config_kwargs,
         )
 
-        try:
-            response = self.client.models.generate_content_stream(
-                model=self.model,
-                contents=prompt,
-                config=config_obj,
-            )
+        max_retries = 5
+        delay = config.RETRY_BASE_DELAY
+        
+        for attempt in range(max_retries):
+            try:
+                response = self.client.models.generate_content_stream(
+                    model=self.model,
+                    contents=prompt,
+                    config=config_obj,
+                )
 
-            for chunk in response:
-                if hasattr(chunk, 'text') and chunk.text:
-                    cleaned = self._strip_reasoning(chunk.text)
-                    if cleaned:
-                        yield cleaned
+                for chunk in response:
+                    if hasattr(chunk, 'text') and chunk.text:
+                        cleaned = self._strip_reasoning(chunk.text)
+                        if cleaned:
+                            yield cleaned
+                # Break on success
+                break
 
-        except Exception as e:
-            error_str = str(e).lower()
-            if "safety" in error_str or "blocked" in error_str:
-                self._content_blocked = True
-            raise
+            except Exception as e:
+                error_str = str(e).lower()
+                if "safety" in error_str or "blocked" in error_str:
+                    self._content_blocked = True
+                    raise
+                
+                is_transient = "503" in error_str or "unavailable" in error_str or "quota" in error_str or "rate" in error_str
+                if is_transient and attempt < max_retries - 1:
+                    wait = delay
+                    if "rate" in error_str or "quota" in error_str:
+                        match = re.search(r"retry after (\d+)", error_str)
+                        wait = float(match.group(1)) if match else 15.0
+                    logger.warning(
+                        f"[Gemini] Streaming attempt {attempt + 1}/{max_retries} failed: {e}. "
+                        f"Retrying in {wait:.1f}s..."
+                    )
+                    time.sleep(wait)
+                    delay = min(delay * config.RETRY_BACKOFF_FACTOR, config.RETRY_MAX_DELAY)
+                else:
+                    raise
 
     def is_available(self) -> bool:
         """Check if Gemini API is reachable with a minimal request."""
         if not self._api_key:
             logger.warning("[Gemini] No API key configured.")
             return False
-        try:
-            config_obj = types.GenerateContentConfig(
-                max_output_tokens=10,
-            )
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents="Say hello in one word.",
-                config=config_obj,
-            )
-            return bool(response.text)
-        except Exception as e:
-            logger.warning(f"[Gemini] Availability check failed: {e}")
-            return False
+            
+        max_retries = 5
+        delay = 2.0
+        
+        for attempt in range(max_retries):
+            try:
+                config_obj = types.GenerateContentConfig(
+                    max_output_tokens=40,
+                )
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents="Say hello.",
+                    config=config_obj,
+                )
+                return response is not None and len(response.candidates) > 0
+            except Exception as e:
+                error_str = str(e).lower()
+                is_transient = "503" in error_str or "unavailable" in error_str or "quota" in error_str or "rate" in error_str
+                if is_transient and attempt < max_retries - 1:
+                    logger.warning(
+                        f"[Gemini] Availability check attempt {attempt + 1}/{max_retries} failed: {e}. "
+                        f"Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2.0
+                else:
+                    logger.warning(f"[Gemini] Availability check failed: {e}")
+                    return False
+        return False
 
     def get_name(self) -> str:
         return f"Gemini ({self.model})"

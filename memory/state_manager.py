@@ -397,6 +397,7 @@ class StateManager:
         meta = self._state.setdefault("metadata", {})
         meta["state_version"] = int(meta.get("state_version", 0)) + 1
         self._state["metadata"]["updated_at"] = datetime.now().isoformat()
+        os.makedirs(self.project_dir, exist_ok=True)
         tmp_path = self.state_path + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(self._state, f, indent=2, ensure_ascii=False)

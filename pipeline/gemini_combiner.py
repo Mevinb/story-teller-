@@ -86,7 +86,8 @@ def _generate_content_with_retry(client: genai.Client, model: str, contents, con
         except Exception as e:
             err_str = str(e)
             is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()
-            if is_rate_limit and attempt < max_retries - 1:
+            is_daily_limit = "daily" in err_str.lower() or "limit: 20" in err_str.lower() or "free_tier_requests" in err_str.lower() or "limit: 0" in err_str.lower()
+            if is_rate_limit and not is_daily_limit and attempt < max_retries - 1:
                 sleep_time = delay + random.uniform(0.5, 2.0)
                 logger.warning(f"Gemini API Rate limit hit (429/Resource Exhausted). Retrying in {sleep_time:.2f}s... (Attempt {attempt+1}/{max_retries})")
                 slept = 0.0
@@ -97,7 +98,70 @@ def _generate_content_with_retry(client: genai.Client, model: str, contents, con
                     slept += 0.5
                 delay *= 2.0
             else:
-                raise e
+                try:
+                    from models.groq_model import GroqModel
+                    logger.warning(f"Gemini API failed/exhausted ({e}). Falling back to Groq for combine & polish pass...")
+                    groq = GroqModel()
+                    
+                    prompt_str = ""
+                    if isinstance(contents, str):
+                        prompt_str = contents
+                    elif isinstance(contents, list):
+                        prompt_parts = []
+                        for item in contents:
+                            if isinstance(item, str):
+                                prompt_parts.append(item)
+                            elif hasattr(item, "text"):
+                                prompt_parts.append(item.text)
+                            elif isinstance(item, dict) and "text" in item:
+                                prompt_parts.append(item["text"])
+                        prompt_str = "\n".join(prompt_parts)
+                    else:
+                        prompt_str = str(contents)
+                    
+                    system_str = ""
+                    temp = None
+                    max_toks = None
+                    schema_dict = None
+                    
+                    if config:
+                        if hasattr(config, "system_instruction"):
+                            system_str = config.system_instruction or ""
+                        elif isinstance(config, dict):
+                            system_str = config.get("system_instruction") or ""
+                            
+                        if hasattr(config, "temperature"):
+                            temp = config.temperature
+                        elif isinstance(config, dict):
+                            temp = config.get("temperature")
+                            
+                        if hasattr(config, "max_output_tokens"):
+                            max_toks = config.max_output_tokens
+                        elif isinstance(config, dict):
+                            max_toks = config.get("max_output_tokens")
+                            
+                        if hasattr(config, "response_schema"):
+                            schema_dict = config.response_schema
+                        elif isinstance(config, dict):
+                            schema_dict = config.get("response_schema")
+                    
+                    res = groq.generate(
+                        prompt=prompt_str,
+                        system=system_str,
+                        schema=schema_dict,
+                        temperature=temp,
+                        max_tokens=max_toks
+                    )
+                    
+                    class MockGeminiResponse:
+                        def __init__(self, text_content):
+                            self.text = text_content
+                            self.candidates = [True]
+                    
+                    return MockGeminiResponse(res.content)
+                except Exception as fallback_err:
+                    logger.error(f"Fallback to Groq failed: {fallback_err}")
+                    raise e
 
 _CHAPTER_FILE_RE = re.compile(r"^chapter_(\d{3,})\.md$")
 _CHAPTER_HEADER_RE = re.compile(r"^(#+\s*)(Chapter\s+\d+)(.*?)$", re.IGNORECASE | re.MULTILINE)

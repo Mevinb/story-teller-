@@ -6,6 +6,7 @@ Uses sentence-transformers for lightweight CPU-based embedding.
 import os
 import json
 import logging
+from collections import OrderedDict
 from typing import List, Optional
 from dataclasses import dataclass, field
 
@@ -77,7 +78,12 @@ class VectorStore:
         self._texts: List[str] = []
         self._metadata: List[dict] = []
         self._dimension: int = 384  # MiniLM-L6-v2 dimension
-        self._embedding_cache: dict[str, np.ndarray] = {}
+        # LRU cache: OrderedDict preserves insertion order; recently-used
+        # entries are moved to the end so the oldest (LRU) entry is always
+        # at the front and is evicted first when the cache is full.
+        self._embedding_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+        self._embedding_cache_hits: int = 0
+        self._embedding_cache_misses: int = 0
         self._cross_encoder: Optional[CrossEncoder] = None
 
     @property
@@ -236,17 +242,25 @@ class VectorStore:
         if self.index.ntotal == 0:
             return []
 
-        # Encode query
-        query_embedding = self._embedding_cache.get(query)
-        if query_embedding is None:
+        # Encode query — LRU cache keyed by query string
+        if query in self._embedding_cache:
+            # Cache hit: move to end (most-recently-used position)
+            self._embedding_cache.move_to_end(query)
+            query_embedding = self._embedding_cache[query]
+            self._embedding_cache_hits += 1
+        else:
+            # Cache miss: encode and store
             query_embedding = self.model.encode(
                 [query],
                 convert_to_numpy=True,
                 normalize_embeddings=True,
             ).astype("float32")
-            if len(self._embedding_cache) >= 512:
-                self._embedding_cache.pop(next(iter(self._embedding_cache)))
+            max_size = getattr(config, "EMBEDDING_CACHE_MAX_SIZE", 1024)
+            if len(self._embedding_cache) >= max_size:
+                # Evict the least-recently-used entry (front of OrderedDict)
+                self._embedding_cache.popitem(last=False)
             self._embedding_cache[query] = query_embedding
+            self._embedding_cache_misses += 1
 
         # Search with extra results if filtering
         search_k = top_k * 3 if chapter_filter is not None else top_k
@@ -284,6 +298,18 @@ class VectorStore:
             "total_chunks": len(self._texts),
             "dimension": self._dimension,
             "index_file_exists": os.path.exists(self.index_path),
+        }
+
+    def cache_info(self) -> dict:
+        """Return embedding cache diagnostics."""
+        total = self._embedding_cache_hits + self._embedding_cache_misses
+        hit_rate = self._embedding_cache_hits / total if total > 0 else 0.0
+        return {
+            "cache_size": len(self._embedding_cache),
+            "max_size": getattr(config, "EMBEDDING_CACHE_MAX_SIZE", 1024),
+            "hits": self._embedding_cache_hits,
+            "misses": self._embedding_cache_misses,
+            "hit_rate": round(hit_rate, 3),
         }
 
     def prune_chapters(self, max_chapter: int) -> int:

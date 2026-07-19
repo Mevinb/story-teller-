@@ -5,6 +5,7 @@ Manages the full chapter generation flow from planning to storage.
 import os
 import json
 import logging
+import shutil
 import time
 import re
 from datetime import datetime
@@ -28,6 +29,7 @@ from agents.editor import Editor
 from agents.pacing import PacingAgent
 from agents.voice import VoiceAgent
 from memory.evolution_engine import evolve_after_scene
+from pipeline.quality_controller import QualityController
 
 logger = logging.getLogger(__name__)
 
@@ -48,8 +50,17 @@ _GENERIC_CHARACTER_LABELS = {
     "people", "onlookers", "everyone", "men", "women",
 }
 _FUTURE_MARKER_TOKEN_STOPWORDS = {
-    "with", "while", "from", "that", "this", "then", "their",
-    "becomes", "starts", "continues", "scene", "scenes",
+    # Conjunctions / prepositions
+    "with", "while", "from", "that", "this", "then", "their", "also", "when",
+    "after", "into", "over", "upon", "about", "through", "during",
+    # Common narrative verbs — appear in virtually every premise step
+    "becomes", "starts", "continues", "begins", "tries", "tries", "finds",
+    "feels", "knows", "goes", "gets", "lets", "puts", "uses", "sees",
+    "come", "comes", "make", "makes", "take", "takes", "give", "gives",
+    "thinking", "feeling", "noticing", "realizing", "realises", "realizes",
+    "discovering", "discovering", "just", "only", "more", "suddenly",
+    "scene", "scenes", "chapter", "story", "event",
+    # Legacy project-specific names kept for backwards compat
     "sherin", "jomy", "riya",
 }
 
@@ -319,6 +330,8 @@ class PipelineOrchestrator:
             self.pacing = PacingAgent()
             self.voice = VoiceAgent()
             self._enable_compact_agent_prompts()
+            # Phase 2/3: Quality controller (stateless, always available)
+            self.quality_ctrl = QualityController()
             return
 
         # All local by default; cloud can optionally be writer-primary.
@@ -331,6 +344,8 @@ class PipelineOrchestrator:
         self.pacing = PacingAgent()
         self.voice = VoiceAgent()
         self._enable_compact_local_planning_prompts()
+        # Phase 2/3: Quality controller (stateless, always available)
+        self.quality_ctrl = QualityController()
 
     def _enable_compact_agent_prompts(self):
         """Use shorter prompts/context for Groq so daily token quotas last longer."""
@@ -841,41 +856,39 @@ class PipelineOrchestrator:
         return re.sub(r"[^a-z0-9']+", " ", sentence.lower()).strip()
 
     def _validate_scene_completion(self, scene_text: str, scene: dict, chapter_num: int) -> None:
-        words = len((scene_text or "").split())
-        try:
-            target = int(scene.get("word_target", config.MIN_SCENE_WORDS))
-        except (TypeError, ValueError):
-            target = config.MIN_SCENE_WORDS
+        """Delegate scene validation to QualityController.
 
-        minimum = max(120, min(config.MIN_SCENE_WORDS, int(target * 0.45)))
-        if words < minimum:
-            scene_num = scene.get("scene_number", "?")
-            self._log(
-                f"Scene {scene_num} rejected as incomplete",
-                level="warn",
-                details={
-                    "words": words,
-                    "minimum_words": minimum,
-                    "chapter": chapter_num,
-                },
-            )
-            raise RuntimeError(
-                f"Scene {scene_num} in chapter {chapter_num} is incomplete "
-                f"({words} words; expected at least {minimum}). "
-                "Generation likely stopped early due to rate limits or truncation."
-            )
-
-        if not re.search(r'[.!?]["\']?\s*$', scene_text or ""):
-            scene_num = scene.get("scene_number", "?")
+        Raises RuntimeError (for backward compatibility) if the scene fails.
+        """
+        result = self.quality_ctrl.validate(scene_text, scene, chapter_num)
+        if result.ok:
+            return
+        scene_num = scene.get("scene_number", "?")
+        if result.truncated:
             self._log(
                 f"Scene {scene_num} rejected because it ends mid-sentence",
                 level="warn",
-                details={"chapter": chapter_num, "words": words},
+                details={"chapter": chapter_num, "words": result.words},
             )
             raise RuntimeError(
                 f"Scene {scene_num} in chapter {chapter_num} appears truncated. "
                 "WIP checkpoint preserved; retry later to resume."
             )
+        # Too short
+        self._log(
+            f"Scene {scene_num} rejected as incomplete",
+            level="warn",
+            details={
+                "words": result.words,
+                "minimum_words": result.minimum,
+                "chapter": chapter_num,
+            },
+        )
+        raise RuntimeError(
+            f"Scene {scene_num} in chapter {chapter_num} is incomplete "
+            f"({result.words} words; expected at least {result.minimum}). "
+            "Generation likely stopped early due to rate limits or truncation."
+        )
 
     def _fix_truncated_ending(self, scene_text: str, scene: dict) -> str:
         """Attempt to complete a scene that ends mid-sentence by generating
@@ -1072,6 +1085,11 @@ class PipelineOrchestrator:
         numbers of steps.  Falls back to the arithmetic estimate for projects
         that pre-date the cursor field (premise_step_completed == -1 means
         'never set; use arithmetic fallback via the chapter number').
+
+        Note: uses strict ``>`` (not ``>=``) so the step at ``completed_idx``
+        itself is NOT treated as exhausted — it may still be the *current*
+        chapter's last step that hasn't been written yet.  The cursor is only
+        advanced *after* a chapter is successfully persisted.
         """
         if not steps:
             return False
@@ -1081,8 +1099,11 @@ class PipelineOrchestrator:
         if completed_idx < 0:
             # Legacy / fresh project — no cursor yet.  Not exhausted.
             return False
-        # All steps covered once we've passed the last index.
-        return completed_idx >= len(steps) - 1
+        # All steps covered once we have passed the last valid index.
+        # Using strict > means step at completed_idx is still "in window" for
+        # the chapter that set it; the NEXT chapter will have completed_idx+1
+        # which will then be > len(steps)-1 and trigger post-premise mode.
+        return completed_idx > len(steps) - 1
 
     @staticmethod
     def _allowed_premise_step_index(chapter_num: int, steps: list[str]) -> int:
@@ -1256,12 +1277,27 @@ class PipelineOrchestrator:
 
     @staticmethod
     def _distinctive_future_markers(step: str) -> set[str]:
+        """Extract distinctive n-gram markers from a future premise step.
+
+        Rules to avoid false positives:
+        - 3-grams: require total phrase length >= 14 chars.
+        - 2-grams: require BOTH tokens to be >= 6 chars (no short connector words)
+          AND total phrase length >= 16 chars.
+        - Single tokens are never used as markers alone (too generic).
+        """
         tokens = PipelineOrchestrator._marker_tokens(step)
         markers = set()
-        for size in (3, 2):
-            for i in range(0, max(0, len(tokens) - size + 1)):
-                phrase = " ".join(tokens[i:i + size])
-                if len(phrase) >= 10:
+        # 3-word phrases — more specific, lower bar
+        for i in range(0, max(0, len(tokens) - 2)):
+            phrase = " ".join(tokens[i:i + 3])
+            if len(phrase) >= 14:
+                markers.add(phrase)
+        # 2-word phrases — only when BOTH tokens are substantial (>=6 chars each)
+        for i in range(0, max(0, len(tokens) - 1)):
+            t1, t2 = tokens[i], tokens[i + 1]
+            if len(t1) >= 6 and len(t2) >= 6:
+                phrase = f"{t1} {t2}"
+                if len(phrase) >= 16:
                     markers.add(phrase)
         return markers
 
@@ -1270,7 +1306,7 @@ class PipelineOrchestrator:
         lowered = re.sub(r"[^a-z0-9\s]+", " ", (text or "").lower())
         return [
             token for token in lowered.split()
-            if len(token) > 3 and token not in _FUTURE_MARKER_TOKEN_STOPWORDS
+            if len(token) > 4 and token not in _FUTURE_MARKER_TOKEN_STOPWORDS
         ]
 
     @staticmethod
@@ -4155,7 +4191,12 @@ class PipelineOrchestrator:
         return os.path.join(self.chapters_dir, f".wip_chapter_{chapter_num:03d}.json")
 
     def _save_wip(self, chapter_num: int, completed_scenes: list, chapter_plan: dict, scene_plans: list):
-        """Save work-in-progress after each completed scene."""
+        """Save work-in-progress after each completed scene.
+
+        Uses an atomic write (temp file + rename) identical to
+        ``StateManager._save_locked`` so a crash mid-write never leaves a
+        corrupt WIP checkpoint on disk.
+        """
         wip = {
             "chapter_num": chapter_num,
             "chapter_plan": chapter_plan,
@@ -4163,16 +4204,47 @@ class PipelineOrchestrator:
             "completed_scenes": completed_scenes,
             "timestamp": datetime.now().isoformat(),
         }
-        with open(self._wip_path(chapter_num), "w", encoding="utf-8") as f:
-            json.dump(wip, f, indent=2, ensure_ascii=False)
+        wip_path = self._wip_path(chapter_num)
+        tmp_path = wip_path + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(wip, f, indent=2, ensure_ascii=False)
+            shutil.move(tmp_path, wip_path)
+        except Exception:
+            # Clean up partial temp file if something went wrong
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
 
     def _load_wip(self, chapter_num: int) -> Optional[dict]:
-        """Load a WIP checkpoint if it exists."""
+        """Load a WIP checkpoint if it exists.
+
+        Returns ``None`` if the file is missing OR if it is unreadable /
+        contains corrupt JSON — so the caller can always start a fresh
+        chapter without crashing the pipeline.
+        """
         path = self._wip_path(chapter_num)
-        if os.path.exists(path):
+        if not os.path.exists(path):
+            return None
+        try:
             with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
-        return None
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            self._log(
+                f"WIP checkpoint for chapter {chapter_num} is corrupt and will be ignored: {exc}",
+                level="warn",
+                details={"path": path},
+            )
+            # Rename rather than delete so the user can inspect the file
+            corrupt_path = path + ".corrupt"
+            try:
+                shutil.move(path, corrupt_path)
+            except OSError:
+                pass
+            return None
 
     def _clear_wip(self, chapter_num: int):
         """Remove WIP file after successful chapter completion."""
@@ -4306,3 +4378,138 @@ class PipelineOrchestrator:
             shutil.rmtree(project_dir)
             return True
         return False
+
+    # ─── Phase 3: Scene Quality Scoring ──────────────────────────────
+
+    def score_scene(
+        self,
+        scene_text: str,
+        scene: dict,
+        previous_ending: str = "",
+        context: str = "",
+    ) -> dict:
+        """
+        Run multi-dimensional quality scoring on a generated scene.
+
+        Returns a dict with keys: coherence, pacing, voice, temporal,
+        overall, passes, word_count, issues.
+        """
+        if not hasattr(self, "quality_ctrl"):
+            self.quality_ctrl = QualityController()
+        result = self.quality_ctrl.score(
+            scene_text=scene_text,
+            scene=scene,
+            previous_ending=previous_ending,
+            context=context,
+        )
+        summary = self.quality_ctrl.summarise(result)
+        self._log(f"Scene quality: {summary}", level="info" if result.passes else "warn")
+        return result.as_dict()
+
+    # ─── Phase 5: World Bible ─────────────────────────────────────────
+
+    def generate_world_bible(
+        self,
+        use_llm: bool = False,
+        max_chapters: int = 999,
+        progress_callback=None,
+    ) -> dict:
+        """
+        Extract world-building facts from all completed chapters.
+
+        Parameters
+        ----------
+        use_llm : bool
+            If True and a model is available, use LLM-assisted extraction.
+            If False (default), uses fast regex-only extraction.
+        max_chapters : int
+            Only scan chapters up to this number.
+        progress_callback : callable | None
+            Called with status strings during extraction.
+
+        Returns a summary dict with entry counts and output paths.
+        """
+        from pipeline.world_bible import WorldBibleGenerator
+
+        def _cb(msg: str) -> None:
+            self._log(msg, level="info")
+            if progress_callback:
+                progress_callback(msg)
+            self._emit("status", msg)
+
+        llm = None
+        if use_llm:
+            llm = self._active_planning_model()
+
+        gen = WorldBibleGenerator(
+            project_dir=self.project_dir,
+            llm=llm,
+            progress_callback=_cb,
+        )
+        bible = gen.generate(max_chapters=max_chapters)
+
+        out_md = os.path.join(self.project_dir, "world_bible.md")
+        out_json = os.path.join(self.project_dir, "world_bible.json")
+
+        return {
+            "status": "ok",
+            "locations": len(bible.locations),
+            "factions": len(bible.factions),
+            "objects": len(bible.objects),
+            "rules": len(bible.rules),
+            "events": len(bible.events),
+            "relationships": len(bible.relationships),
+            "markdown_path": out_md,
+            "json_path": out_json,
+        }
+
+    # ─── Phase 5: Story Export ────────────────────────────────────────
+
+    def export_story(
+        self,
+        fmt: str = "md",
+        output_dir: Optional[str] = None,
+    ) -> dict:
+        """
+        Export the story to a distributable file format.
+
+        Parameters
+        ----------
+        fmt : str
+            "md" | "txt" | "epub" | "all"
+        output_dir : str | None
+            Output directory. Defaults to the project directory.
+
+        Returns a dict with status and output file path(s).
+        """
+        from pipeline.exporter import StoryExporter, epub_available
+
+        exporter = StoryExporter(
+            project_dir=self.project_dir,
+            output_dir=output_dir or self.project_dir,
+        )
+        fmt = (fmt or "md").lower()
+        results: dict[str, str] = {}
+
+        if fmt in ("md", "markdown"):
+            results["markdown"] = exporter.export_markdown()
+        elif fmt == "txt":
+            results["txt"] = exporter.export_txt()
+        elif fmt == "epub":
+            if not epub_available():
+                return {
+                    "status": "error",
+                    "error": "ebooklib not installed. Run: pip install ebooklib",
+                }
+            results["epub"] = exporter.export_epub()
+        elif fmt == "all":
+            results = exporter.export_all(include_epub=epub_available())
+        else:
+            return {"status": "error", "error": f"Unknown format: {fmt!r}"}
+
+        self._log(
+            f"Story exported ({fmt}): {list(results.values())}",
+            level="success",
+        )
+        return {"status": "ok", "format": fmt, "files": results}
+

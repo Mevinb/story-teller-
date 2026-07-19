@@ -1966,7 +1966,88 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 404
 
+    # ─── Phase 5: World Bible API ──────────────────────────────────────
+    @app.route("/api/project/<name>/world-bible", methods=["POST"])
+    def generate_world_bible(name):
+        """Generate or regenerate the World Bible for a project."""
+        name = normalize_project_name(name)
+        data = request.json or {}
+        use_llm = bool(data.get("use_llm", False))
+        max_chapters = int(data.get("max_chapters", 999))
+        try:
+            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline.load_project()
+            result = pipeline.generate_world_bible(
+                use_llm=use_llm,
+                max_chapters=max_chapters,
+            )
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    @app.route("/api/project/<name>/world-bible", methods=["GET"])
+    def get_world_bible(name):
+        """Read an existing World Bible for a project (JSON index)."""
+        name = normalize_project_name(name)
+        project_dir = os.path.join(config.PROJECTS_DIR, name)
+        json_path = os.path.join(project_dir, "world_bible.json")
+        md_path = os.path.join(project_dir, "world_bible.md")
+        if not os.path.exists(json_path):
+            return jsonify({"error": "World Bible not generated yet. POST to /world-bible first."}), 404
+        try:
+            with open(json_path, encoding="utf-8") as f:
+                data = json.load(f)
+            md_content = ""
+            if os.path.exists(md_path):
+                with open(md_path, encoding="utf-8") as f:
+                    md_content = f.read()
+            return jsonify({"world_bible": data, "markdown": md_content})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ─── Phase 5: Story Export API ─────────────────────────────────────
+    @app.route("/api/project/<name>/export-story", methods=["POST"])
+    def export_story(name):
+        """Export the story to a distributable format (md, txt, epub, all)."""
+        name = normalize_project_name(name)
+        data = request.json or {}
+        fmt = str(data.get("format", "md")).lower()
+        try:
+            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline.load_project()
+            result = pipeline.export_story(fmt=fmt)
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+    # ─── Phase 3: Scene Quality Score API ──────────────────────────────
+    @app.route("/api/project/<name>/score-scene", methods=["POST"])
+    def score_scene(name):
+        """
+        Score a scene text across coherence, pacing, voice, and temporal dimensions.
+        Body: {"scene_text": "...", "scene": {...}, "previous_ending": "..."}
+        """
+        name = normalize_project_name(name)
+        data = request.json or {}
+        scene_text = str(data.get("scene_text", ""))
+        scene = data.get("scene", {})
+        previous_ending = str(data.get("previous_ending", ""))
+        if not scene_text:
+            return jsonify({"error": "scene_text is required"}), 400
+        try:
+            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline.load_project()
+            result = pipeline.score_scene(
+                scene_text=scene_text,
+                scene=scene,
+                previous_ending=previous_ending,
+            )
+            return jsonify(result)
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     return app
+
 
 app = create_app()
 
