@@ -6,6 +6,8 @@ Uses sentence-transformers for lightweight CPU-based embedding.
 import os
 import json
 import logging
+import hashlib
+import re
 from collections import OrderedDict
 from typing import List, Optional
 from dataclasses import dataclass, field
@@ -74,6 +76,8 @@ class VectorStore:
         os.makedirs(self.index_dir, exist_ok=True)
 
         self._model: Optional[SentenceTransformer] = None
+        self._model_load_attempted = False
+        self._using_fallback_embeddings = False
         self._index: Optional[faiss.Index] = None
         self._texts: List[str] = []
         self._metadata: List[dict] = []
@@ -85,29 +89,71 @@ class VectorStore:
         self._embedding_cache_hits: int = 0
         self._embedding_cache_misses: int = 0
         self._cross_encoder: Optional[CrossEncoder] = None
+        self._cross_encoder_load_attempted = False
 
     @property
     def cross_encoder(self) -> Optional[CrossEncoder]:
         """Lazy-load the cross-encoder model."""
-        if self._cross_encoder is None:
+        if self._cross_encoder is None and not self._cross_encoder_load_attempted:
+            self._cross_encoder_load_attempted = True
             model_name = getattr(config, "CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
             if model_name:
-                logger.info(f"Loading cross-encoder model: {model_name}")
-                self._cross_encoder = CrossEncoder(model_name)
+                try:
+                    logger.info("Loading cross-encoder model: %s", model_name)
+                    self._cross_encoder = CrossEncoder(
+                        model_name,
+                        local_files_only=getattr(config, "EMBEDDING_LOCAL_FILES_ONLY", True),
+                    )
+                except Exception as exc:
+                    logger.warning("Cross-encoder unavailable; using vector scores only: %s", exc)
         return self._cross_encoder
 
     @property
-    def model(self) -> SentenceTransformer:
-        """Lazy-load the embedding model."""
-        if self._model is None:
-            logger.info(f"Loading embedding model: {config.EMBEDDING_MODEL}")
-            self._model = SentenceTransformer(config.EMBEDDING_MODEL)
-            if hasattr(self._model, "get_embedding_dimension"):
-                self._dimension = self._model.get_embedding_dimension()
-            else:
-                self._dimension = self._model.get_sentence_embedding_dimension()
-            logger.info(f"Embedding dimension: {self._dimension}")
+    def model(self) -> Optional[SentenceTransformer]:
+        """Lazy-load the embedding model without making memory a single point of failure."""
+        if self._model is None and not self._model_load_attempted:
+            self._model_load_attempted = True
+            try:
+                logger.info("Loading embedding model: %s", config.EMBEDDING_MODEL)
+                self._model = SentenceTransformer(
+                    config.EMBEDDING_MODEL,
+                    local_files_only=getattr(config, "EMBEDDING_LOCAL_FILES_ONLY", True),
+                )
+                if hasattr(self._model, "get_embedding_dimension"):
+                    self._dimension = self._model.get_embedding_dimension()
+                else:
+                    self._dimension = self._model.get_sentence_embedding_dimension()
+                logger.info("Embedding dimension: %s", self._dimension)
+            except Exception as exc:
+                self._using_fallback_embeddings = True
+                logger.warning(
+                    "Embedding model unavailable; using deterministic lexical memory fallback: %s", exc
+                )
         return self._model
+
+    def _encode(self, texts: List[str]) -> np.ndarray:
+        """Return transformer embeddings, or deterministic offline lexical vectors."""
+        model = self.model
+        if model is not None:
+            return model.encode(
+                texts,
+                convert_to_numpy=True,
+                batch_size=32,
+                show_progress_bar=False,
+                normalize_embeddings=True,
+            ).astype("float32")
+
+        vectors = np.zeros((len(texts), self._dimension), dtype="float32")
+        for row, text in enumerate(texts):
+            for token in re.findall(r"[\\w']+", (text or "").lower()):
+                value = int.from_bytes(
+                    hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest(), "big"
+                )
+                vectors[row, value % self._dimension] += 1.0 if value & 1 else -1.0
+            norm = np.linalg.norm(vectors[row])
+            if norm:
+                vectors[row] /= norm
+        return vectors
 
     @property
     def index(self) -> faiss.Index:
@@ -185,13 +231,7 @@ class VectorStore:
         if not chunks:
             return 0
 
-        embeddings = self.model.encode(
-            chunks,
-            convert_to_numpy=True,
-            batch_size=32,
-            show_progress_bar=False,
-            normalize_embeddings=True,  # For cosine similarity via inner product
-        ).astype("float32")
+        embeddings = self._encode(chunks)
 
         # Add to FAISS
         self.index.add(embeddings)
@@ -250,11 +290,7 @@ class VectorStore:
             self._embedding_cache_hits += 1
         else:
             # Cache miss: encode and store
-            query_embedding = self.model.encode(
-                [query],
-                convert_to_numpy=True,
-                normalize_embeddings=True,
-            ).astype("float32")
+            query_embedding = self._encode([query])
             max_size = getattr(config, "EMBEDDING_CACHE_MAX_SIZE", 1024)
             if len(self._embedding_cache) >= max_size:
                 # Evict the least-recently-used entry (front of OrderedDict)
@@ -298,6 +334,7 @@ class VectorStore:
             "total_chunks": len(self._texts),
             "dimension": self._dimension,
             "index_file_exists": os.path.exists(self.index_path),
+            "using_fallback_embeddings": self._using_fallback_embeddings,
         }
 
     def cache_info(self) -> dict:
@@ -344,13 +381,7 @@ class VectorStore:
         # Rebuild FAISS index from remaining texts
         self._index = faiss.IndexFlatIP(self._dimension)
         if self._texts:
-            embeddings = self.model.encode(
-                self._texts,
-                convert_to_numpy=True,
-                batch_size=32,
-                show_progress_bar=False,
-                normalize_embeddings=True,
-            ).astype("float32")
+            embeddings = self._encode(self._texts)
             self._index.add(embeddings)
 
         self._save()

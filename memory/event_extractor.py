@@ -4,11 +4,11 @@ Event Extractor — Major story event extraction and tracking.
 Extracts and categorizes significant plot events from scene text:
 {
     "type": "betrayal",
-    "characters": ["Elise", "Marcus"],
+    "characters": ["[Character A]", "[Character B]"],
     "impact": "high",
     "chapter": 5,
     "scene": 2,
-    "description": "Marcus betrayed Elise by revealing her location",
+    "description": "[Character B] betrayed [Character A] by revealing her location",
     "resolved": false
 }
 

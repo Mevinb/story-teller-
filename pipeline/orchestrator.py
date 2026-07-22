@@ -1393,8 +1393,6 @@ class PipelineOrchestrator:
             ("nightclub", "Nightclub"),
             ("living room", "Living room"),
             ("master bedroom", "Master bedroom"),
-            ("marcus's apartment", "Marcus's apartment"),
-            ("lukas's apartment", "Lukas's apartment"),
             ("dining table", "Dining room"),
             ("moves in", "Family home"),
             ("boutique", "Boutique / shopping area"),

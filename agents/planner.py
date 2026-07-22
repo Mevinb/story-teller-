@@ -148,7 +148,7 @@ Each scene is a bounded narrative unit with:
 - Key events that happen
 - A suggested word length for pacing
 - A narrative_bridge: ONE sentence explaining WHY this scene follows from the previous one.
-  This is the cause-and-effect or time link. Example: "Sherin, rattled by Riya's ultimatum, goes to Arjun's apartment seeking comfort."
+  This is the cause-and-effect or time link. Example: "[Character A], rattled by [Character B]'s ultimatum, goes to [Character C]'s apartment seeking comfort."
   The narrative_bridge must connect the emotional or physical state at the END of the previous scene
   to the BEGINNING of this scene. Never leave it empty.
 

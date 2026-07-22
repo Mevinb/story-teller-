@@ -1,9 +1,9 @@
 """
 Relationship Graph — Dynamic relationship evolution tracking.
 
-Replaces flat "John": "friend" relationships with rich structures:
+Replaces flat "[Character A]": "friend" relationships with rich structures:
 {
-    "John": {
+    "[Character A]": {
         "type": "ally",
         "trust": 0.61,
         "romantic_tension": 0.34,

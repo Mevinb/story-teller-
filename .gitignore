@@ -6,15 +6,22 @@
 .codex/
 .agents/
 
+# Python
 __pycache__/
 *.py[cod]
 *.so
 .pytest_cache/
 .mypy_cache/
+*.egg-info/
+dist/
+build/
 
+# Virtual environments
 venv/
 .venv/
+env/
 
+# Project runtime data (generated at runtime, not source code)
 projects/
 logs/
 state.json
@@ -24,5 +31,30 @@ vector_index/
 *.jsonl
 *.trace.jsonl
 
+# Local model weights
 models/*.gguf
+
+# Archives
 *.zip
+
+# Gunicorn / server logs
+gunicorn.log
+*.log
+
+# Leftover pip install artifacts
+=*
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Test output / scratch files
+test_combined_polished.md
+test_story_analysis.md
+
+# Internal planning / notes docs
+PRODUCTION_READINESS.md
+agent_system_report.md
+story_system_explained.md

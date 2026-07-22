@@ -78,6 +78,11 @@ WORDS_PER_SCENE_MAX = 1000
 # ─── Embedding / Retrieval ──────────────────────────────────────────
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+# Keep story generation usable when a machine is offline or a Hugging Face
+# model was not downloaded yet. Set this to false to permit first-run downloads.
+EMBEDDING_LOCAL_FILES_ONLY = os.getenv("EMBEDDING_LOCAL_FILES_ONLY", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 CHUNK_SIZE = 400          # tokens per chunk
 CHUNK_OVERLAP = 50        # token overlap between chunks
 TOP_K_RETRIEVAL = 4       # number of chunks to retrieve
