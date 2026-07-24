@@ -25,6 +25,7 @@ from pipeline.gemini_combiner import combine_chapters, analyze_and_polish
 from models.groq_model import GroqModel
 from models.openrouter_model import OpenRouterModel
 from models.llm import LlamaCPP, list_gguf_models, resolve_model_path, to_model_id
+from vision.router import vision_bp
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +432,7 @@ def _settings_payload() -> dict:
 def create_app():
     app = Flask(__name__, static_folder="static", template_folder="templates")
     app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
+    app.register_blueprint(vision_bp)
 
     def _resolve_generation_pipeline_kwargs(requested_model: str):
         global _selected_local_model_path, _selected_backend

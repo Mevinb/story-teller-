@@ -135,3 +135,9 @@ FLASK_HOST = os.getenv("FLASK_HOST", "127.0.0.1")
 FLASK_PORT = int(os.getenv("FLASK_PORT", "5000"))
 FLASK_DEBUG = os.getenv("FLASK_DEBUG", "false").lower() in ("1", "true", "yes", "on")
 SSE_QUEUE_MAXSIZE = int(os.getenv("SSE_QUEUE_MAXSIZE", "1000"))
+
+# ─── Vision Module Configuration ─────────────────────────────────────
+VISION_BACKEND = os.getenv("VISION_BACKEND", "local").lower()
+OLLAMA_VISION_URL = os.getenv("OLLAMA_VISION_URL", "http://localhost:11434")
+OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "moondream")
+

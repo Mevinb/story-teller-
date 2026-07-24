@@ -77,6 +77,7 @@ function switchView(viewName) {
     if (viewName === 'premise' && currentProject) loadProjectPremise();
     if (viewName === 'dashboard') loadProjects();
     if (viewName === 'settings') loadSettings();
+    if (viewName === 'vision') checkVisionStatus();
     if (viewName === 'manual' && currentProject) {
         // Fetch the current manual session status to restore UI state
         fetch(`/api/project/${currentProject}/generate/manual/status`)
@@ -2689,4 +2690,223 @@ async function savePremiseToProject() {
         btn.disabled = false;
         btn.innerHTML = oldText;
     }
+}
+
+// ─── Vision Lab Module ────────────────────────────────────────────────
+let selectedVisionFile = null;
+
+async function checkVisionStatus() {
+    const badge = document.getElementById('visionStatusBadge');
+    if (!badge) return;
+    try {
+        const res = await fetch('/api/vision/status');
+        const json = await res.json();
+        if (json.success) {
+            const data = json.data;
+            let statusText = `Active: ${data.active_mode}`;
+            if (data.local && data.local.available) {
+                statusText += ' | Local (Ollama) Ready';
+            } else {
+                statusText += ' | Local Offline';
+            }
+            if (data.cloud && data.cloud.available) {
+                statusText += ' | Gemini Cloud Ready';
+            }
+            badge.innerText = statusText;
+            badge.className = 'badge badge-info';
+        }
+    } catch (e) {
+        badge.innerText = 'Vision API Unreachable';
+        badge.className = 'badge badge-warning';
+    }
+}
+
+function handleVisionFileSelect(files) {
+    if (!files || !files.length) return;
+    const file = files[0];
+    if (!file.type.startsWith('image/')) {
+        showToast('Please select a valid image file (PNG, JPG, WEBP).', 'error');
+        return;
+    }
+    selectedVisionFile = file;
+    const reader = new FileReader();
+    reader.onload = function(e) {
+        document.getElementById('visionPreviewImg').src = e.target.result;
+        document.getElementById('visionDropzoneContent').style.display = 'none';
+        document.getElementById('visionImagePreview').style.display = 'block';
+        document.getElementById('btnAnalyzeVision').disabled = false;
+    };
+    reader.readAsDataURL(file);
+}
+
+function clearVisionFile() {
+    selectedVisionFile = null;
+    document.getElementById('visionFileInput').value = '';
+    document.getElementById('visionPreviewImg').src = '';
+    document.getElementById('visionDropzoneContent').style.display = 'block';
+    document.getElementById('visionImagePreview').style.display = 'none';
+    document.getElementById('btnAnalyzeVision').disabled = true;
+    document.getElementById('visionResults').style.display = 'none';
+}
+
+let currentVisionSessionId = null;
+
+async function runVisionAnalysis() {
+    if (!selectedVisionFile) {
+        showToast('Please select or drag an image first.', 'warning');
+        return;
+    }
+
+    const btn = document.getElementById('btnAnalyzeVision');
+    const oldText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Scanning Image (LLaVA)...';
+
+    const formData = new FormData();
+    formData.append('image', selectedVisionFile);
+
+    try {
+        const res = await fetch('/api/vision/chat/start', {
+            method: 'POST',
+            body: formData
+        });
+        const json = await res.json();
+        if (!res.ok || !json.success) {
+            throw new Error(json.error || 'Vision scan failed');
+        }
+        
+        currentVisionSessionId = json.data.session_id;
+        
+        // Hide dropzone, show chat interface
+        document.getElementById('visionDropzone').style.display = 'none';
+        document.getElementById('visionChatInterface').style.display = 'block';
+        
+        // Clear chat history
+        const history = document.getElementById('visionChatHistory');
+        history.innerHTML = '';
+        
+        // Add initial system message with observation summary
+        addChatMessage('system', `System: ${json.data.observations_summary}`);
+        
+        // Add initial Grok message
+        addChatMessage('assistant', json.data.initial_message);
+        
+        showToast('Chat started!', 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = '⚡ Chat Started';
+    }
+}
+
+function addChatMessage(role, content) {
+    const history = document.getElementById('visionChatHistory');
+    const messageDiv = document.createElement('div');
+    messageDiv.className = `chat-message ${role}`;
+    
+    const label = role === 'assistant' ? 'Grok' : (role === 'user' ? 'You' : 'System');
+    
+    messageDiv.innerHTML = `
+        <div class="chat-label">${label}</div>
+        <div class="chat-bubble">${content}</div>
+    `;
+    
+    history.appendChild(messageDiv);
+    history.scrollTop = history.scrollHeight;
+}
+
+function handleVisionChatKeyPress(e) {
+    if (e.key === 'Enter') {
+        sendVisionChatMessage();
+    }
+}
+
+async function sendVisionChatMessage() {
+    if (!currentVisionSessionId) return;
+    
+    const input = document.getElementById('visionChatMessage');
+    const message = input.value.trim();
+    if (!message) return;
+    
+    // Add user message to UI
+    addChatMessage('user', message);
+    input.value = '';
+    
+    const btn = document.getElementById('btnVisionChatSend');
+    btn.disabled = true;
+    
+    // Add typing indicator
+    const history = document.getElementById('visionChatHistory');
+    const typingDiv = document.createElement('div');
+    typingDiv.className = `chat-message assistant`;
+    typingDiv.id = 'visionChatTyping';
+    typingDiv.innerHTML = `
+        <div class="chat-label">Grok</div>
+        <div class="chat-bubble">Typing...</div>
+    `;
+    history.appendChild(typingDiv);
+    history.scrollTop = history.scrollHeight;
+    
+    try {
+        const res = await fetch('/api/vision/chat/message', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                session_id: currentVisionSessionId,
+                message: message
+            })
+        });
+        
+        const json = await res.json();
+        
+        // Remove typing indicator
+        const typingEl = document.getElementById('visionChatTyping');
+        if (typingEl) typingEl.remove();
+        
+        if (!res.ok || !json.success) {
+            throw new Error(json.error || 'Message failed');
+        }
+        
+        // Add response to UI
+        addChatMessage('assistant', json.data.response);
+        
+    } catch (e) {
+        // Remove typing indicator on error
+        const typingEl = document.getElementById('visionChatTyping');
+        if (typingEl) typingEl.remove();
+        
+        showToast(e.message, 'error');
+    } finally {
+        btn.disabled = false;
+        input.focus();
+    }
+}
+
+function setupVisionDropzone() {
+    const dropzone = document.getElementById('visionDropzone');
+    if (!dropzone || dropzone.dataset.initialized) return;
+    dropzone.dataset.initialized = 'true';
+
+    ['dragenter', 'dragover'].forEach(eventName => {
+        dropzone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.add('dragover');
+        }, false);
+    });
+
+    ['dragleave', 'drop'].forEach(eventName => {
+        dropzone.addEventListener(eventName, (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            dropzone.classList.remove('dragover');
+        }, false);
+    });
+
+    dropzone.addEventListener('drop', (e) => {
+        const dt = e.dataTransfer;
+        const files = dt.files;
+        handleVisionFileSelect(files);
+    }, false);
 }

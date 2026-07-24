@@ -45,6 +45,7 @@
             <button class="nav-tab hidden" data-view="state" onclick="switchView('state')" id="tabState">🧠 State</button>
             <button class="nav-tab hidden" data-view="combine" onclick="switchView('combine')" id="tabCombine">📦 Combine</button>
             <button class="nav-tab hidden" data-view="edit" onclick="switchView('edit')" id="tabEdit">✏️ Edit Story</button>
+            <button class="nav-tab" data-view="vision" onclick="switchView('vision')" id="tabVision">👁️ Vision Lab</button>
             <button class="nav-tab" data-view="settings" onclick="switchView('settings')">⚙️ Settings</button>
         </nav>
 
@@ -1015,6 +1016,76 @@
                                 <input type="checkbox" id="setting_FLASK_DEBUG" data-setting="FLASK_DEBUG">
                                 <span>Debug reload</span>
                             </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Vision Lab View -->
+        <div class="view" id="viewVision">
+            <div class="card" style="max-width: 900px; margin: 0 auto;">
+                <div class="card-header flex justify-between items-center" style="margin-bottom: 16px;">
+                    <span class="card-title"><span class="icon">👁️</span> Person Recognition & Visual Breakdown Lab</span>
+                    <span class="badge badge-info" id="visionStatusBadge">Checking backend...</span>
+                </div>
+                
+                <div class="grid grid-cols-2 gap-4 mb-4">
+                    <div class="form-group">
+                        <label class="form-label">Vision Engine Mode</label>
+                        <select class="form-select" id="visionModeSelect">
+                            <option value="auto">Auto (Prefer Local, Fallback Cloud)</option>
+                            <option value="local" selected>Local Vision (Offline / Ollama)</option>
+                            <option value="cloud">Cloud Vision (Gemini 2.5 Flash)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">Extra Guidance / Focus Context (Optional)</label>
+                        <input class="form-input" id="visionPromptExtra" placeholder="e.g. Focus on facial features, body posture, or outfit details...">
+                    </div>
+                </div>
+
+                <!-- Dropzone -->
+                <div class="vision-dropzone" id="visionDropzone" onclick="document.getElementById('visionFileInput').click()">
+                    <input type="file" id="visionFileInput" accept="image/*" style="display:none;" onchange="handleVisionFileSelect(this.files)">
+                    <div id="visionDropzoneContent">
+                        <span style="font-size: 2.5rem;">📸</span>
+                        <h4 style="margin: 8px 0 4px;">Drag & Drop a Person/Character Image Here</h4>
+                        <p class="text-dim text-sm">Supports PNG, JPG, WEBP formats. Click to browse.</p>
+                    </div>
+                    <div id="visionImagePreview" style="display:none; text-align:center;">
+                        <img id="visionPreviewImg" style="max-height: 220px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); margin-bottom: 12px;" />
+                        <div>
+                            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation(); clearVisionFile();">Change Image</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="mt-4 flex justify-end gap-2">
+                    <button class="btn btn-primary" id="btnAnalyzeVision" onclick="runVisionAnalysis()" disabled>⚡ Analyze Person & Body</button>
+                </div>
+            </div>
+
+            <!-- Chat Interface -->
+            <div id="visionChatInterface" class="mt-6" style="display:none; max-width: 900px; margin: 24px auto 0;">
+                <div class="card" style="display: flex; flex-direction: column; height: 600px;">
+                    <div class="card-header flex justify-between items-center" style="border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 0;">
+                        <span class="card-title"><span class="icon">🔥</span> Grok Vision Chat</span>
+                        <span class="badge badge-success" id="visionChatSessionBadge">Session Active</span>
+                    </div>
+                    
+                    <!-- Chat History -->
+                    <div id="visionChatHistory" style="flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; background: rgba(0,0,0,0.2);">
+                        <!-- Messages will be appended here -->
+                    </div>
+                    
+                    <!-- Chat Input -->
+                    <div style="border-top: 1px solid var(--border); padding: 16px; background: var(--bg-secondary);">
+                        <div class="flex gap-2">
+                            <input type="text" class="form-input" id="visionChatMessage" placeholder="Tell Grok what to focus on..." style="flex: 1;" onkeypress="handleVisionChatKeyPress(event)">
+                            <button class="btn btn-primary" id="btnVisionChatSend" onclick="sendVisionChatMessage()">
+                                💬 Send
+                            </button>
                         </div>
                     </div>
                 </div>
