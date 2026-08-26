@@ -6,6 +6,7 @@ from .consistency import ConsistencyEngine
 from .editor import Editor
 from .pacing import PacingAgent
 from .voice import VoiceAgent
+from .verifier import Verifier
 
 __all__ = [
     "AgentContract",
@@ -16,5 +17,6 @@ __all__ = [
     "Editor",
     "PacingAgent",
     "VoiceAgent",
+    "Verifier",
 ]
 

@@ -4,7 +4,8 @@ Provides a unified interface so agents don't care about the provider.
 """
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Iterable, Optional
+import threading
 import time
 import json
 import logging
@@ -12,8 +13,170 @@ import re
 import ast
 
 import config
+from pipeline.errors import PipelineCancelledError
 
 logger = logging.getLogger(__name__)
+
+
+class ContentBlockedError(Exception):
+    """Raised when any provider's content moderation blocks a request.
+
+    Defined once here so callers (e.g. the writer's local-model fallback)
+    can catch a single exception type regardless of provider. Backends
+    re-export this name for backward compatibility.
+    """
+
+
+# ─── Reasoning-tag filtering (shared by OpenAI-compatible backends) ──────
+_REASONING_BLOCK_RE = re.compile(
+    r"<(?:think|analysis|reasoning)>.*?</(?:think|analysis|reasoning)>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_REASONING_TAG_RE = re.compile(r"</?(?:think|analysis|reasoning)>", flags=re.IGNORECASE)
+_REASONING_OPEN_TAGS = ("<think>", "<analysis>", "<reasoning>")
+_REASONING_CLOSE_TAGS = {
+    "<think>": "</think>",
+    "<analysis>": "</analysis>",
+    "<reasoning>": "</reasoning>",
+}
+_MAX_REASONING_TAG_LEN = max(len(tag) for tag in _REASONING_OPEN_TAGS)
+
+
+class ReasoningStreamFilter:
+    """Mixin that strips <think>/<analysis>/<reasoning> blocks from output.
+
+    Works both on complete strings (`_strip_reasoning`) and incrementally on
+    token streams (`_filter_reasoning_stream`) so partial tags held across
+    chunk boundaries are never leaked to the UI.
+    """
+
+    @staticmethod
+    def _strip_reasoning(text: str) -> str:
+        cleaned = _REASONING_BLOCK_RE.sub("", text or "")
+        cleaned = _REASONING_TAG_RE.sub("", cleaned)
+        return cleaned.strip()
+
+    @staticmethod
+    def _remove_reasoning_tags(text: str) -> str:
+        return _REASONING_TAG_RE.sub("", text or "")
+
+    @staticmethod
+    def _first_reasoning_tag(text: str):
+        lower = text.lower()
+        best = None
+        for tag in _REASONING_OPEN_TAGS:
+            idx = lower.find(tag)
+            if idx != -1 and (best is None or idx < best[0]):
+                best = (idx, tag)
+        return best
+
+    @classmethod
+    def _filter_reasoning_stream(cls, chunks: Iterable[str]):
+        pending = ""
+        hidden_close_tag = None
+
+        for chunk in chunks:
+            pending += chunk
+            while pending:
+                lower = pending.lower()
+
+                if hidden_close_tag:
+                    end = lower.find(hidden_close_tag)
+                    if end == -1:
+                        pending = pending[-len(hidden_close_tag):]
+                        break
+                    pending = pending[end + len(hidden_close_tag):]
+                    hidden_close_tag = None
+                    continue
+
+                found = cls._first_reasoning_tag(pending)
+                if found:
+                    idx, open_tag = found
+                    visible = cls._remove_reasoning_tags(pending[:idx])
+                    if visible:
+                        yield visible
+                    pending = pending[idx + len(open_tag):]
+                    hidden_close_tag = _REASONING_CLOSE_TAGS[open_tag]
+                    continue
+
+                if len(pending) <= _MAX_REASONING_TAG_LEN:
+                    break
+                visible = pending[:-_MAX_REASONING_TAG_LEN]
+                pending = pending[-_MAX_REASONING_TAG_LEN:]
+                if visible:
+                    yield visible
+
+        if pending and not hidden_close_tag:
+            visible = cls._remove_reasoning_tags(pending)
+            if visible:
+                yield visible
+
+
+def parse_retry_after_seconds(error: Exception, default: float = 5.0) -> float:
+    """Best-effort extraction of a Retry-After hint from a rate-limit error.
+
+    Checks the Retry-After header first, then common "try again in X"
+    error-message formats (minutes, seconds, bare numbers).
+    """
+    retry_after = None
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers:
+        raw_retry_after = headers.get("retry-after") or headers.get("Retry-After")
+        if raw_retry_after:
+            try:
+                retry_after = float(raw_retry_after)
+            except (TypeError, ValueError):
+                retry_after = None
+
+    error_str = str(error)
+    if retry_after is None:
+        match = re.search(r"try again in\s+(\d+)m", error_str, re.IGNORECASE)
+        if match:
+            retry_after = int(match.group(1)) * 60
+    if retry_after is None:
+        match = re.search(r"try again in\s+(\d+\.?\d*)\s*s", error_str, re.IGNORECASE)
+        if match:
+            retry_after = float(match.group(1))
+    if retry_after is None:
+        match = re.search(r"try again in\s+(\d+\.?\d*)", error_str, re.IGNORECASE)
+        if match:
+            retry_after = float(match.group(1))
+
+    return max(float(retry_after if retry_after is not None else default), 0.2)
+
+
+class RateLimitTracker:
+    """Thread-safe cooldown/request-interval bookkeeping for cloud backends.
+
+    One instance per backend class; entries are keyed by an arbitrary
+    track id (e.g. "(model, key)") so multi-key rotation stays correct.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last_request_by_key: dict = {}
+        self._key_cooldowns: dict = {}
+
+    def throttle_wait(self, track_id: str, now: float, min_interval: float) -> float:
+        """Seconds the caller must sleep before the next request."""
+        with self._lock:
+            cooldown_wait = max(0.0, self._key_cooldowns.get(track_id, 0.0) - now)
+            elapsed = now - self._last_request_by_key.get(track_id, 0.0)
+            interval_wait = max(0.0, min_interval - elapsed)
+            return max(cooldown_wait, interval_wait)
+
+    def record_request(self, track_id: str, now: float) -> None:
+        with self._lock:
+            self._last_request_by_key[track_id] = now
+
+    def mark_cooldown(self, track_id: str, until: float) -> None:
+        with self._lock:
+            self._key_cooldowns[track_id] = until
+
+    def cooldown_expiry(self, track_id: str) -> float:
+        with self._lock:
+            return self._key_cooldowns.get(track_id, 0.0)
 
 
 @dataclass
@@ -143,6 +306,33 @@ class LLMResponse:
 class LLMInterface(ABC):
     """Abstract LLM backend interface."""
 
+    # ─── Cancellation support ───────────────────────────────────────────────
+    # The orchestrator installs a `_should_cancel` callable on each model so
+    # that blocking (non-streaming) generation, throttle waits, and retry
+    # backoff can abort promptly when the user presses a Stop/Cancel button.
+
+    _should_cancel: Optional[Callable[[], bool]] = None
+
+    def _cancel_requested(self) -> bool:
+        check = getattr(self, "_should_cancel", None)
+        return bool(callable(check) and check())
+
+    def _raise_if_cancelled(self, message: str = "Generation cancelled by user") -> None:
+        if self._cancel_requested():
+            raise PipelineCancelledError(message)
+
+    def _sleep_interruptible(self, seconds: float) -> None:
+        """Sleep in small increments, aborting immediately on cancellation."""
+        if not isinstance(seconds, (int, float)) or seconds <= 0:
+            return
+        end = time.time() + seconds
+        while True:
+            self._raise_if_cancelled()
+            remaining = end - time.time()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.25, max(0.05, remaining)))
+
     @abstractmethod
     def generate(
         self,
@@ -200,6 +390,7 @@ class LLMInterface(ABC):
         last_error = None
 
         for attempt in range(max_retries):
+            self._raise_if_cancelled()
             try:
                 return self.generate(
                     prompt=prompt,
@@ -209,6 +400,8 @@ class LLMInterface(ABC):
                     max_tokens=max_tokens,
                     stream=stream,
                 )
+            except PipelineCancelledError:
+                raise
             except Exception as e:
                 last_error = e
                 err_str = str(e).lower()
@@ -246,7 +439,7 @@ class LLMInterface(ABC):
                         f"[{self.get_name()}] Attempt {attempt + 1}/{max_retries} "
                         f"failed: {e}. Retrying in {wait:.1f}s..."
                     )
-                    time.sleep(wait)
+                    self._sleep_interruptible(wait)
                     delay = min(delay * config.RETRY_BACKOFF_FACTOR, config.RETRY_MAX_DELAY)
 
         raise RuntimeError(

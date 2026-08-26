@@ -8,6 +8,7 @@ import json
 import logging
 import hashlib
 import re
+import threading
 from collections import OrderedDict
 from typing import List, Optional
 from dataclasses import dataclass, field
@@ -82,6 +83,9 @@ class VectorStore:
         self._texts: List[str] = []
         self._metadata: List[dict] = []
         self._dimension: int = 384  # MiniLM-L6-v2 dimension
+        # Guards all index/text mutations and persistence. RLock because
+        # public methods may call each other while holding it.
+        self._lock = threading.RLock()
         # LRU cache: OrderedDict preserves insertion order; recently-used
         # entries are moved to the end so the oldest (LRU) entry is always
         # at the front and is evicted first when the cache is full.
@@ -145,7 +149,10 @@ class VectorStore:
 
         vectors = np.zeros((len(texts), self._dimension), dtype="float32")
         for row, text in enumerate(texts):
-            for token in re.findall(r"[\\w']+", (text or "").lower()):
+            # NOTE: r"[\w']+" — word characters + apostrophes. An escaped
+            # backslash here ("[\\w']") silently matches only literal
+            # backslash/w/apostrophe and destroys fallback retrieval quality.
+            for token in re.findall(r"[\w']+", (text or "").lower()):
                 value = int.from_bytes(
                     hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest(), "big"
                 )
@@ -158,30 +165,61 @@ class VectorStore:
     @property
     def index(self) -> faiss.Index:
         """Lazy-load or create the FAISS index."""
-        if self._index is None:
-            if os.path.exists(self.index_path):
-                self._index = faiss.read_index(self.index_path)
-                self._dimension = self._index.d
-                self._load_metadata()
-                if self._index.ntotal != len(self._texts) or len(self._texts) != len(self._metadata):
-                    logger.warning(
-                        "Vector index metadata mismatch "
-                        "(vectors=%s, texts=%s, metadata=%s). Rebuilding empty index.",
-                        self._index.ntotal,
-                        len(self._texts),
-                        len(self._metadata),
+        with self._lock:
+            if self._index is None:
+                if os.path.exists(self.index_path):
+                    self._index = faiss.read_index(self.index_path)
+                    self._dimension = self._index.d
+                    self._load_metadata()
+                    self._reconcile_mismatch_locked()
+                    logger.info(
+                        f"Loaded FAISS index: {self._index.ntotal} vectors"
                     )
+                else:
                     self._index = faiss.IndexFlatIP(self._dimension)
-                    self._texts = []
-                    self._metadata = []
-                    self._save()
-                logger.info(
-                    f"Loaded FAISS index: {self._index.ntotal} vectors"
-                )
-            else:
-                self._index = faiss.IndexFlatIP(self._dimension)
-                logger.info("Created new FAISS index (Inner Product)")
-        return self._index
+                    logger.info("Created new FAISS index (Inner Product)")
+            return self._index
+
+    def _reconcile_mismatch_locked(self) -> None:
+        """Recover from a crash between index/metadata/texts writes.
+
+        Keeps the longest consistent prefix of (vectors, texts, metadata)
+        instead of wiping all semantic memory. Only falls back to an empty
+        index when nothing can be salvaged.
+        """
+        if (
+            self._index.ntotal == len(self._texts)
+            and len(self._texts) == len(self._metadata)
+        ):
+            return
+
+        consistent_n = min(self._index.ntotal, len(self._texts), len(self._metadata))
+        logger.warning(
+            "Vector index metadata mismatch "
+            "(vectors=%s, texts=%s, metadata=%s); keeping %s consistent entries.",
+            self._index.ntotal,
+            len(self._texts),
+            len(self._metadata),
+            consistent_n,
+        )
+
+        recovered_index = faiss.IndexFlatIP(self._dimension)
+        try:
+            for i in range(consistent_n):
+                recovered_index.add(self._index.reconstruct(i).reshape(1, -1))
+        except Exception as exc:
+            logger.error(
+                "Vector reconstruction failed (%s); rebuilding embeddings from text.", exc
+            )
+            recovered_index = faiss.IndexFlatIP(self._dimension)
+            if self._texts[:consistent_n]:
+                recovered_index.add(self._encode(self._texts[:consistent_n]))
+
+        self._texts = self._texts[:consistent_n]
+        self._metadata = self._metadata[:consistent_n]
+        self._embedding_cache.clear()
+        self._index = recovered_index
+        self._save()
 
     # ─── Chunking ─────────────────────────────────────────────────────
 
@@ -214,6 +252,34 @@ class VectorStore:
 
     # ─── Add / Index ──────────────────────────────────────────────────
 
+    @staticmethod
+    def _classify_chunk(text: str) -> str:
+        """Classify a chunk as dialogue / action / description for typed recall.
+
+        Cheap heuristic used when add_text is called with memory_type="auto":
+        - dialogue: high density of quotation marks
+        - action: multiple physical past-tense verbs
+        - description: everything else
+        """
+        if not text:
+            return "description"
+        quote_chars = sum(text.count(c) for c in ('"', "\u201c", "\u201d"))
+        # A usable voice sample needs a substantive exchange (≈3+ utterances)
+        if quote_chars >= 6 or (quote_chars / max(len(text), 1) > 0.02
+                                and quote_chars >= 2):
+            return "dialogue"
+        action_verbs = (
+            "ran ", "walked ", "grabbed ", "threw ", "swung ", "jumped ",
+            "slammed ", "dashed ", "lunged ", "punched ", "kicked ", "climbed ",
+            "stormed ", "rushed ", "bolted ", "ducked ", "dodged ", "fled ",
+            "leapt ", "spun ", "hurled ", "charged ", "crashed ",
+        )
+        lower = text.lower()
+        hits = sum(1 for v in action_verbs if v in lower)
+        if hits >= 2:
+            return "action"
+        return "description"
+
     def add_text(
         self,
         text: str,
@@ -233,29 +299,34 @@ class VectorStore:
 
         embeddings = self._encode(chunks)
 
-        # Add to FAISS
-        self.index.add(embeddings)
+        with self._lock:
+            # Add to FAISS
+            self.index.add(embeddings)
 
-        # Store texts and metadata
-        for i, chunk in enumerate(chunks):
-            meta = ChunkMetadata(
-                chapter=chapter,
-                scene=scene,
-                characters=characters or [],
-                location=location,
-                memory_type=memory_type,
-                chunk_index=len(self._texts),
+            # Store texts and metadata
+            for i, chunk in enumerate(chunks):
+                chunk_type = (
+                    self._classify_chunk(chunk) if memory_type == "auto"
+                    else memory_type
+                )
+                meta = ChunkMetadata(
+                    chapter=chapter,
+                    scene=scene,
+                    characters=characters or [],
+                    location=location,
+                    memory_type=chunk_type,
+                    chunk_index=len(self._texts),
+                )
+                self._texts.append(chunk)
+                self._metadata.append(meta.to_dict())
+
+            # Persist
+            self._save()
+
+            logger.debug(
+                f"Added {len(chunks)} chunks from Ch{chapter}/Sc{scene} "
+                f"(total: {self.index.ntotal})"
             )
-            self._texts.append(chunk)
-            self._metadata.append(meta.to_dict())
-
-        # Persist
-        self._save()
-
-        logger.debug(
-            f"Added {len(chunks)} chunks from Ch{chapter}/Sc{scene} "
-            f"(total: {self.index.ntotal})"
-        )
         return len(chunks)
 
     # ─── Search ───────────────────────────────────────────────────────
@@ -265,6 +336,7 @@ class VectorStore:
         query: str,
         top_k: int = None,
         chapter_filter: int = None,
+        memory_type: str = None,
     ) -> List[SearchResult]:
         """
         Semantic search over stored content.
@@ -273,69 +345,76 @@ class VectorStore:
             query: Natural language search query
             top_k: Number of results to return
             chapter_filter: Optional - only return results from this chapter
+            memory_type: Optional - only return chunks of this type
+                (e.g. "dialogue", "action", "description")
 
         Returns:
             List of SearchResult sorted by relevance
         """
         top_k = top_k or config.TOP_K_RETRIEVAL
 
-        if self.index.ntotal == 0:
-            return []
+        with self._lock:
+            if self.index.ntotal == 0:
+                return []
 
-        # Encode query — LRU cache keyed by query string
-        if query in self._embedding_cache:
-            # Cache hit: move to end (most-recently-used position)
-            self._embedding_cache.move_to_end(query)
-            query_embedding = self._embedding_cache[query]
-            self._embedding_cache_hits += 1
-        else:
-            # Cache miss: encode and store
-            query_embedding = self._encode([query])
-            max_size = getattr(config, "EMBEDDING_CACHE_MAX_SIZE", 1024)
-            if len(self._embedding_cache) >= max_size:
-                # Evict the least-recently-used entry (front of OrderedDict)
-                self._embedding_cache.popitem(last=False)
-            self._embedding_cache[query] = query_embedding
-            self._embedding_cache_misses += 1
+            # Encode query — LRU cache keyed by query string
+            if query in self._embedding_cache:
+                # Cache hit: move to end (most-recently-used position)
+                self._embedding_cache.move_to_end(query)
+                query_embedding = self._embedding_cache[query]
+                self._embedding_cache_hits += 1
+            else:
+                # Cache miss: encode and store
+                query_embedding = self._encode([query])
+                max_size = getattr(config, "EMBEDDING_CACHE_MAX_SIZE", 1024)
+                if len(self._embedding_cache) >= max_size:
+                    # Evict the least-recently-used entry (front of OrderedDict)
+                    self._embedding_cache.popitem(last=False)
+                self._embedding_cache[query] = query_embedding
+                self._embedding_cache_misses += 1
 
-        # Search with extra results if filtering
-        search_k = top_k * 3 if chapter_filter is not None else top_k
-        search_k = min(search_k, self.index.ntotal)
+            # Over-fetch when post-hoc filtering so we can still fill top_k
+            _filtering = chapter_filter is not None or memory_type is not None
+            search_k = top_k * 3 if _filtering else top_k
+            search_k = min(search_k, self.index.ntotal)
 
-        scores, indices = self.index.search(query_embedding, search_k)
+            scores, indices = self.index.search(query_embedding, search_k)
 
-        results = []
-        for score, idx in zip(scores[0], indices[0]):
-            if idx < 0 or idx >= len(self._texts):
-                continue
+            results = []
+            for score, idx in zip(scores[0], indices[0]):
+                if idx < 0 or idx >= len(self._texts):
+                    continue
 
-            meta = ChunkMetadata.from_dict(self._metadata[idx])
+                meta = ChunkMetadata.from_dict(self._metadata[idx])
 
-            if chapter_filter is not None and meta.chapter != chapter_filter:
-                continue
+                if chapter_filter is not None and meta.chapter != chapter_filter:
+                    continue
+                if memory_type is not None and meta.memory_type != memory_type:
+                    continue
 
-            results.append(SearchResult(
-                text=self._texts[idx],
-                score=float(score),
-                metadata=meta,
-            ))
+                results.append(SearchResult(
+                    text=self._texts[idx],
+                    score=float(score),
+                    metadata=meta,
+                ))
 
-            if len(results) >= top_k:
-                break
+                if len(results) >= top_k:
+                    break
 
-        return results
+            return results
 
     # ─── Stats ────────────────────────────────────────────────────────
 
     def get_stats(self) -> dict:
         """Return stats about the vector store."""
-        return {
-            "total_vectors": self.index.ntotal,
-            "total_chunks": len(self._texts),
-            "dimension": self._dimension,
-            "index_file_exists": os.path.exists(self.index_path),
-            "using_fallback_embeddings": self._using_fallback_embeddings,
-        }
+        with self._lock:
+            return {
+                "total_vectors": self.index.ntotal,
+                "total_chunks": len(self._texts),
+                "dimension": self._dimension,
+                "index_file_exists": os.path.exists(self.index_path),
+                "using_fallback_embeddings": self._using_fallback_embeddings,
+            }
 
     def cache_info(self) -> dict:
         """Return embedding cache diagnostics."""
@@ -355,48 +434,60 @@ class VectorStore:
         Returns number of chunks removed.
         """
         max_chapter = int(max_chapter)
-        # Force-load any persisted index/metadata before pruning
-        _ = self.index
 
-        keep_indices = []
-        for idx, meta_dict in enumerate(self._metadata):
-            try:
-                meta = ChunkMetadata.from_dict(meta_dict)
-            except Exception:
-                continue
-            if int(meta.chapter) <= max_chapter:
-                keep_indices.append(idx)
+        with self._lock:
+            # Force-load any persisted index/metadata before pruning
+            _ = self.index
 
-        removed = len(self._metadata) - len(keep_indices)
-        if removed <= 0:
-            return 0
+            keep_indices = []
+            for idx, meta_dict in enumerate(self._metadata):
+                try:
+                    meta = ChunkMetadata.from_dict(meta_dict)
+                except Exception:
+                    continue
+                if int(meta.chapter) <= max_chapter:
+                    keep_indices.append(idx)
 
-        kept_texts = [self._texts[i] for i in keep_indices]
-        kept_metadata = [self._metadata[i] for i in keep_indices]
+            removed = len(self._metadata) - len(keep_indices)
+            if removed <= 0:
+                return 0
 
-        self._texts = kept_texts
-        self._metadata = kept_metadata
-        self._embedding_cache.clear()
+            kept_texts = [self._texts[i] for i in keep_indices]
+            kept_metadata = [self._metadata[i] for i in keep_indices]
 
-        # Rebuild FAISS index from remaining texts
-        self._index = faiss.IndexFlatIP(self._dimension)
-        if self._texts:
-            embeddings = self._encode(self._texts)
-            self._index.add(embeddings)
+            self._texts = kept_texts
+            self._metadata = kept_metadata
+            self._embedding_cache.clear()
 
-        self._save()
+            # Rebuild FAISS index from remaining texts
+            self._index = faiss.IndexFlatIP(self._dimension)
+            if self._texts:
+                embeddings = self._encode(self._texts)
+                self._index.add(embeddings)
+
+            self._save()
         logger.info("Pruned %s vector chunks for chapters > %s", removed, max_chapter)
         return removed
 
     # ─── Persistence ──────────────────────────────────────────────────
 
     def _save(self) -> None:
-        """Persist FAISS index and metadata to disk."""
-        faiss.write_index(self._index, self.index_path)
-        with open(self.meta_path, "w", encoding="utf-8") as f:
+        """Persist FAISS index and metadata to disk (atomic per-file writes)."""
+        faiss_tmp = self.index_path + ".tmp"
+        meta_tmp = self.meta_path + ".tmp"
+        texts_tmp = self.texts_path + ".tmp"
+
+        faiss.write_index(self._index, faiss_tmp)
+        with open(meta_tmp, "w", encoding="utf-8") as f:
             json.dump(self._metadata, f, ensure_ascii=False)
-        with open(self.texts_path, "w", encoding="utf-8") as f:
+        with open(texts_tmp, "w", encoding="utf-8") as f:
             json.dump(self._texts, f, ensure_ascii=False)
+
+        # os.replace is atomic on POSIX and Windows; writing tmp files first
+        # means a crash can never leave a truncated file in place.
+        os.replace(faiss_tmp, self.index_path)
+        os.replace(meta_tmp, self.meta_path)
+        os.replace(texts_tmp, self.texts_path)
 
     def _load_metadata(self) -> None:
         """Load texts and metadata from disk."""

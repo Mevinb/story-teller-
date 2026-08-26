@@ -50,6 +50,10 @@ function modelOptionLabel(modelId, groqModelName, geminiModelName, openrouterMod
     if (modelId === GROQ_MODEL_OPTION) {
         return `☁️ Groq API (${groqModelName || 'default'})`;
     }
+    if (modelId.startsWith('groq:')) {
+        const m = modelId.slice(5);
+        return `☁️ Groq — ${m.split('/').pop()}`;
+    }
     if (modelId === GEMINI_MODEL_OPTION) {
         return `✨ Gemini API (${geminiModelName || 'default'})`;
     }
@@ -126,17 +130,19 @@ function renderManualScenes(scenes) {
             const sceneText = typeof scene === 'string' ? scene : scene.text;
             const enhancedSummary = typeof scene === 'string' ? '' : (scene.enhanced_summary || '');
             const wordCount = (sceneText || '').split(/\s+/).filter(Boolean).length;
-            
+            const isLast = idx === scenes.length - 1;
+
             // Store raw text in Map for edit mode
             manualSceneTexts.set(idx, sceneText || '');
-            
+
             const sceneHtml = `
                 <div class="manual-scene-result" style="position:relative; margin-bottom:16px;padding:16px;background:var(--surface-2);border-radius:8px;border-left:3px solid var(--accent-primary)">
                     <div style="position:absolute;top:12px;right:12px;z-index:10;display:flex;gap:4px">
+                        ${isLast ? `<button class="btn btn-sm" style="font-size:0.8rem;padding:4px 8px;background:var(--accent-primary);color:#fff" onclick="regenerateManualScene(${idx})" title="Discard and regenerate this scene">🔄</button>` : ''}
                         <button class="btn btn-sm" style="font-size:0.8rem;padding:4px 8px;background:var(--accent-secondary);color:#fff" onclick="editManualScene(${idx})" title="Edit this scene's text">✏️</button>
                         <button class="btn btn-sm btn-danger" style="font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${idx})" title="Delete this scene">🗑️</button>
                     </div>
-                    <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:80px">Scene ${idx + 1}</div>
+                    <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:${isLast ? '120px' : '80px'}">Scene ${idx + 1}</div>
                     ${enhancedSummary ? `<div class="text-dim text-sm" style="margin-bottom:6px">Enhanced: ${escHtml(enhancedSummary)}</div>` : ''}
                     <div style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif;font-size:0.92rem;max-height:300px;overflow-y:auto">${escHtml(sceneText || '')}</div>
                     <div class="text-dim text-sm" style="margin-top:8px">${wordCount} words</div>
@@ -154,17 +160,66 @@ async function deleteManualScene(index) {
         const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${index}`, { method: 'DELETE' });
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || 'Failed to delete scene');
-        
+
         manualScenesCompleted = data.scenes_completed;
         document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
         document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
         renderManualScenes(data.completed_scenes);
-        
+
         if (manualScenesCompleted === 0) {
             document.getElementById('btnManualFinish').classList.add('hidden');
         }
         showToast('Scene deleted', 'success');
     } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+// ─── Scene Regeneration (Manual Mode) ──────────────���──────────────
+async function regenerateManualScene(index) {
+    if (!currentProject || !manualSessionActive || manualIsGeneratingScene) return;
+    if (!confirm('Discard this scene and write a new version?')) return;
+
+    const btn = document.getElementById('btnManualScene');
+    const stopBtn = document.getElementById('btnManualStopScene');
+    const finishBtn = document.getElementById('btnManualFinish');
+    const statusEl = document.getElementById('manualSceneStatus');
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${index}/regenerate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to regenerate scene');
+
+        manualIsGeneratingScene = true;
+        if (btn) { btn.disabled = true; btn.textContent = '⏳ Generating...'; }
+        if (stopBtn) stopBtn.classList.remove('hidden');
+        if (finishBtn) finishBtn.classList.add('hidden');
+        if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Regenerating scene...'; }
+
+        // Show streaming area
+        document.getElementById('manualStreamArea').classList.remove('hidden');
+        document.getElementById('manualStreamOutput').textContent = '';
+        streamSceneNodes = new Map();
+
+        // Reconnect SSE if needed (manual_scene_done will finalize UI state)
+        if (!eventSource) {
+            eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
+            eventSource.onmessage = handleSSE;
+            eventSource.onerror = () => {
+                if (eventSource) { eventSource.close(); eventSource = null; }
+            };
+        }
+        showToast(`Regenerating scene ${index + 1}...`, 'info');
+    } catch (e) {
+        // Scene was already removed server-side only on success path; safe to just report
+        manualIsGeneratingScene = false;
+        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
+        if (statusEl) statusEl.classList.add('hidden');
+        if (stopBtn) stopBtn.classList.add('hidden');
         showToast(e.message, 'error');
     }
 }
@@ -354,7 +409,8 @@ function renderProjects(projects) {
                 </div>
             </div>
             <div class="flex gap-2 mt-2" style="justify-content:flex-end">
-                <button class="btn btn-sm" onclick="event.stopPropagation();exportStory('${p.name}')" title="Export full story">📥 Export</button>
+                <button class="btn btn-sm" onclick="event.stopPropagation();exportStory('${p.name}')" title="Export full story (Markdown)">📥 Export</button>
+                <button class="btn btn-sm" onclick="event.stopPropagation();exportEpub('${p.name}')" title="Export story as EPUB e-book" style="background:var(--accent-secondary);color:#fff">📗 EPUB</button>
                 <button class="btn btn-sm" onclick="event.stopPropagation();resetProject('${p.name}','${escHtml(p.title)}')" title="Reset generated content" style="background:var(--warning);color:#000">🔄 Reset</button>
                 <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteProject('${p.name}','${escHtml(p.title)}')" title="Delete project">🗑️ Delete</button>
             </div>
@@ -1734,27 +1790,220 @@ function exportStory(name) {
     showToast('Exporting story...', 'info');
 }
 
+// ─── EPUB / Multi-format Export (Phase C) ───────────────────────────
+async function exportEpub(name) {
+    await exportStoryFormat(name, 'epub');
+}
+
+async function exportStoryFormat(name, fmt) {
+    if (!name) return;
+    showToast(`Exporting ${fmt.toUpperCase()}...`, 'info');
+    try {
+        const res = await fetch(`/api/project/${name}/export-story`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ format: fmt }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error || data.status === 'error') {
+            throw new Error(data.error || 'Export failed');
+        }
+        // Response: {status, format, files: {epub: "/path/to/file.epub"}}
+        const files = data.files || {};
+        const path = files[fmt] || files.markdown || files.txt || files.epub;
+        if (!path || typeof path !== 'string') throw new Error('No output file returned');
+        const file = path.split('/').pop();
+        window.open(`/api/project/${name}/export/download?file=${encodeURIComponent(file)}`, '_blank');
+        showToast(`${fmt.toUpperCase()} exported`, 'success');
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+// ─── Branch Options (Phase C) ───────────────────────────────────────
+let branchOptions = [];
+
+async function loadBranchOptions() {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    const card = document.getElementById('branchOptionsCard');
+    const list = document.getElementById('branchOptionsList');
+    const btn = document.getElementById('btnBranchRefresh');
+    card.classList.remove('hidden');
+    const hint = document.getElementById('branchDirectionHint')?.value.trim() || '';
+    list.innerHTML = '<div class="text-dim text-sm">Asking the story architect for directions…</div>';
+    if (btn) { btn.disabled = true; btn.textContent = '⏳…'; }
+    try {
+        const res = await fetch(`/api/project/${currentProject}/branch-options`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ count: 3, direction_hint: hint }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to get branch options');
+        branchOptions = data.options || [];
+        renderBranchOptions();
+    } catch (e) {
+        list.innerHTML = `<div class="text-dim text-sm" style="color:var(--danger)">⚠️ ${escHtml(e.message)}</div>`;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh'; }
+    }
+}
+
+function renderBranchOptions() {
+    const list = document.getElementById('branchOptionsList');
+    if (!branchOptions.length) {
+        list.innerHTML = '<div class="text-dim text-sm">No options returned.</div>';
+        return;
+    }
+    list.innerHTML = branchOptions.map((o, i) => `
+        <div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;background:var(--surface-2)">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
+                <div style="font-weight:600;color:var(--accent-primary)">${escHtml(o.title)}</div>
+                <div style="display:flex;gap:4px;flex-shrink:0">
+                    <button class="btn btn-sm" style="font-size:0.8rem;padding:3px 8px" onclick="copyBranchOption(${i})" title="Copy premise to clipboard">📋 Copy</button>
+                    <button class="btn btn-sm" style="font-size:0.8rem;padding:3px 8px;background:var(--accent-secondary);color:#fff" onclick="useBranchOption(${i})" title="Use as scene brief in Manual Mode">✍️ Use</button>
+                </div>
+            </div>
+            <div style="margin-top:6px;line-height:1.5">${escHtml(o.premise)}</div>
+            ${o.new_threads ? `<div class="text-dim text-sm" style="margin-top:6px"><strong>Opens:</strong> ${escHtml(o.new_threads)}</div>` : ''}
+            ${o.risk ? `<div class="text-dim text-sm" style="margin-top:2px"><strong>Risk:</strong> ${escHtml(o.risk)}</div>` : ''}
+        </div>
+    `).join('');
+}
+
+function copyBranchOption(i) {
+    const o = branchOptions[i];
+    if (!o) return;
+    const text = `${o.title}\n\n${o.premise}`;
+    if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(text).then(
+            () => showToast('Branch premise copied', 'success'),
+            () => showToast('Copy failed — select manually', 'error'),
+        );
+    } else {
+        showToast('Clipboard unavailable in this browser', 'error');
+    }
+}
+
+function useBranchOption(i) {
+    const o = branchOptions[i];
+    if (!o) return;
+    switchView('manual');
+    const brief = document.getElementById('manualSceneBrief');
+    if (!brief) { showToast('Manual mode not available', 'error'); return; }
+    brief.value = o.premise + (o.new_threads ? `\n(Opens thread: ${o.new_threads})` : '');
+    brief.focus();
+    showToast(manualSessionActive
+        ? 'Branch premise loaded as next scene brief'
+        : 'Branch premise loaded — start a manual chapter to use it', 'info');
+}
+
+function hideBranchOptions() {
+    document.getElementById('branchOptionsCard').classList.add('hidden');
+}
+
+// ─── Continuity Report (Phase C) ────────────────────────────────────
+async function loadContinuityReport() {
+    if (!currentProject) { showToast('Select a project first', 'error'); return; }
+    const card = document.getElementById('continuityCard');
+    const body = document.getElementById('continuityReportBody');
+    const btn = document.getElementById('btnContinuityRefresh');
+    card.classList.remove('hidden');
+    body.innerHTML = '<div class="text-dim text-sm">Loading…</div>';
+    if (btn) { btn.disabled = true; btn.textContent = '⏳…'; }
+    try {
+        const res = await fetch(`/api/project/${currentProject}/continuity`);
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to load continuity report');
+        renderContinuityReport(data);
+    } catch (e) {
+        body.innerHTML = `<div class="text-dim text-sm" style="color:var(--danger)">⚠️ ${escHtml(e.message)}</div>`;
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh'; }
+    }
+}
+
+function renderContinuityReport(r) {
+    const body = document.getElementById('continuityReportBody');
+    const chips = (items, cls) => items.length
+        ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${items.map(t =>
+            `<span style="padding:2px 10px;border-radius:12px;font-size:0.8rem;${cls}">${escHtml(t)}</span>`).join('')}</div>`
+        : '<span class="text-dim text-sm">None</span>';
+
+    const seeds = (r.planted_seeds || []).map(s => `Ch${s.chapter}: ${s.text}`);
+    const motifs = (r.active_motifs || []).map(m => `${m.name} ×${m.mentions}`);
+
+    const charRows = (r.characters || []).map(c => `
+        <tr>
+            <td style="padding:4px 10px"><strong>${escHtml(c.name)}</strong></td>
+            <td style="padding:4px 10px" class="text-dim">${escHtml(c.role)}</td>
+            <td style="padding:4px 10px" class="text-dim">${escHtml(c.status)}</td>
+            <td style="padding:4px 10px" class="text-dim">${escHtml(c.emotion || '—')}</td>
+            <td style="padding:4px 10px" class="text-dim">${escHtml(c.location || '—')}</td>
+        </tr>`).join('');
+
+    const warnings = (r.warnings || []).length
+        ? `<div style="margin-top:12px;padding:10px;border-left:3px solid var(--warning);background:var(--surface-2);border-radius:4px">
+             ${(r.warnings || []).map(w => `<div style="margin:2px 0">⚠️ ${escHtml(w)}</div>`).join('')}
+           </div>`
+        : '<div class="text-dim text-sm" style="margin-top:12px">✅ No continuity warnings</div>';
+
+    body.innerHTML = `
+        <div class="text-dim text-sm" style="margin-bottom:10px">
+            Phase: <strong>${escHtml(r.narrative_phase)}</strong> ·
+            Chapters written: <strong>${r.chapters_written}</strong> ·
+            Current: <strong>Ch${r.current_chapter}</strong>
+        </div>
+        <div style="margin-bottom:10px"><strong style="font-size:0.85rem">🧵 Unresolved threads</strong>
+            ${chips(r.unresolved_threads || [], 'background:var(--accent-primary);color:#fff')}</div>
+        <div style="margin-bottom:10px"><strong style="font-size:0.85rem">🌱 Planted seeds (unpaid)</strong>
+            ${chips(seeds, 'background:var(--accent-secondary);color:#fff')}</div>
+        <div style="margin-bottom:10px"><strong style="font-size:0.85rem">🔁 Active motifs</strong>
+            ${chips(motifs, 'background:var(--surface-2);border:1px solid var(--border)')}</div>
+        ${charRows ? `<div style="margin-bottom:10px;overflow-x:auto"><strong style="font-size:0.85rem">👥 Characters</strong>
+            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-top:4px">
+                <thead><tr class="text-dim"><th style="text-align:left;padding:4px 10px">Name</th><th style="text-align:left;padding:4px 10px">Role</th><th style="text-align:left;padding:4px 10px">Status</th><th style="text-align:left;padding:4px 10px">Emotion</th><th style="text-align:left;padding:4px 10px">Location</th></tr></thead>
+                <tbody>${charRows}</tbody>
+            </table></div>` : ''}
+        ${warnings}
+    `;
+}
+
+function hideContinuityReport() {
+    document.getElementById('continuityCard').classList.add('hidden');
+}
+
 // ─── Combine & Polish (Gemini) ───────────────────────────────────
 let combineEventSource = null;
 let isCombining = false;
 
 async function startCombine() {
+    await startCombineMode('polish', 'Combining with Gemini...', 'Starting combine pipeline...');
+}
+
+async function startWholeStory() {
+    await startCombineMode('whole', 'Generating whole story with Gemini...', 'Starting one-shot whole-story generation...');
+}
+
+async function startCombineMode(mode, statusLabel, statusText) {
     if (!currentProject) { showToast('Select a project first', 'error'); return; }
     if (isCombining) { showToast('Combine already in progress', 'info'); return; }
 
     isCombining = true;
-    const btn = document.getElementById('btnCombine');
+    const btn = mode === 'whole' ? document.getElementById('btnWholeStory') : document.getElementById('btnCombine');
     const progress = document.getElementById('combineProgress');
     const analysisCard = document.getElementById('combineAnalysisCard');
     const downloadCard = document.getElementById('combineDownloadCard');
 
-    btn.disabled = true;
-    btn.innerHTML = '<span class="gemini-icon">⏳</span> Processing...';
+    if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="gemini-icon">⏳</span> Processing...';
+    }
     progress.classList.remove('hidden');
     analysisCard.classList.add('hidden');
     downloadCard.classList.add('hidden');
-    document.getElementById('combineStatusText').textContent = 'Starting combine pipeline...';
-    setStatus('working', 'Combining with Gemini...');
+    document.getElementById('combineStatusText').textContent = statusText;
+    setStatus('working', statusLabel);
 
     try {
         const modelSelect = document.getElementById('combineModelSelect');
@@ -1763,7 +2012,7 @@ async function startCombine() {
         const res = await fetch(`/api/project/${currentProject}/combine`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: selectedModel })
+            body: JSON.stringify({ model: selectedModel, mode })
         });
 
         if (!res.ok) {
@@ -1814,12 +2063,17 @@ function handleCombineSSE(event) {
 
 function stopCombine() {
     isCombining = false;
-    const btn = document.getElementById('btnCombine');
     const progress = document.getElementById('combineProgress');
     const btnCancel = document.getElementById('btnCancelCombine');
-    if (btn) {
-        btn.disabled = false;
-        btn.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
+    const btnCombine = document.getElementById('btnCombine');
+    const btnWhole = document.getElementById('btnWholeStory');
+    if (btnCombine) {
+        btnCombine.disabled = false;
+        btnCombine.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
+    }
+    if (btnWhole) {
+        btnWhole.disabled = false;
+        btnWhole.innerHTML = '<span class="gemini-icon">✨</span> Generate Whole Story (One Shot)';
     }
     if (btnCancel) {
         btnCancel.disabled = false;
@@ -2124,15 +2378,41 @@ function populateSettings(data) {
     if (activeModel) {
         const models = data.local_models || [];
         const active = settings.ACTIVE_MODEL || data.active_model || '';
-        const options = models.map(model =>
-            `<option value="${escHtml(model)}" ${model === active ? 'selected' : ''}>${escHtml(model)}</option>`
-        );
-        if (active && active !== GROQ_MODEL_OPTION && active !== OPENROUTER_MODEL_OPTION && !models.includes(active)) {
-            options.unshift(`<option value="${escHtml(active)}" selected>${escHtml(active)}</option>`);
+
+        const options = [];
+        const listedValues = new Set();
+        if (models.length) {
+            options.push('<optgroup label="💻 Local GGUF models">');
+            models.forEach(model => {
+                listedValues.add(model);
+                options.push(`<option value="${escHtml(model)}" ${model === active ? 'selected' : ''}>${escHtml(model)}</option>`);
+            });
+            options.push('</optgroup>');
         }
-        activeModel.innerHTML = options.length
-            ? options.join('')
-            : '<option value="">No GGUF models found</option>';
+        const groqModels = data.groq_models || [];
+        if (groqModels.length) {
+            options.push('<optgroup label="☁️ Groq API models">');
+            groqModels.forEach(m => {
+                const id = `groq:${m.id}`;
+                listedValues.add(id);
+                options.push(`<option value="${escHtml(id)}" ${id === active ? 'selected' : ''}>${escHtml(m.name)} (${m.id})</option>`);
+            });
+            options.push('</optgroup>');
+        }
+        options.push('<optgroup label="✨ Other cloud APIs">');
+        listedValues.add(GEMINI_MODEL_OPTION);
+        listedValues.add(OPENROUTER_MODEL_OPTION);
+        options.push(`<option value="${GEMINI_MODEL_OPTION}" ${GEMINI_MODEL_OPTION === active ? 'selected' : ''}>✨ Gemini API (${settings.GEMINI_MODEL || 'default'})</option>`);
+        options.push(`<option value="${OPENROUTER_MODEL_OPTION}" ${OPENROUTER_MODEL_OPTION === active ? 'selected' : ''}>🌐 OpenRouter API (${settings.OPENROUTER_MODEL || 'default'})</option>`);
+        options.push('</optgroup>');
+
+        // Include the active selection even if it's not in any list (e.g. custom Groq model from .env)
+        if (active && !listedValues.has(active)) {
+            const label = active.startsWith('groq:') ? `☁️ Groq — ${active.slice(5)}` : active;
+            options.unshift(`<option value="${escHtml(active)}" selected>${escHtml(label)}</option>`);
+        }
+
+        activeModel.innerHTML = options.join('');
     }
 
     renderSettingsSummary(data);
@@ -2212,14 +2492,15 @@ async function switchModel(model) {
         });
         const data = await res.json();
         if (data.status === 'ok') {
-            if ((data.active || model) === GROQ_MODEL_OPTION) {
+            const active = data.active || model;
+            if (active === GROQ_MODEL_OPTION || (typeof active === 'string' && active.startsWith('groq:'))) {
                 showToast(`Switched to Groq API (${data.groq_model || 'default'})`, 'success');
-            } else if ((data.active || model) === GEMINI_MODEL_OPTION) {
+            } else if (active === GEMINI_MODEL_OPTION) {
                 showToast(`Switched to Gemini API (${data.gemini_model || 'default'})`, 'success');
-            } else if ((data.active || model) === OPENROUTER_MODEL_OPTION) {
+            } else if (active === OPENROUTER_MODEL_OPTION) {
                 showToast(`Switched to OpenRouter API (${data.openrouter_model || 'default'})`, 'success');
             } else {
-                showToast(`Switched to ${data.active || model}`, 'success');
+                showToast(`Switched to ${active}`, 'success');
             }
         } else {
             showToast(data.error || 'Switch failed', 'error');
@@ -2397,7 +2678,11 @@ document.addEventListener('DOMContentLoaded', () => {
     loadSettings();
     document.getElementById('settingsActiveModel')?.addEventListener('change', (e) => {
         const pathInput = document.getElementById('setting_LLAMA_MODEL_PATH');
-        if (pathInput && e.target.value) pathInput.value = e.target.value;
+        // Only local GGUF selections update the local model path.
+        if (pathInput && e.target.value && !e.target.value.startsWith('groq:')
+            && e.target.value !== GEMINI_MODEL_OPTION && e.target.value !== OPENROUTER_MODEL_OPTION) {
+            pathInput.value = e.target.value;
+        }
     });
     setStatus('online', 'Ready');
 });

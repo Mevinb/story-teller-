@@ -20,6 +20,7 @@ from .arc_tracker import ArcTracker
 from .importance_ranker import ImportanceRanker
 from .event_extractor import EventExtractor
 from .memory_compressor import MemoryCompressor
+from .motif_tracker import MotifTracker
 
 logger = logging.getLogger(__name__)
 
@@ -173,6 +174,42 @@ class Retriever:
                 parts.append(events_block)
                 char_count += len(events_block)
 
+        # ─── Part 2.8c: Planted Foreshadowing (seeds to pay off) ─────
+        seeds = self.state.state.get("plot", {}).get("foreshadowing", [])
+        if isinstance(seeds, list) and seeds and char_count < max_chars - 250:
+            seed_lines = []
+            for seed in seeds[-5:]:
+                if not isinstance(seed, dict):
+                    continue
+                text = str(seed.get("text", "")).strip()
+                if not text:
+                    continue
+                seed_ch = seed.get("chapter", "?")
+                status = seed.get("status", "planted")
+                seed_lines.append(f"- (Ch{seed_ch}, {status}) {text[:160]}")
+            if seed_lines:
+                seeds_block = (
+                    "\n=== PLANTED FORESHADOWING — advance or pay off these "
+                    "seeds where natural; do NOT contradict them ===\n"
+                    + "\n".join(seed_lines)
+                )
+                parts.append(seeds_block)
+                char_count += len(seeds_block)
+
+        # ─── Part 2.8d: Recurring Motifs & Symbols ────────────────────
+        # Surface tracked motifs so the writer keeps weaving them in.
+        try:
+            motif_summary = MotifTracker.get_motif_summary(self.state.state)
+        except Exception:
+            motif_summary = ""
+        if motif_summary and char_count < max_chars - 200:
+            motif_block = (
+                "\n=== RECURRING MOTIFS — weave one in naturally where it "
+                "fits; never force or over-explain ===\n" + motif_summary
+            )
+            parts.append(motif_block)
+            char_count += len(motif_block)
+
         # ─── Part 2.8b: Graph Retrieval (Related Events) ─────────────
         if story_events and characters and char_count < max_chars - 200:
             related_events = []
@@ -253,6 +290,62 @@ class Retriever:
                 if char_count + len(summary_text) < max_chars:
                     parts.append(summary_text)
                     char_count += len(summary_text)
+
+        # ─── Part 4.3: Voice Samples (typed dialogue recall) ──────────
+        # Pull one past dialogue chunk per present character so the writer
+        # can match their established cadence and word choice.
+        if characters and self.vectors.index.ntotal > 0 and char_count < max_chars - 500:
+            for char_name in characters[:2]:
+                if char_count >= max_chars - 480:
+                    break
+                try:
+                    voice_hits = self.vectors.search(
+                        f"{char_name} said dialogue",
+                        top_k=1,
+                        memory_type="dialogue",
+                    )
+                except Exception:
+                    logger.debug("Voice sample search failed", exc_info=True)
+                    break
+                # Only anchor on PRIOR chapters — never echo the chapter being written
+                voice_hits = [
+                    h for h in voice_hits
+                    if getattr(h.metadata, "chapter", 0) < chapter_num
+                ]
+                if not voice_hits:
+                    continue
+                sample = " ".join(voice_hits[0].text.split())[:420]
+                voice_block = (
+                    f"\n=== VOICE SAMPLE: {char_name} "
+                    "(match cadence/word choice, do not copy) ===\n"
+                    f"{sample}"
+                )
+                parts.append(voice_block)
+                char_count += len(voice_block)
+
+        # ─── Part 4.5: Style Anchor (best-scored passage of prior chapters) ──
+        exemplars = plot.get("style_exemplars", [])
+        if isinstance(exemplars, list) and exemplars and char_count < max_chars - 1600:
+            try:
+                prior = [
+                    e for e in exemplars
+                    if isinstance(e, dict)
+                    and int(e.get("chapter", 0) or 0) < chapter_num
+                    and str(e.get("text", "")).strip()
+                ]
+            except (TypeError, ValueError):
+                prior = []
+            if prior:
+                ex = prior[-1]
+                ex_text = " ".join(str(ex.get("text", "")).split())[:1400]
+                if ex_text:
+                    style_block = (
+                        "\n=== STYLE ANCHOR "
+                        "(imitate rhythm/diction ONLY — never copy events or phrasing) ===\n"
+                        f"{ex_text}"
+                    )
+                    parts.append(style_block)
+                    char_count += len(style_block)
 
         context = "\n".join(parts)
         logger.debug(

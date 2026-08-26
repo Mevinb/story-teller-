@@ -73,6 +73,30 @@ Key environment variables:
 
 See [`.env.example`](.env.example) for the full list of options.
 
+### Optional rotating proxy for OpenCode
+
+This repository includes a small localhost-only HTTP proxy that rotates through
+upstream HTTP proxies once per client connection (including HTTPS `CONNECT`).
+It is independent of the story application and can be used by OpenCode or any
+client that honors standard proxy environment variables:
+
+```bash
+export ROTATING_PROXY_URLS='http://user:password@proxy1.example:3128,http://proxy2.example:3128'
+python proxy_rotator.py --listen-port 8080
+```
+
+In the shell that launches OpenCode:
+
+```bash
+export HTTP_PROXY=http://127.0.0.1:8080
+export HTTPS_PROXY=http://127.0.0.1:8080
+opencode
+```
+
+Use `NO_PROXY=127.0.0.1,localhost` so local services are not sent through the
+upstream pool. The proxy list must contain reachable HTTP/HTTPS proxy URLs;
+this tool does not create proxy IPs or bypass provider limits.
+
 ## Local Model Setup (llama.cpp)
 
 Place a `.gguf` file under `models/` and point `LLAMA_MODEL_PATH` to it.

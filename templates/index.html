@@ -264,6 +264,36 @@
         <!-- Generate View -->
         <div class="view" id="viewGenerate">
             <div class="gen-container">
+                <!-- Branch Options (Phase C) -->
+                <div class="card hidden" id="branchOptionsCard" style="grid-column: 1 / -1;">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">🔀</span> Next Chapter — Branch Options</span>
+                        <div class="flex gap-2 items-center">
+                            <input class="form-input" id="branchDirectionHint" placeholder="Optional steering hint…"
+                                   style="width:220px;padding:4px 8px;font-size:0.85rem">
+                            <button class="btn btn-sm" onclick="loadBranchOptions()" id="btnBranchRefresh">🔄 Refresh</button>
+                            <button class="btn btn-sm" onclick="hideBranchOptions()" title="Close">✕</button>
+                        </div>
+                    </div>
+                    <div id="branchOptionsList" style="padding:12px">
+                        <div class="text-dim text-sm">Asking the story architect for directions…</div>
+                    </div>
+                </div>
+
+                <!-- Continuity Report (Phase C) -->
+                <div class="card hidden" id="continuityCard" style="grid-column: 1 / -1;">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">🧭</span> Continuity Report</span>
+                        <div class="flex gap-2">
+                            <button class="btn btn-sm" onclick="loadContinuityReport()" id="btnContinuityRefresh">🔄 Refresh</button>
+                            <button class="btn btn-sm" onclick="hideContinuityReport()" title="Close">✕</button>
+                        </div>
+                    </div>
+                    <div id="continuityReportBody" style="padding:12px">
+                        <div class="text-dim text-sm">Loading…</div>
+                    </div>
+                </div>
+
                 <!-- Main Output -->
                 <div class="card">
                     <div class="card-header">
@@ -284,6 +314,12 @@
                                 <option value="-1">📖 Entire Story (All Remaining Chapters)</option>
                                 <option value="-2">🎬 Until Premise Completed (Complete Story)</option>
                             </select>
+                            <button class="btn" onclick="loadBranchOptions()" id="btnBranchOptions" title="Propose directions for the next chapter" style="background:var(--accent-secondary);color:#fff">
+                                🔀 Branch
+                            </button>
+                            <button class="btn" onclick="loadContinuityReport()" id="btnContinuity" title="Threads, seeds, characters, motifs">
+                                🧭 Continuity
+                            </button>
                             <button class="btn btn-primary" onclick="startGeneration()" id="btnGenerate">
                                 ▶ Generate
                             </button>
@@ -541,18 +577,19 @@
                     <div class="form-group mb-4" style="margin-bottom: 16px;">
                         <label class="form-label" for="combineModelSelect">Gemini Model for Combine & Polish</label>
                         <select class="form-select" id="combineModelSelect">
-                            <optgroup label="Gemini 3.x">
-                                <option value="gemini-3.5-flash">gemini-3.5-flash (5 RPM)</option>
-                                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (15 RPM)</option>
-                                <option value="gemini-3-flash">gemini-3-flash (5 RPM)</option>
+                            <optgroup label="Gemini 3.x (current)">
+                                <option value="gemini-3.6-flash">gemini-3.6-flash (latest GA)</option>
+                                <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (latest lite)</option>
+                                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
                             </optgroup>
-                            <optgroup label="Gemini 2.5">
-                                <option value="gemini-2.5-flash">gemini-2.5-flash (5 RPM)</option>
-                                <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite (10 RPM)</option>
+                            <optgroup label="Gemini 2.5 (retiring Oct 2026)">
+                                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                                <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite</option>
                             </optgroup>
                             <optgroup label="Gemma Open Models">
-                                <option value="gemma-4-26b">gemma-4-26b (15 RPM)</option>
-                                <option value="gemma-4-31b">gemma-4-31b (15 RPM)</option>
+                                <option value="gemma-4-26b-a4b-it">gemma-4-26b-a4b-it</option>
+                                <option value="gemma-4-31b-it">gemma-4-31b-it</option>
                             </optgroup>
                         </select>
                     </div>
@@ -560,6 +597,9 @@
                     <div class="combine-actions" id="combineActions">
                         <button class="btn btn-gemini" onclick="startCombine()" id="btnCombine">
                             <span class="gemini-icon">🔮</span> Combine & Polish
+                        </button>
+                        <button class="btn btn-gemini" onclick="startWholeStory()" id="btnWholeStory">
+                            <span class="gemini-icon">✨</span> Generate Whole Story (One Shot)
                         </button>
                         <button class="btn btn-danger hidden" onclick="deleteCombineData()" id="btnDeleteCombine">
                             🗑️ Delete Polished Version
@@ -572,7 +612,7 @@
                             <span>✍️</span> Generate the Entire Story Instead
                         </h4>
                         <p class="text-sm text-dim" style="margin-bottom: 12px; font-size: 0.9rem; line-height: 1.4;">
-                            If you only have one or a few chapters generated, "Combine & Polish" will fill missing premise beats with short paragraph-length scenes. For a fully-realized, long-form novel, use the automatic sequential generator to write all remaining chapters in full detail.
+                            "Generate Whole Story" hands Gemini the complete story bible (premise, characters, world rules, existing chapters) and asks it to write the entire story in a single call — no multi-agent pipeline needed. Use it when you want the whole novel in one pass. For the agent-driven sequential generator, use the button below.
                         </p>
                         <button class="btn btn-sm btn-secondary" onclick="switchToEntireStoryGeneration()" style="font-size: 0.85rem; padding: 6px 12px;">
                             🚀 Switch to Auto-Generation
@@ -701,7 +741,7 @@
                             <span class="card-title">Model Selection</span>
                         </div>
                         <div class="form-group">
-                            <label class="form-label">Active local model</label>
+                            <label class="form-label">Active model (local GGUF or cloud API)</label>
                             <select class="form-select" id="settingsActiveModel"></select>
                         </div>
                         <div class="form-group">
@@ -778,18 +818,19 @@
                         <div class="form-group">
                             <label class="form-label">Gemini model</label>
                             <select class="form-select" id="setting_GEMINI_MODEL" data-setting="GEMINI_MODEL">
-                                <optgroup label="Gemini 3.x">
-                                    <option value="gemini-3.5-flash">gemini-3.5-flash (5 RPM)</option>
-                                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (15 RPM)</option>
-                                    <option value="gemini-3-flash">gemini-3-flash (5 RPM)</option>
+                                <optgroup label="Gemini 3.x (current)">
+                                    <option value="gemini-3.6-flash">gemini-3.6-flash (latest GA)</option>
+                                    <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                                    <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (latest lite)</option>
+                                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
                                 </optgroup>
-                                <optgroup label="Gemini 2.5">
-                                    <option value="gemini-2.5-flash">gemini-2.5-flash (5 RPM)</option>
-                                    <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite (10 RPM)</option>
+                                <optgroup label="Gemini 2.5 (retiring Oct 2026)">
+                                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                                    <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite</option>
                                 </optgroup>
                                 <optgroup label="Gemma Open Models">
-                                    <option value="gemma-4-26b">gemma-4-26b (15 RPM, Unlimited TPM)</option>
-                                    <option value="gemma-4-31b">gemma-4-31b (15 RPM, Unlimited TPM)</option>
+                                    <option value="gemma-4-26b-a4b-it">gemma-4-26b-a4b-it</option>
+                                    <option value="gemma-4-31b-it">gemma-4-31b-it</option>
                                 </optgroup>
                             </select>
                         </div>
@@ -894,9 +935,12 @@
                             <label class="form-label">Model</label>
                             <select class="form-select" id="setting_OPENROUTER_MODEL" data-setting="OPENROUTER_MODEL">
                                 <optgroup label="Free Models">
-                                    <option value="cognitivecomputations/dolphin-mistral-24b-venice-edition:free" selected>cognitivecomputations/dolphin-mistral-24b-venice-edition:free</option>
-                                    <option value="deepseek/deepseek-chat-v3-0324:free">deepseek/deepseek-chat-v3-0324:free</option>
-                                    <option value="google/gemma-3-27b-it:free">google/gemma-3-27b-it:free</option>
+                                    <option value="nvidia/nemotron-3-ultra-550b-a55b:free" selected>nvidia/nemotron-3-ultra-550b-a55b:free (550B)</option>
+                                    <option value="nvidia/nemotron-3-super-120b-a12b:free">nvidia/nemotron-3-super-120b-a12b:free (120B)</option>
+                                    <option value="google/gemma-4-31b-it:free">google/gemma-4-31b-it:free</option>
+                                    <option value="google/gemma-4-26b-a4b-it:free">google/gemma-4-26b-a4b-it:free</option>
+                                    <option value="nvidia/nemotron-3-nano-30b-a3b:free">nvidia/nemotron-3-nano-30b-a3b:free</option>
+                                    <option value="openai/gpt-oss-20b:free">openai/gpt-oss-20b:free</option>
                                     <option value="meta-llama/llama-3.3-70b-instruct:free">meta-llama/llama-3.3-70b-instruct:free</option>
                                     <option value="qwen/qwen3-32b:free">qwen/qwen3-32b:free</option>
                                     <option value="mistralai/mistral-small-3.1-24b-instruct:free">mistralai/mistral-small-3.1-24b-instruct:free</option>
@@ -967,6 +1011,18 @@
                             <div class="form-group">
                                 <label class="form-label">Token budget</label>
                                 <input class="form-input" type="number" id="setting_MAX_TOKEN_BUDGET" data-setting="MAX_TOKEN_BUDGET">
+                            </div>
+                        </div>
+                        <div class="settings-field-row">
+                            <div class="form-group">
+                                <label class="form-label">Drafts per key scene</label>
+                                <input class="form-input" type="number" min="1" max="3" id="setting_BEST_OF_N_KEY_SCENES" data-setting="BEST_OF_N_KEY_SCENES">
+                                <small class="text-dim text-sm">1 = single draft (fast, cheap). 2+ generates extra candidate scenes for key moments — uses more tokens.</small>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Drafts per normal scene</label>
+                                <input class="form-input" type="number" min="1" max="3" id="setting_BEST_OF_N_NORMAL_SCENES" data-setting="BEST_OF_N_NORMAL_SCENES">
+                                <small class="text-dim text-sm">Keep at 1 for normal scenes.</small>
                             </div>
                         </div>
                     </div>

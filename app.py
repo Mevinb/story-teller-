@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from flask import Flask, render_template, request, jsonify, Response
 import config
 from pipeline.orchestrator import PipelineOrchestrator, normalize_project_name
-from pipeline.gemini_combiner import combine_chapters, analyze_and_polish
+from pipeline.gemini_combiner import combine_chapters, analyze_and_polish, generate_whole_story
+from pipeline.errors import PipelineCancelledError
 from models.groq_model import GroqModel
 from models.openrouter_model import OpenRouterModel
 from models.llm import LlamaCPP, list_gguf_models, resolve_model_path, to_model_id
@@ -64,51 +65,66 @@ _ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
 _SENSITIVE_SETTING_KEYS = {"GROQ_API_KEY", "GROQ_API_KEYS", "GEMINI_API_KEY", "OPENROUTER_API_KEY"}
 _REDACTED_VALUE = "********"
 
+# Editable settings exposed by /api/settings. Defaults are sourced from
+# `config` so the UI can never drift from the actual runtime configuration.
 _SETTING_DEFS = {
     "BACKEND_MODE": {"type": "str", "default": "local"},
     "GROQ_API_KEY": {"type": "str", "default": ""},
     "GROQ_API_KEYS": {"type": "str", "default": ""},
-    "GROQ_MODEL": {"type": "str", "default": "qwen/qwen3-32b"},
+    "GROQ_MODEL": {"type": "str", "default": config.GROQ_MODEL},
     "GEMINI_API_KEY": {"type": "str", "default": ""},
-    "GEMINI_MODEL": {"type": "str", "default": "gemini-2.5-flash-lite"},
+    "GEMINI_MODEL": {"type": "str", "default": config.GEMINI_MODEL},
     "OPENROUTER_API_KEY": {"type": "str", "default": ""},
-    "OPENROUTER_MODEL": {"type": "str", "default": "cognitivecomputations/dolphin-mistral-24b-venice-edition:free"},
-    "OPENROUTER_MIN_REQUEST_INTERVAL": {"type": "float", "default": 1.0},
+    "OPENROUTER_MODEL": {"type": "str", "default": config.OPENROUTER_MODEL},
+    "OPENROUTER_MIN_REQUEST_INTERVAL": {
+        "type": "float", "default": config.OPENROUTER_MIN_REQUEST_INTERVAL,
+    },
     "USE_CLOUD_MODEL": {"type": "bool", "default": False},
     "LLAMA_MODELS_DIR": {"type": "str", "default": config.LLAMA_MODELS_DIR},
     "LLAMA_MODEL_PATH": {"type": "str", "default": config.LLAMA_MODEL_PATH},
-    "LLAMA_PROMPT_TEMPLATE": {"type": "str", "default": "mistral"},
-    "LLAMA_N_GPU_LAYERS": {"type": "int", "default": 20},
-    "LLAMA_N_BATCH": {"type": "int", "default": 512},
-    "LLAMA_N_THREADS": {"type": "int", "default": max(1, (os.cpu_count() or 8) // 2)},
-    "LLAMA_F16_KV": {"type": "bool", "default": True},
-    "LOCAL_NUM_CTX": {"type": "int", "default": 4096},
-    "LOCAL_TEMPERATURE": {"type": "float", "default": 0.7},
-    "LOCAL_TOP_P": {"type": "float", "default": 0.9},
-    "LOCAL_MAX_TOKENS": {"type": "int", "default": 1024},
-    "LOCAL_STRUCTURED_MAX_TOKENS": {"type": "int", "default": 900},
-    "CLOUD_TEMPERATURE": {"type": "float", "default": 0.8},
-    "CLOUD_TOP_P": {"type": "float", "default": 0.9},
-    "CLOUD_MAX_TOKENS": {"type": "int", "default": 4096},
-    "GROQ_MIN_REQUEST_INTERVAL": {"type": "float", "default": 8.0},
-    "GROQ_RATE_LIMIT_BUFFER": {"type": "float", "default": 5.0},
-    "GROQ_ROTATE_ON_RATE_LIMIT": {"type": "bool", "default": False},
-    "GROQ_CONTINUATION_ATTEMPTS": {"type": "int", "default": 1},
-    "RETRY_BASE_DELAY": {"type": "float", "default": 3.0},
-    "RETRY_MAX_DELAY": {"type": "float", "default": 30.0},
-    "RETRY_BACKOFF_FACTOR": {"type": "float", "default": 2.0},
-    "WORDS_PER_SCENE_MIN": {"type": "int", "default": 500},
-    "WORDS_PER_SCENE_MAX": {"type": "int", "default": 1000},
-    "MIN_SCENE_WORDS": {"type": "int", "default": 500},
-    "MAX_SCENE_ITERATIONS": {"type": "int", "default": 5},
-    "MAX_PIPELINE_STEPS": {"type": "int", "default": 300},
-    "MAX_TOKEN_BUDGET": {"type": "int", "default": 24000},
-    "TOP_K_RETRIEVAL": {"type": "int", "default": 4},
-    "CONTEXT_TOKEN_BUDGET": {"type": "int", "default": 2048},
-    "SSE_QUEUE_MAXSIZE": {"type": "int", "default": 1000},
-    "FLASK_HOST": {"type": "str", "default": "0.0.0.0"},
-    "FLASK_PORT": {"type": "int", "default": 5000},
-    "FLASK_DEBUG": {"type": "bool", "default": False},
+    "LLAMA_PROMPT_TEMPLATE": {"type": "str", "default": config.LLAMA_PROMPT_TEMPLATE},
+    "LLAMA_N_GPU_LAYERS": {"type": "int", "default": config.LLAMA_CPP_PARAMS["n_gpu_layers"]},
+    "LLAMA_N_BATCH": {"type": "int", "default": config.LLAMA_CPP_PARAMS["n_batch"]},
+    "LLAMA_N_THREADS": {"type": "int", "default": config.LLAMA_CPP_PARAMS["n_threads"]},
+    "LLAMA_F16_KV": {"type": "bool", "default": config.LLAMA_CPP_PARAMS["f16_kv"]},
+    "LOCAL_NUM_CTX": {"type": "int", "default": config.LOCAL_MODEL_PARAMS["num_ctx"]},
+    "LOCAL_TEMPERATURE": {"type": "float", "default": config.LOCAL_MODEL_PARAMS["temperature"]},
+    "LOCAL_TOP_P": {"type": "float", "default": config.LOCAL_MODEL_PARAMS["top_p"]},
+    "LOCAL_MAX_TOKENS": {"type": "int", "default": config.LOCAL_MODEL_PARAMS["max_tokens"]},
+    "LOCAL_STRUCTURED_MAX_TOKENS": {
+        "type": "int", "default": config.LOCAL_MODEL_PARAMS["structured_max_tokens"],
+    },
+    "CLOUD_TEMPERATURE": {"type": "float", "default": config.CLOUD_MODEL_PARAMS["temperature"]},
+    "CLOUD_TOP_P": {"type": "float", "default": config.CLOUD_MODEL_PARAMS["top_p"]},
+    "CLOUD_MAX_TOKENS": {"type": "int", "default": config.CLOUD_MODEL_PARAMS["max_tokens"]},
+    "GROQ_MIN_REQUEST_INTERVAL": {"type": "float", "default": config.GROQ_MIN_REQUEST_INTERVAL},
+    "GROQ_RATE_LIMIT_BUFFER": {"type": "float", "default": config.GROQ_RATE_LIMIT_BUFFER},
+    "GROQ_ROTATE_ON_RATE_LIMIT": {"type": "bool", "default": config.GROQ_ROTATE_ON_RATE_LIMIT},
+    "GROQ_CONTINUATION_ATTEMPTS": {"type": "int", "default": config.GROQ_CONTINUATION_ATTEMPTS},
+    "GROQ_TPM_LIMIT": {"type": "int", "default": config.GROQ_TPM_LIMIT},
+    "GROQ_TPM_WINDOW_SECONDS": {"type": "float", "default": config.GROQ_TPM_WINDOW_SECONDS},
+    "GROQ_TPM_SAFETY_MARGIN": {"type": "float", "default": config.GROQ_TPM_SAFETY_MARGIN},
+    "GROQ_TPM_RESERVE_DEFAULT": {"type": "int", "default": config.GROQ_TPM_RESERVE_DEFAULT},
+    "GROQ_TPM_PACING": {"type": "bool", "default": config.GROQ_TPM_PACING},
+    "GROQ_PROACTIVE_ROTATION": {"type": "bool", "default": config.GROQ_PROACTIVE_ROTATION},
+    "HYBRID_ROUTING": {"type": "bool", "default": config.HYBRID_ROUTING},
+    "RETRY_BASE_DELAY": {"type": "float", "default": config.RETRY_BASE_DELAY},
+    "RETRY_MAX_DELAY": {"type": "float", "default": config.RETRY_MAX_DELAY},
+    "RETRY_BACKOFF_FACTOR": {"type": "float", "default": config.RETRY_BACKOFF_FACTOR},
+    "WORDS_PER_SCENE_MIN": {"type": "int", "default": config.WORDS_PER_SCENE_MIN},
+    "WORDS_PER_SCENE_MAX": {"type": "int", "default": config.WORDS_PER_SCENE_MAX},
+    "MIN_SCENE_WORDS": {"type": "int", "default": config.MIN_SCENE_WORDS},
+    "MAX_SCENE_ITERATIONS": {"type": "int", "default": config.MAX_SCENE_ITERATIONS},
+    "BEST_OF_N_KEY_SCENES": {"type": "int", "default": config.BEST_OF_N_KEY_SCENES},
+    "BEST_OF_N_NORMAL_SCENES": {"type": "int", "default": config.BEST_OF_N_NORMAL_SCENES},
+    "MAX_PIPELINE_STEPS": {"type": "int", "default": config.MAX_PIPELINE_STEPS},
+    "MAX_TOKEN_BUDGET": {"type": "int", "default": config.MAX_TOKEN_BUDGET},
+    "TOP_K_RETRIEVAL": {"type": "int", "default": config.TOP_K_RETRIEVAL},
+    "CONTEXT_TOKEN_BUDGET": {"type": "int", "default": config.CONTEXT_TOKEN_BUDGET},
+    "SSE_QUEUE_MAXSIZE": {"type": "int", "default": config.SSE_QUEUE_MAXSIZE},
+    "FLASK_HOST": {"type": "str", "default": config.FLASK_HOST},
+    "FLASK_PORT": {"type": "int", "default": config.FLASK_PORT},
+    "FLASK_DEBUG": {"type": "bool", "default": config.FLASK_DEBUG},
 }
 
 
@@ -194,20 +210,32 @@ def _queue_event(eq: queue.Queue, message: dict, force: bool = False) -> bool:
             return False
 
 
+def _is_groq_selection(selected: str) -> bool:
+    """Return True if the model selection string refers to Groq (generic or specific)."""
+    return selected == _GROQ_MODEL_OPTION or selected.startswith("groq:")
+
+
+def _groq_model_from_selection(selected: str) -> str:
+    """Extract the Groq model ID from a selection string."""
+    if selected.startswith("groq:"):
+        return selected.split(":", 1)[1]
+    return config.GROQ_MODEL
+
+
 def _active_model_selection() -> str:
     if _selected_backend == "gemini":
         return _GEMINI_MODEL_OPTION
     if _selected_backend == "openrouter":
         return _OPENROUTER_MODEL_OPTION
-    return _GROQ_MODEL_OPTION if _selected_backend == "groq" else to_model_id(_selected_local_model_path)
+    return f"groq:{config.GROQ_MODEL}" if _selected_backend == "groq" else to_model_id(_selected_local_model_path)
 
 
 def _get_llm_for_premise(requested_model=None):
     selected = (requested_model or "").strip() or _active_model_selection()
-    if selected == _GROQ_MODEL_OPTION:
+    if _is_groq_selection(selected):
         if not config.GROQ_API_KEY:
             raise RuntimeError("GROQ_API_KEY not set. Add it to .env before using Groq.")
-        return GroqModel(model=config.GROQ_MODEL)
+        return GroqModel(model=_groq_model_from_selection(selected))
     if selected == _GEMINI_MODEL_OPTION:
         if not config.GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY not set. Add it to .env before using Gemini.")
@@ -312,8 +340,12 @@ def _write_env_values(updates: dict) -> None:
         for key in missing:
             out.append(f"{key}={_setting_to_env(updates[key])}\n")
 
-    with open(_ENV_PATH, "w", encoding="utf-8") as f:
+    # Atomic replace: this file holds API keys, so a crash mid-write must
+    # never leave a truncated .env behind.
+    tmp_path = _ENV_PATH + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.writelines(out)
+    os.replace(tmp_path, _ENV_PATH)
 
 
 def _apply_runtime_settings(settings: dict) -> None:
@@ -376,6 +408,8 @@ def _apply_runtime_settings(settings: dict) -> None:
         "WORDS_PER_SCENE_MAX",
         "MIN_SCENE_WORDS",
         "MAX_SCENE_ITERATIONS",
+        "BEST_OF_N_KEY_SCENES",
+        "BEST_OF_N_NORMAL_SCENES",
         "MAX_PIPELINE_STEPS",
         "MAX_TOKEN_BUDGET",
         "TOP_K_RETRIEVAL",
@@ -423,6 +457,8 @@ def _settings_payload() -> dict:
     return {
         "settings": public_values,
         "local_models": _list_local_models(),
+        "groq_models": config.GROQ_MODELS,
+        "cloud_options": [_GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION, _OPENROUTER_MODEL_OPTION],
         "active_model": _active_model_selection(),
         "backend_mode": _active_generation_mode(),
         "env_path": _ENV_PATH,
@@ -439,10 +475,10 @@ def create_app():
         pipeline_kwargs = {"local_model": _selected_local_model_path}
         selected = (requested_model or "").strip() or _active_model_selection()
 
-        if selected == _GROQ_MODEL_OPTION:
+        if _is_groq_selection(selected):
             if not config.GROQ_API_KEY:
                 return None, jsonify({"error": "GROQ_API_KEY not set. Add it to .env before using Groq."}), 400
-            pipeline_kwargs.update({"backend": "groq", "groq_model": config.GROQ_MODEL})
+            pipeline_kwargs.update({"backend": "groq", "groq_model": _groq_model_from_selection(selected)})
             _selected_backend = "groq"
             return pipeline_kwargs, None, None
 
@@ -520,13 +556,23 @@ def create_app():
             return jsonify({"error": "Invalid setting value", "details": errors}), 400
 
         selected_model = str(raw_settings.get("ACTIVE_MODEL", "") or "").strip()
-        if selected_model and selected_model not in {_GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION, _OPENROUTER_MODEL_OPTION} and mode not in {"groq", "gemini", "openrouter"}:
+        _cloud_ids = {_GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION, _OPENROUTER_MODEL_OPTION}
+        is_cloud = selected_model in _cloud_ids or selected_model.startswith("groq:") or selected_model.startswith("gemini:") or selected_model.startswith("openrouter:")
+        if selected_model and not is_cloud and mode not in {"groq", "gemini", "openrouter"}:
             resolved = resolve_model_path(selected_model)
             if not resolved.lower().endswith(".gguf"):
                 return jsonify({"error": "ACTIVE_MODEL must be a .gguf local model, Groq API, Gemini API, or OpenRouter API"}), 400
             if not os.path.isfile(resolved):
                 return jsonify({"error": f"Model file not found: {resolved}"}), 400
             updates["LLAMA_MODEL_PATH"] = resolved
+        elif selected_model and selected_model.startswith("groq:"):
+            # A specific Groq model was picked via the model dropdown — apply and
+            # persist it (overrides the plain GROQ_MODEL form field, if present).
+            updates["GROQ_MODEL"] = _groq_model_from_selection(selected_model)
+        elif selected_model and selected_model.startswith("gemini:"):
+            updates["GEMINI_MODEL"] = selected_model.split(":", 1)[1]
+        elif selected_model and selected_model.startswith("openrouter:"):
+            updates["OPENROUTER_MODEL"] = selected_model.split(":", 1)[1]
         elif mode not in {"groq", "gemini", "openrouter"} and "LLAMA_MODEL_PATH" in updates and updates["LLAMA_MODEL_PATH"]:
             resolved = resolve_model_path(updates["LLAMA_MODEL_PATH"])
             if not resolved.lower().endswith(".gguf"):
@@ -570,20 +616,26 @@ def create_app():
             _selected_backend = "local"
 
         available_models = [*models, _GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION, _OPENROUTER_MODEL_OPTION]
+        # Also expose individual Groq models in the list so the UI can show a dropdown
+        groq_model_ids = [f"groq:{m['id']}" for m in config.GROQ_MODELS]
+        available_models.extend(groq_model_ids)
+
         active = _active_model_selection()
         if active not in available_models:
             if models:
                 _selected_backend = "local"
                 _selected_local_model_path = resolve_model_path(models[0])
                 active = to_model_id(_selected_local_model_path)
+            elif _selected_backend == "groq":
+                active = f"groq:{config.GROQ_MODEL}"
             else:
-                _selected_backend = "groq"
                 active = _GROQ_MODEL_OPTION
 
         return jsonify({
             "models": available_models,
             "active": active,
             "groq_model": config.GROQ_MODEL,
+            "groq_models": config.GROQ_MODELS,
             "gemini_model": config.GEMINI_MODEL,
             "openrouter_model": config.OPENROUTER_MODEL,
             "backend_mode": _active_generation_mode(),
@@ -598,23 +650,25 @@ def create_app():
         if not model:
             return jsonify({"error": "No model specified"}), 400
 
-        if model == _GROQ_MODEL_OPTION:
+        if model == _GROQ_MODEL_OPTION or model.startswith("groq:"):
             if not config.GROQ_API_KEY:
                 return jsonify({
                     "error": "GROQ_API_KEY not set. Add it to .env before selecting Groq.",
                 }), 400
-            groq = GroqModel(model=config.GROQ_MODEL)
+            groq_model = _groq_model_from_selection(model)
+            groq = GroqModel(model=groq_model)
             if not groq.is_available():
                 return jsonify({
-                    "error": "Groq API is unavailable right now. Check internet and API key.",
+                    "error": f"Groq API model '{groq_model}' is unavailable right now. Check internet and API key.",
                 }), 400
             _selected_backend = "groq"
-            logger.info("Switched backend to Groq API (%s)", config.GROQ_MODEL)
+            config.GROQ_MODEL = groq_model
+            logger.info("Switched backend to Groq API (%s)", groq_model)
             return jsonify({
                 "status": "ok",
-                "active": _GROQ_MODEL_OPTION,
+                "active": f"groq:{groq_model}",
                 "provider": "groq",
-                "groq_model": config.GROQ_MODEL,
+                "groq_model": groq_model,
             })
 
         if model == _GEMINI_MODEL_OPTION:
@@ -1058,6 +1112,10 @@ def create_app():
         with _generation_lock:
             if name in _active_pipelines:
                 return jsonify({"error": "Generation already active"}), 409
+            # Reserve the slot synchronously. The real pipeline is built in a
+            # worker thread; without a placeholder two rapid requests could
+            # both pass the check above and generate concurrently.
+            _active_pipelines[name] = None
             _cancel_requests.discard(name)
             eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
             _event_queues[name] = eq
@@ -1076,8 +1134,9 @@ def create_app():
                 )
                 pipeline.load_project()
                 with _generation_lock:
-                    _active_pipelines[name] = pipeline
                     cancel_requested = name in _cancel_requests
+                    if not cancel_requested:
+                        _active_pipelines[name] = pipeline
                 if cancel_requested:
                     _queue_event(eq, _normalize_event("done", {
                         "status": "cancelled",
@@ -1090,6 +1149,11 @@ def create_app():
                 else:
                     result = pipeline.generate_chapter(pacing=pacing)
                     _queue_event(eq, _normalize_event("done", result), force=True)
+            except PipelineCancelledError:
+                _queue_event(eq, _normalize_event("done", {
+                    "status": "cancelled",
+                    "message": "Generation cancelled by user.",
+                }), force=True)
             except Exception as e:
                 _queue_event(eq, _normalize_event("error", {"error": str(e)}), force=True)
             finally:
@@ -1133,6 +1197,8 @@ def create_app():
         with _generation_lock:
             if name in _active_pipelines:
                 return jsonify({"error": "Generation already active"}), 409
+            # Reserve the slot synchronously (same rationale as start_generation).
+            _active_pipelines[name] = None
             _cancel_requests.discard(name)
             eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
             _event_queues[name] = eq
@@ -1153,8 +1219,9 @@ def create_app():
                 )
                 pipeline.load_project()
                 with _generation_lock:
-                    _active_pipelines[name] = pipeline
                     cancel_requested = name in _cancel_requests
+                    if not cancel_requested:
+                        _active_pipelines[name] = pipeline
                 if cancel_requested:
                     _queue_event(eq, _normalize_event("done", {
                         "status": "cancelled",
@@ -1167,6 +1234,11 @@ def create_app():
                     pacing=pacing,
                 )
                 _queue_event(eq, _normalize_event("done", result), force=True)
+            except PipelineCancelledError:
+                _queue_event(eq, _normalize_event("done", {
+                    "status": "cancelled",
+                    "message": "Generation cancelled by user.",
+                }), force=True)
             except Exception as e:
                 _queue_event(eq, _normalize_event("error", {"error": str(e)}), force=True)
             finally:
@@ -1200,6 +1272,9 @@ def create_app():
                 return jsonify({"error": "A manual session is already active for this project"}), 409
             if name in _active_pipelines:
                 return jsonify({"error": "Generation already active"}), 409
+            # Reserve synchronously: pipeline construction below is slow and
+            # must not let a second request slip past this check.
+            _manual_sessions[name] = None
 
         try:
             eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
@@ -1231,6 +1306,10 @@ def create_app():
                 "chapter_title": session["chapter_title"],
             })
         except Exception as e:
+            with _generation_lock:
+                # Release the reservation; keep a fully registered session.
+                if _manual_sessions.get(name) is None:
+                    _manual_sessions.pop(name, None)
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/project/<name>/generate/manual/scene", methods=["POST"])
@@ -1265,6 +1344,13 @@ def create_app():
                     scene_brief=scene_brief,
                 )
                 _queue_event(eq, _normalize_event("manual_scene_done", result), force=True)
+            except PipelineCancelledError:
+                _queue_event(eq, _normalize_event("manual_scene_done", {
+                    "status": "cancelled",
+                    "scene_number": session.get("scene_counter", 0) + 1,
+                    "scenes_completed": session.get("scene_counter", 0),
+                    "completed_scenes": session.get("completed_scenes", []),
+                }), force=True)
             except Exception as e:
                 _queue_event(eq, _normalize_event("manual_scene_done", {
                     "status": "error",
@@ -1342,18 +1428,24 @@ def create_app():
         with _generation_lock:
             if name in _active_pipelines:
                 return jsonify({"error": "Generation in progress"}), 409
-            
-            try:
-                eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
+            if name in _manual_sessions:
+                return jsonify({"error": "A manual session is already active for this project"}), 409
+            # Reserve synchronously; construction happens outside the lock so
+            # model init doesn't stall every other generation endpoint.
+            _manual_sessions[name] = None
 
-                def progress_cb(event, data=None, **kwargs):
-                    msg = _normalize_event(event, data)
-                    if not _queue_event(eq, msg):
-                        logger.warning(f"SSE queue full for manual session '{name}'.")
+        try:
+            eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
 
-                pipeline = PipelineOrchestrator(name, progress_cb, **_current_pipeline_kwargs())
-                session = pipeline.resume_manual_chapter(num)
-                
+            def progress_cb(event, data=None, **kwargs):
+                msg = _normalize_event(event, data)
+                if not _queue_event(eq, msg):
+                    logger.warning(f"SSE queue full for manual session '{name}'.")
+
+            pipeline = PipelineOrchestrator(name, progress_cb, **_current_pipeline_kwargs())
+            session = pipeline.resume_manual_chapter(num)
+
+            with _generation_lock:
                 _manual_sessions[name] = {
                     "pipeline": pipeline,
                     "session": session,
@@ -1361,18 +1453,21 @@ def create_app():
                     "progress_cb": progress_cb,
                 }
                 _event_queues[name] = eq
-                
-                return jsonify({
-                    "status": "resumed",
-                    "chapter_num": session["chapter_num"],
-                    "chapter_title": session["chapter_title"],
-                    "scenes_completed": session["scene_counter"],
-                    "completed_scenes": session["completed_scenes"]
-                })
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                return jsonify({"error": str(e)}), 500
+
+            return jsonify({
+                "status": "resumed",
+                "chapter_num": session["chapter_num"],
+                "chapter_title": session["chapter_title"],
+                "scenes_completed": session["scene_counter"],
+                "completed_scenes": session["completed_scenes"]
+            })
+        except Exception as e:
+            with _generation_lock:
+                # Release the reservation; keep a fully registered session.
+                if _manual_sessions.get(name) is None:
+                    _manual_sessions.pop(name, None)
+            logger.error("Failed to resume chapter %s for '%s'", num, name, exc_info=True)
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/project/<name>/generate/manual/finish", methods=["POST"])
     def finish_manual_chapter_api(name):
@@ -1545,10 +1640,13 @@ def create_app():
 
         data = request.json or {}
         requested_model = data.get("model")
+        mode = data.get("mode", "polish")
 
         with _generation_lock:
             if name in _active_combines:
                 return jsonify({"error": "Combine already in progress"}), 409
+            # Claim synchronously so concurrent requests can't double-start.
+            _active_combines[name] = True
             eq = queue.Queue(maxsize=100)
             _combine_queues[name] = eq
             _combine_cancel_requests.discard(name)
@@ -1559,9 +1657,6 @@ def create_app():
 
         def run_combine():
             try:
-                with _generation_lock:
-                    _active_combines[name] = True
-
                 pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
                 pipeline.load_project()
                 state = pipeline.get_state()
@@ -1585,7 +1680,13 @@ def create_app():
                 _queue_event(eq, _normalize_event("combine_status", {
                     "step": "Combining chapters into a single document...",
                 }))
-                combined = combine_chapters(chapters_dir, metadata)
+                combined = ""
+                try:
+                    combined = combine_chapters(chapters_dir, metadata)
+                except RuntimeError:
+                    if mode != "whole":
+                        raise
+                    combined = ""
 
                 # Save original combined file
                 original_path = os.path.join(output_dir, "combined_original.md")
@@ -1596,15 +1697,23 @@ def create_app():
                     "step": f"Combined {len(combined)} characters. Sending to Gemini...",
                 }))
 
-                # Step 2: Analyze and polish with Gemini
+                # Step 2: Analyze and polish with Gemini, or generate the whole
+                # story in a single call.
                 # Pass the premise and full state so Gemini can use canonical
-                # character/world data as ground truth during polish
+                # character/world data as ground truth.
                 story_premise = metadata.get("premise", "")
-                result = analyze_and_polish(
-                    combined, progress_cb, premise=story_premise, model_name=requested_model,
-                    is_cancelled=lambda: name in _combine_cancel_requests,
-                    state=state,
-                )
+                if mode == "whole":
+                    result = generate_whole_story(
+                        combined, progress_cb, premise=story_premise, model_name=requested_model,
+                        is_cancelled=lambda: name in _combine_cancel_requests,
+                        state=state,
+                    )
+                else:
+                    result = analyze_and_polish(
+                        combined, progress_cb, premise=story_premise, model_name=requested_model,
+                        is_cancelled=lambda: name in _combine_cancel_requests,
+                        state=state,
+                    )
 
                 # Save polished file
                 polished_path = os.path.join(output_dir, "combined_polished.md")
@@ -2022,6 +2131,39 @@ def create_app():
         except Exception as e:
             return jsonify({"error": str(e)}), 500
 
+    @app.route("/api/project/<name>/export/download", methods=["GET"])
+    def download_export(name):
+        """
+        Download a file produced by /export-story.
+        Query: ?file=<basename> — restricted to .md/.txt/.epub inside the project dir.
+        """
+        name = normalize_project_name(name)
+        file_name = request.args.get("file", "")
+        # Only bare filenames, no traversal
+        if not file_name or os.path.basename(file_name) != file_name:
+            return jsonify({"error": "Invalid file name"}), 400
+        if not file_name.lower().endswith((".md", ".txt", ".epub")):
+            return jsonify({"error": "Invalid file type"}), 400
+
+        project_dir = os.path.join(config.PROJECTS_DIR, name)
+        path = os.path.join(project_dir, file_name)
+        if not os.path.isfile(path):
+            return jsonify({"error": "File not found. Run the export first."}), 404
+
+        mimetypes = {
+            ".md": "text/markdown",
+            ".txt": "text/plain",
+            ".epub": "application/epub+zip",
+        }
+        ext = file_name.lower().rsplit(".", 1)[-1]
+        with open(path, "rb") as f:
+            content = f.read()
+        return Response(
+            content,
+            mimetype=mimetypes[f".{ext}"],
+            headers={"Content-Disposition": f"attachment; filename={file_name}"},
+        )
+
     # ─── Phase 3: Scene Quality Score API ──────────────────────────────
     @app.route("/api/project/<name>/score-scene", methods=["POST"])
     def score_scene(name):
@@ -2047,6 +2189,115 @@ def create_app():
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+
+    # ─── Phase C: Branch Options API ───────────────────────────────────
+    @app.route("/api/project/<name>/branch-options", methods=["POST"])
+    def branch_options(name):
+        """
+        Propose distinct directions for the NEXT chapter.
+        Body: {"count": 3, "direction_hint": "..."} (both optional)
+        """
+        name = normalize_project_name(name)
+        data = request.json or {}
+        count = int(data.get("count", 3))
+        direction_hint = str(data.get("direction_hint", "") or "")
+        try:
+            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline.load_project()
+            result = pipeline.generate_branch_options(
+                count=count,
+                direction_hint=direction_hint,
+            )
+            code = 200 if result.get("status") == "ok" else 502
+            return jsonify(result), code
+        except Exception as e:
+            logger.exception("Error in branch_options")
+            return jsonify({"error": str(e)}), 500
+
+    # ─── Phase C: Continuity Report API ────────────────────────────────
+    @app.route("/api/project/<name>/continuity", methods=["GET"])
+    def continuity_report(name):
+        """
+        Deterministic continuity overview: threads, seeds, characters,
+        motifs, and warnings. No LLM involved.
+        """
+        name = normalize_project_name(name)
+        try:
+            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline.load_project()
+            return jsonify(pipeline.continuity_report())
+        except Exception as e:
+            logger.exception("Error in continuity_report")
+            return jsonify({"error": str(e)}), 500
+
+    # ─── Phase C: Manual Scene Regeneration API ────────────────────────
+    @app.route("/api/project/<name>/generate/manual/scene/<int:index>/regenerate", methods=["POST"])
+    def regenerate_manual_scene_api(name, index):
+        """
+        Delete the last scene of the active manual session and regenerate it.
+        Body: {"scene_brief": "..."} (optional — falls back to the original plan)
+        Streams results via the manual_scene_done SSE event, like /manual/scene.
+        """
+        name = normalize_project_name(name)
+        data = request.json or {}
+        scene_brief = str(data.get("scene_brief", "") or "").strip()
+
+        with _generation_lock:
+            ms = _manual_sessions.get(name)
+            if not ms:
+                return jsonify({"error": "No active manual session. Call /manual/start first."}), 404
+            if name in _active_pipelines:
+                return jsonify({"error": "A scene is currently being generated. Wait for it to finish."}), 409
+
+            pipeline = ms["pipeline"]
+            session = ms["session"]
+            eq = ms["eq"]
+
+            try:
+                recovered_brief = pipeline.prepare_manual_scene_regeneration(
+                    session, index, scene_brief=scene_brief,
+                )
+            except (IndexError, ValueError) as e:
+                return jsonify({"error": str(e)}), 400
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                return jsonify({"error": str(e)}), 500
+
+            _cancel_requests.discard(name)
+            _active_pipelines[name] = pipeline
+
+        def run_scene():
+            try:
+                result = pipeline.generate_manual_scene(
+                    session=session,
+                    scene_brief=recovered_brief,
+                )
+                _queue_event(eq, _normalize_event("manual_scene_done", result), force=True)
+            except PipelineCancelledError:
+                _queue_event(eq, _normalize_event("manual_scene_done", {
+                    "status": "cancelled",
+                    "scene_number": session.get("scene_counter", 0) + 1,
+                    "scenes_completed": session.get("scene_counter", 0),
+                    "completed_scenes": session.get("completed_scenes", []),
+                }), force=True)
+            except Exception as e:
+                _queue_event(eq, _normalize_event("manual_scene_done", {
+                    "status": "error",
+                    "error": str(e),
+                    "scene_number": session.get("scene_counter", 0) + 1,
+                    "scenes_completed": session.get("scene_counter", 0),
+                    "completed_scenes": session.get("completed_scenes", []),
+                }), force=True)
+            finally:
+                with _generation_lock:
+                    _active_pipelines.pop(name, None)
+
+        thread = threading.Thread(target=run_scene, daemon=True)
+        thread.start()
+
+        scene_number = session["scene_counter"] + 1
+        return jsonify({"status": "started", "scene_number": scene_number})
 
     return app
 

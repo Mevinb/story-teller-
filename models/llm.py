@@ -254,6 +254,7 @@ class LlamaCPP(LLMInterface):
                 raw=None,
             )
 
+        self._raise_if_cancelled()
         kwargs = self._build_generation_kwargs(
             prompt=prompt,
             system=system,
@@ -319,6 +320,7 @@ class LlamaCPP(LLMInterface):
         with self.inference_lock:
             stream = self.llm(**kwargs)
             for chunk in stream:
+                self._raise_if_cancelled()
                 choices = chunk.get("choices") or []
                 if not choices:
                     continue

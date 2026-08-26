@@ -19,4 +19,4 @@ export HF_HUB_DISABLE_SYMLINKS_WARNING=1
 export DISABLE_TQDM=1
 export TQDM_DISABLE=1
 
-exec ./venv/bin/gunicorn --worker-class gthread --threads 8 --workers 1 --bind 127.0.0.1:5000 app:app
+exec ./venv/bin/python -m gunicorn --worker-class gthread --threads 8 --workers 1 --bind 127.0.0.1:5000 app:app

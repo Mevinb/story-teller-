@@ -292,6 +292,9 @@ These steps ARE the plot of this chapter. Your key_events MUST be these steps re
 === ALREADY COVERED IN PREVIOUS CHAPTERS — DO NOT REPEAT ===
 {completed_steps}
 
+=== UPCOMING STEPS (do NOT cover yet — plant seeds toward these) ===
+{upcoming_steps}
+
 === ORIGINAL FULL PREMISE (for reference only) ===
 {premise}
 
@@ -316,6 +319,7 @@ Rules:
 - Do NOT invent events outside the mandatory steps
 - Do NOT repeat any ALREADY COVERED steps
 - Do NOT skip ahead to premise steps beyond the mandatory window
+- Foreshadow: where a mandatory step naturally hints at an UPCOMING STEP, plant a small clue (an object, a line of dialogue, a passing detail) via new_threads_to_introduce
 - Treat the LAST WRITTEN ENDING in story context as hard continuity
 - If a step requires a location change, include that transition in the key event's phrasing
 - Keep the protagonist or active main character involved
@@ -337,7 +341,7 @@ Respond with this exact JSON structure:
     "tone": "The emotional tone",
     "estimated_scenes": {scene_count},
     "unresolved_threads_to_address": ["Thread to resolve or advance"],
-    "new_threads_to_introduce": []
+    "new_threads_to_introduce": ["0-2 optional seeds/clues pointing at the UPCOMING STEPS"]
 }}"""
 
 PLAN_CHAPTER_CONTINUE_COMPACT = """Plan chapter {chapter_num}.
@@ -347,6 +351,9 @@ MANDATORY STEPS FOR THIS CHAPTER (your key_events MUST be these, in order):
 
 Already covered (DO NOT repeat):
 {completed_steps}
+
+Upcoming (do NOT cover yet; plant small seeds toward them):
+{upcoming_steps}
 
 Premise (reference only):
 {premise}
@@ -541,6 +548,16 @@ class StoryArchitect(AgentContract):
                 f"  {i + 1}. {step}" for i, step in enumerate(prior_steps[-6:])
             ) or "  None yet."
 
+            # Upcoming steps (after this window) — roadmap for foreshadowing
+            if all_steps:
+                look_ahead = 3
+                upcoming = all_steps[hi:hi + look_ahead]
+            else:
+                upcoming = []
+            upcoming_steps_text = "\n".join(
+                f"  {i + 1}. {step}" for i, step in enumerate(upcoming)
+            ) or "  (Final stretch — steer toward a satisfying convergence)"
+
             template = PLAN_CHAPTER_CONTINUE_COMPACT if self._compact_mode else PLAN_CHAPTER_CONTINUE
             prompt = position_block + template.format(
                 chapter_num=chapter_num,
@@ -553,6 +570,7 @@ class StoryArchitect(AgentContract):
                 scene_count=scene_count,
                 required_steps=required_steps_text,
                 completed_steps=completed_steps_text,
+                upcoming_steps=upcoming_steps_text,
             )
 
         schema = {

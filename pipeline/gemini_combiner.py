@@ -26,6 +26,31 @@ import config
 
 logger = logging.getLogger(__name__)
 
+_MODELS_WITHOUT_SAMPLING_PARAMS = ("gemini-3.6-flash", "gemini-3.5-flash-lite")
+
+
+def _model_supports_sampling_params(model: str) -> bool:
+    """Gemini 3.6 Flash and 3.5 Flash-Lite ignore temperature/top_p/top_k."""
+    if not model:
+        return True
+    return not any(model.startswith(prefix) for prefix in _MODELS_WITHOUT_SAMPLING_PARAMS)
+
+
+def _sanitize_generate_config(model: str, config_obj):
+    """Rebuild a GenerateContentConfig without sampling params for models that reject them."""
+    if config_obj is None or _model_supports_sampling_params(model):
+        return config_obj
+    kwargs = {}
+    if getattr(config_obj, "system_instruction", None) is not None:
+        kwargs["system_instruction"] = config_obj.system_instruction
+    if getattr(config_obj, "response_mime_type", None) is not None:
+        kwargs["response_mime_type"] = config_obj.response_mime_type
+    if getattr(config_obj, "response_schema", None) is not None:
+        kwargs["response_schema"] = config_obj.response_schema
+    if getattr(config_obj, "max_output_tokens", None) is not None:
+        kwargs["max_output_tokens"] = config_obj.max_output_tokens
+    return types.GenerateContentConfig(**kwargs) if kwargs else None
+
 
 # ── Cached Embedder Singleton ─────────────────────────────────────────
 @lru_cache(maxsize=1)
@@ -82,7 +107,8 @@ def _generate_content_with_retry(client: genai.Client, model: str, contents, con
         if is_cancelled and is_cancelled():
             raise RuntimeError("Cancellation requested by user")
         try:
-            return client.models.generate_content(model=model, contents=contents, config=config)
+            sanitized_config = _sanitize_generate_config(model, config)
+            return client.models.generate_content(model=model, contents=contents, config=sanitized_config)
         except Exception as e:
             err_str = str(e)
             is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()
@@ -764,7 +790,7 @@ def analyze_and_polish(
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not set.")
 
-    model_name = model_name or config.GEMINI_MODEL or "gemini-2.5-flash-lite"
+    model_name = model_name or config.GEMINI_MODEL or "gemini-3.1-flash-lite"
     client = genai.Client(api_key=api_key)
 
     # Build canonical story digest for polish prompt injection
@@ -1145,4 +1171,163 @@ CRITICAL RULES:
         "model": model_name,
         "provenance": provenance,
         "confidence_scores": confidence_scores,
+    }
+
+
+def generate_whole_story(
+    story_text: str = "",
+    progress_cb: Optional[Callable] = None,
+    premise: str = "",
+    model_name: Optional[str] = None,
+    is_cancelled: Optional[Callable[[], bool]] = None,
+    state: Optional[dict] = None,
+    max_output_tokens: int = 16384,
+) -> dict:
+    """
+    One-shot whole-story generation with a single Gemini call.
+
+    Gemini has a large context window, so the multi-agent pipeline is not
+    needed here. We hand the model the complete story bible (premise steps,
+    canonical characters/world/rules, timeline) plus any already-written
+    chapters and ask it to write the entire story in one go.
+
+    Args:
+        story_text: Existing chapter text (optional). "" means write from scratch.
+        progress_cb: SSE progress callback.
+        premise: Master premise text.
+        model_name: Gemini model to use.
+        is_cancelled: Cancellation check callable.
+        state: Full state.json dict for canonical facts injection.
+        max_output_tokens: Output token budget for the single call.
+    """
+    api_key = config.GEMINI_API_KEY
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    model_name = model_name or config.GEMINI_MODEL or "gemini-3.1-flash-lite"
+    client = genai.Client(api_key=api_key)
+
+    # Build canonical story facts for prompt injection
+    story_digest = _build_story_digest(state or {}, max_chars=6000)
+
+    premise_steps = _extract_premise_steps(premise)
+    steps_block = _format_step_list("MASTER PREMISE STEPS", premise_steps)
+
+    def _emit(msg: str):
+        if progress_cb:
+            progress_cb("combine_status", {"step": msg})
+
+    def _check_cancelled():
+        if is_cancelled and is_cancelled():
+            raise RuntimeError("Cancellation requested by user")
+
+    _emit("Building one-shot generation prompt from premise + story bible...")
+    _check_cancelled()
+
+    existing_block = story_text.strip()
+    if existing_block:
+        existing_section = f"""EXISTING CHAPTERS (already written — CONTINUE from these, do NOT discard or rewrite them, but finish the whole story through to the end):
+{existing_block}
+"""
+    else:
+        existing_section = "There are NO existing chapters yet. Write the complete story from scratch."
+
+    prompt = f"""You are the master author of a fully-realized, long-form mature romance/erotica novel.
+
+Write the ENTIRE story in one response, from the opening scene through the final resolution, covering every step in the MASTER PREMISE STEPS in chronological order.
+
+STORY BIBLE (canonical facts — source of truth, never contradict):
+{story_digest or "(No additional world data available.)"}
+
+{steps_block}
+
+{existing_section}
+
+CRITICAL RULES:
+- Structure the output with markdown chapter headings: "## Chapter 1", "## Chapter 2", etc. Chapters should be substantial (at least 1500-2500 words each unless the premise is short).
+- Write with GROUNDED REALISM. Avoid abstract, floral AI-isms. Banned words (only allowed in a strictly literal sense): shiver, testament, dance, intertwine, symphony, beacon, crescendo, tapestry, gaze, whisper, silhouette, labyrinthine, sanctuary.
+- NEVER skip, summarize, or fade-to-black the explicit intimate scenes. When characters are together, write the entire act from start to finish in full explicit detail.
+- Keep character names, spellings, ages, relationships, and world rules EXACTLY as given in the STORY BIBLE.
+- Respect timelines: characters cannot appear before they exist; babies/toddlers must be written age-appropriately.
+- Do NOT duplicate scenes. Maintain continuity and escalating tension across chapters.
+- Every premise step MUST be covered. Write the complete arc — setup, rising action, climax, resolution.
+
+Return ONLY the complete story text. No preamble, no notes, no commentary outside the story."""
+    try:
+        config_obj = types.GenerateContentConfig(
+            max_output_tokens=max_output_tokens,
+        )
+        _emit(f"Calling {model_name} to write the entire story in one pass...")
+        response = _generate_content_with_retry(
+            client=client,
+            model=model_name,
+            contents=prompt,
+            config=config_obj,
+            is_cancelled=is_cancelled,
+        )
+    except Exception as e:
+        logger.error(f"One-shot whole-story generation failed: {e}", exc_info=True)
+        raise RuntimeError(f"One-shot whole-story generation failed: {e}") from e
+
+    _check_cancelled()
+    raw_text = response.text or ""
+    if not raw_text.strip():
+        raise RuntimeError("Gemini returned an empty response for whole-story generation.")
+
+    # Post-processing
+    _emit("Applying post-processing (deduplication & resequencing)...")
+    deduped_text = _dedup_paragraphs(raw_text, similarity_threshold=0.90)
+    final_text = _preserve_length_or_fallback(
+        deduped_text,
+        raw_text,
+        "Whole-story deduplication",
+        min_ratio=0.95,
+    )
+    final_text = _resequence_chapter_headers(final_text)
+    final_text = final_text.replace("INSERTED: ", "")
+
+    coverage_gaps = []
+    missing_steps = []
+    try:
+        _emit("Verifying premise coverage...")
+        final_covered, final_missing = _evaluate_coverage_with_gemini(
+            client, model_name, final_text, premise_steps, is_cancelled
+        )
+        coverage_gaps = final_missing
+        missing_steps = final_missing
+    except Exception as e:
+        logger.warning(f"Coverage verification skipped: {e}")
+
+    analysis_report = f"""# One-Shot Whole Story Generation
+
+- **Model:** {model_name}
+- **Premise steps:** {len(premise_steps)}
+- **Output characters:** {len(final_text)}
+- **Coverage gaps:** {len(coverage_gaps)}
+
+{_format_step_list("Coverage gaps", coverage_gaps)}
+
+The story was generated in a single Gemini call using the full story bible as context.
+"""
+
+    _emit("One-shot story generation finished successfully.")
+
+    return {
+        "final_story": final_text,
+        "analysis": analysis_report,
+        "inserted_sections": [],
+        "kept_extra_scenes": [],
+        "removed_scenes": [],
+        "coverage_gaps": coverage_gaps,
+        "model": model_name,
+        "provenance": [
+            {
+                "pass": "one_shot",
+                "input_chars": len(story_text or ""),
+                "output_chars": len(final_text),
+                "changes_summary": "Whole story written in a single Gemini call",
+            }
+        ],
+        "confidence_scores": {},
+        "missing_steps": missing_steps,
     }

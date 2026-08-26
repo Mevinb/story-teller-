@@ -33,16 +33,45 @@ if GROQ_API_KEYS:
     print(f"✅ Loaded {len(GROQ_API_KEYS)} Groq API keys for rotation.")
 else:
     print("⚠️ No Groq API keys found in .env!")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3-32b")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
+
+# ─── Groq Model Catalog ─────────────────────────────────────────────
+# Available text-generation models on Groq (as of 2026).
+# The first entry is the default if GROQ_MODEL is unset.
+GROQ_MODELS = [
+    {"id": "qwen/qwen3.8-27b",        "name": "Qwen 3.8 27B",        "context": "256k", "notes": "Default — strong, fast"},
+    {"id": "qwen/qwen3.6-27b",        "name": "Qwen 3.6 27B",        "context": "256k", "notes": "Previous-gen Qwen"},
+    {"id": "openai/gpt-oss-120b",     "name": "GPT-OSS 120B",        "context": "128k", "notes": "Largest available — best coherence"},
+    {"id": "openai/gpt-oss-20b",      "name": "GPT-OSS 20B",         "context": "128k", "notes": "Lighter OpenAI model"},
+    {"id": "allam-2-7b",              "name": "Allam 2 7B",           "context": "4k",   "notes": "Small — fast but limited"},
+]
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 USE_CLOUD_MODEL = os.getenv("USE_CLOUD_MODEL", "false").lower() in ("1", "true", "yes", "on")
 
+# Free-tier Groq caps tokens/minute at ~6000. Adaptive TPM pacing keeps a
+# rolling 60s token budget (estimated prompt + max output) under this ceiling
+# so we get throttled by pacing instead of 429 storms.
+GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "6000"))
+GROQ_TPM_WINDOW_SECONDS = float(os.getenv("GROQ_TPM_WINDOW_SECONDS", "60"))
+GROQ_TPM_SAFETY_MARGIN = float(os.getenv("GROQ_TPM_SAFETY_MARGIN", "0.15"))
+# Reserve for calls that don't pass max_tokens (avoids reserving full 4096).
+GROQ_TPM_RESERVE_DEFAULT = int(os.getenv("GROQ_TPM_RESERVE_DEFAULT", "1200"))
+GROQ_TPM_PACING = os.getenv("GROQ_TPM_PACING", "true").lower() in ("1", "true", "yes", "on")
+# Preemptively pick the key with the most remaining TPM budget per window,
+# instead of only rotating after a 429.
+GROQ_PROACTIVE_ROTATION = os.getenv("GROQ_PROACTIVE_ROTATION", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+# Route Planner/Critic/Editor/Verifier to a local GGUF and reserve Groq for the
+# Writer. Only activates when a local model is present and loadable.
+HYBRID_ROUTING = os.getenv("HYBRID_ROUTING", "true").lower() in ("1", "true", "yes", "on")
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_TPM_LIMIT = int(os.getenv("GEMINI_TPM_LIMIT", "200000"))
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "cognitivecomputations/dolphin-mistral-24b-venice-edition:free")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MIN_REQUEST_INTERVAL = float(os.getenv("OPENROUTER_MIN_REQUEST_INTERVAL", "1.0"))
 
@@ -105,10 +134,45 @@ MAX_TOKEN_BUDGET = 24000
 # ─── Drift Prevention ───────────────────────────────────────────────
 REANCHOR_EVERY_N_CHAPTERS = 3
 
+# Post-generation verifier (last-line-of-defense drift guard).
+VERIFIER_ENABLED = os.getenv("VERIFIER_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+# Maximum guided-rewrite attempts when the verifier blocks a scene.
+VERIFIER_MAX_RETRIES = int(os.getenv("VERIFIER_MAX_RETRIES", "2"))
+# After this many repeated (same-signature) verifier failures, escalate to review.
+VERIFIER_REVIEW_AFTER = int(os.getenv("VERIFIER_REVIEW_AFTER", "3"))
+# If true, a scene that cannot pass verification hard-stops the chapter instead
+# of continuing with a needs_review flag.
+VERIFIER_HARD_STOP = os.getenv("VERIFIER_HARD_STOP", "false").lower() in ("1", "true", "yes", "on")
+# Run the LLM refinement pass only when a cloud backend is active (cheap local
+# models can produce noisy verifier output). Override with VERIFIER_LLM_ALWAYS=1.
+VERIFIER_LLM_ALWAYS = os.getenv("VERIFIER_LLM_ALWAYS", "false").lower() in ("1", "true", "yes", "on")
+
 # How many premise steps the planner is allowed to cover per chapter.
 # With 100-step premises, 1 step/chapter = 100 chapters (too slow).
 # Set to 3-5 to let the story move forward at a comfortable pace.
 PREMISE_STEPS_PER_CHAPTER = int(os.getenv("PREMISE_STEPS_PER_CHAPTER", "3"))
+
+# ─── Quality Gate & Best-of-N ────────────────────────────────────────
+# Deterministic post-editor quality gate (QualityController.score). When a
+# finished scene scores below the threshold, the pipeline requests ONE guided
+# rewrite with the scorer's issues, then accepts the best effort.
+QUALITY_GATE_ENABLED = os.getenv("QUALITY_GATE_ENABLED", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+QUALITY_GATE_THRESHOLD = float(os.getenv("QUALITY_GATE_THRESHOLD", "0.55"))
+# Candidate drafts per scene. Key scenes = first scene of a chapter, scenes
+# typed "peak", and the final scene. Candidates are generated sequentially so
+# Groq TPM pacing stays intact; each candidate is scored deterministically.
+# Default is 1 (single draft) — each extra candidate is a full LLM scene
+# generation, so raise this only when you want higher quality per scene and
+# are willing to spend extra tokens.
+BEST_OF_N_KEY_SCENES = int(os.getenv("BEST_OF_N_KEY_SCENES", "1"))
+BEST_OF_N_NORMAL_SCENES = int(os.getenv("BEST_OF_N_NORMAL_SCENES", "1"))
+
+# Cloud backends have large context windows — retrieve more story memory for
+# them instead of squeezing continuity to a couple of chunks.
+CLOUD_TOP_K_RETRIEVAL = int(os.getenv("CLOUD_TOP_K_RETRIEVAL", "4"))
+CLOUD_CONTEXT_CHARS = int(os.getenv("CLOUD_CONTEXT_CHARS", "6000"))
 
 # ─── Retry Configuration ────────────────────────────────────────────
 RETRY_BASE_DELAY = 3.0        # seconds

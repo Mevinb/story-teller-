@@ -28,8 +28,10 @@ from agents.consistency import ConsistencyEngine
 from agents.editor import Editor
 from agents.pacing import PacingAgent
 from agents.voice import VoiceAgent
+from agents.verifier import Verifier
 from memory.evolution_engine import evolve_after_scene
 from pipeline.quality_controller import QualityController
+from pipeline.errors import PipelineCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +62,6 @@ _FUTURE_MARKER_TOKEN_STOPWORDS = {
     "thinking", "feeling", "noticing", "realizing", "realises", "realizes",
     "discovering", "discovering", "just", "only", "more", "suddenly",
     "scene", "scenes", "chapter", "story", "event",
-    # Legacy project-specific names kept for backwards compat
-    "sherin", "jomy", "riya",
 }
 
 PIPELINE_GRAPH = {
@@ -78,7 +78,8 @@ SCENE_GRAPH = {
     "writer": ["critic"],
     "critic": ["decision"],
     "decision": ["writer", "editor"],
-    "editor": ["end"],
+    "editor": ["verifier"],
+    "verifier": ["writer", "end"],
 }
 
 MANUAL_SCENE_ENHANCER_SYSTEM = (
@@ -191,6 +192,45 @@ class PipelineOrchestrator:
         self._init_models()
         self._init_memory()
         self._init_agents()
+        self._install_cancel_hooks()
+
+    def _cancel_hook(self) -> bool:
+        """True when either the whole pipeline or the current scene was cancelled."""
+        return self._cancelled or self._scene_cancelled
+
+    def _install_cancel_hook(self, model) -> None:
+        """Attach this orchestrator's cancel flag to a model so its blocking
+        generation / throttle waits / retry backoff can abort on Stop."""
+        if model is None:
+            return
+        try:
+            if hasattr(model, "_should_cancel"):
+                model._should_cancel = self._cancel_hook
+        except Exception:
+            pass
+
+    def _install_cancel_hooks(self) -> None:
+        """Attach cancel hooks to every model this orchestrator owns."""
+        candidates = []
+        if getattr(self, "cloud_model", None) is not None:
+            candidates.append(self.cloud_model)
+        if getattr(self, "_local_model", None) is not None:
+            candidates.append(self._local_model)
+        for agent in (
+            getattr(self, "architect", None),
+            getattr(self, "planner", None),
+            getattr(self, "consistency", None),
+            getattr(self, "editor", None),
+            getattr(self, "verifier", None),
+        ):
+            if agent is not None and hasattr(agent, "model"):
+                candidates.append(agent.model)
+        writer = getattr(self, "writer", None)
+        if writer is not None:
+            candidates.append(getattr(writer, "primary", None))
+            candidates.append(getattr(writer, "fallback", None))
+        for model in candidates:
+            self._install_cancel_hook(model)
 
     def _init_models(self):
         self._emit("status", "Initializing models...")
@@ -288,6 +328,7 @@ class PipelineOrchestrator:
         """Lazy-load local model only when actually needed (saves GPU/heat)."""
         if self._local_model is None:
             self._ensure_local_model()
+            self._install_cancel_hook(self._local_model)
         return self._local_model
 
     def _ensure_local_model(self):
@@ -322,14 +363,37 @@ class PipelineOrchestrator:
         if self._backend in {"groq", "gemini", "openrouter"}:
             if not self.cloud_model:
                 raise RuntimeError(f"{self._backend.title()} backend selected but cloud model is not initialized.")
-            self.architect = StoryArchitect(self.cloud_model, self.state_manager)
-            self.planner = ScenePlanner(self.cloud_model)
-            self.writer = SceneWriter(self.cloud_model, self.cloud_model)
-            self.consistency = ConsistencyEngine(self.cloud_model)
-            self.editor = Editor(self.cloud_model)
-            self.pacing = PacingAgent()
-            self.voice = VoiceAgent()
-            self._enable_compact_agent_prompts()
+
+            # Hybrid routing (Groq): keep the Writer on Groq for prose quality but
+            # route Planner/Critic/Editor/Verifier to the local GGUF when it's
+            # usable. This cuts Groq token burn ~60-70% so free-tier TPM lasts.
+            local_usable = self._hybrid_local_usable()
+
+            if self._backend == "groq" and config.HYBRID_ROUTING and local_usable:
+                self.architect = StoryArchitect(self.local_model, self.state_manager)
+                self.planner = ScenePlanner(self.local_model)
+                self.writer = SceneWriter(self.cloud_model, self.local_model)
+                self.consistency = ConsistencyEngine(self.local_model)
+                self.editor = Editor(self.local_model)
+                self.pacing = PacingAgent()
+                self.voice = VoiceAgent()
+                self.verifier = Verifier(self.local_model)
+                self._enable_compact_local_planning_prompts()
+                self._log(
+                    "Hybrid routing: Groq for Writer, local GGUF for planner/critic/editor/verifier",
+                    level="success",
+                )
+            else:
+                self.architect = StoryArchitect(self.cloud_model, self.state_manager)
+                self.planner = ScenePlanner(self.cloud_model)
+                self.writer = SceneWriter(self.cloud_model, self.cloud_model)
+                self.consistency = ConsistencyEngine(self.cloud_model)
+                self.editor = Editor(self.cloud_model)
+                self.pacing = PacingAgent()
+                self.voice = VoiceAgent()
+                self.verifier = Verifier(self.cloud_model)
+                self._enable_compact_agent_prompts()
+
             # Phase 2/3: Quality controller (stateless, always available)
             self.quality_ctrl = QualityController()
             return
@@ -343,9 +407,32 @@ class PipelineOrchestrator:
         self.editor = Editor(self.local_model)
         self.pacing = PacingAgent()
         self.voice = VoiceAgent()
+        self.verifier = Verifier(
+            self.cloud_model if self._cloud_available else self.local_model
+        )
         self._enable_compact_local_planning_prompts()
         # Phase 2/3: Quality controller (stateless, always available)
         self.quality_ctrl = QualityController()
+
+    def _hybrid_local_usable(self) -> bool:
+        """True when a local GGUF exists AND llama.cpp can actually load it.
+
+        Local inference may be broken (missing .gguf, missing CUDA runtime) —
+        hybrid must degrade gracefully to full-cloud instead of crashing.
+        """
+        if not config.LLAMA_MODEL_PATH:
+            return False
+        if not os.path.isfile(self._local_model_ref):
+            return False
+        try:
+            probe = LlamaCPP(model_path=self._local_model_ref)
+            return bool(probe.is_available())
+        except Exception as e:
+            logger.warning(
+                "[Hybrid] Local model unusable (%s). Falling back to full cloud routing.",
+                e,
+            )
+            return False
 
     def _enable_compact_agent_prompts(self):
         """Use shorter prompts/context for Groq so daily token quotas last longer."""
@@ -355,6 +442,7 @@ class PipelineOrchestrator:
             self.writer,
             self.consistency,
             self.editor,
+            self.verifier,
         ):
             if hasattr(agent, "set_compact_mode"):
                 agent.set_compact_mode(True)
@@ -367,6 +455,7 @@ class PipelineOrchestrator:
             self.planner,
             self.consistency,
             self.editor,
+            self.verifier,
         ):
             if hasattr(agent, "set_compact_mode"):
                 agent.set_compact_mode(True)
@@ -444,6 +533,8 @@ class PipelineOrchestrator:
         start = time.time()
         try:
             result = call_fn()
+        except PipelineCancelledError:
+            raise
         except Exception as e:
             error_payload = {"error": str(e), "agent": agent_name}
             self._emit("error", error_payload)
@@ -480,6 +571,32 @@ class PipelineOrchestrator:
         previous_ending: str,
         trace_entries: list,
         step_counter: dict,
+        scenes_total: int = 0,
+    ) -> dict:
+        """Execute the full scene graph, converting user cancellation into a
+        'cancelled' result so callers never treat it as a hard failure."""
+        try:
+            return self._run_scene_graph_impl(
+                chapter_num=chapter_num,
+                scene=scene,
+                scene_context=scene_context,
+                previous_ending=previous_ending,
+                trace_entries=trace_entries,
+                step_counter=step_counter,
+                scenes_total=scenes_total,
+            )
+        except PipelineCancelledError:
+            return {"status": "cancelled", "scene_number": scene.get("scene_number")}
+
+    def _run_scene_graph_impl(
+        self,
+        chapter_num: int,
+        scene: dict,
+        scene_context: str,
+        previous_ending: str,
+        trace_entries: list,
+        step_counter: dict,
+        scenes_total: int = 0,
     ) -> dict:
         scene_num = scene["scene_number"]
         graph_node = "start"
@@ -492,6 +609,17 @@ class PipelineOrchestrator:
             "non_blocking_issues": [],
             "last_blocking_fingerprint": "",
             "blocking_repeat_count": 0,
+            # Post-generation verifier state (fed into writer rewrites)
+            "verifier_issues": [],
+            "verifier_report": None,
+            "verifier_repeat_count": 0,
+            "last_verifier_fingerprint": "",
+            "needs_review": False,
+            # Deterministic quality-gate state (QualityController.score)
+            "quality_issues": [],
+            "quality_rewrite_done": False,
+            "quality_scores": None,
+            "pacing_report": None,
         }
 
         while graph_node != "end":
@@ -526,13 +654,57 @@ class PipelineOrchestrator:
                     return True
 
                 mode = "write"
-                if state.get("blocking_issues"):
+                writer_issues = list(state.get("blocking_issues", [])) + list(
+                    state.get("verifier_issues", [])
+                ) + list(state.get("quality_issues", []))
+                # Inject deterministic pacing feedback alongside rewrite issues
+                if writer_issues:
+                    pacing_feedback = PacingAgent.format_pacing_feedback(
+                        state.get("pacing_report") or {}
+                    )
+                    if pacing_feedback:
+                        writer_issues.append({
+                            "type": "pacing",
+                            "detail": pacing_feedback,
+                            "suggestion": "Adjust rhythm/density per the pacing feedback",
+                        })
+                if writer_issues:
                     if iteration >= config.MAX_SCENE_ITERATIONS:
                         mode = "final_patch"
-                    elif state.get("blocking_repeat_count", 0) >= 2:
+                    elif (state.get("blocking_repeat_count", 0) >= 2
+                          or state.get("verifier_repeat_count", 0) >= 2):
                         mode = "patch"
                     else:
                         mode = "rewrite"
+
+                # ── Selective best-of-N: key scenes get scored candidate drafts ──
+                n_candidates = self._best_of_n_count(scene, scene_num, scenes_total)
+                if n_candidates > 1 and mode == "write":
+                    best_text, best_scores = self._generate_best_of_n(
+                        chapter_num=chapter_num,
+                        scene=scene,
+                        scene_context=scene_context,
+                        previous_ending=previous_ending,
+                        n_candidates=n_candidates,
+                        trace_entries=trace_entries,
+                        step_counter=step_counter,
+                    )
+                    if self._cancelled or self._scene_cancelled:
+                        return {"status": "cancelled"}
+                    if best_text:
+                        state["scene_text"] = best_text
+                        state["quality_scores"] = best_scores
+                        words = len(best_text.split())
+                        self._emit("scene_written", {
+                            "scene": scene_num,
+                            "words": words,
+                            "provider": self.writer.last_provider,
+                            "best_of_n": n_candidates,
+                            "score": (best_scores or {}).get("overall"),
+                        })
+                        graph_node = SCENE_GRAPH["writer"][0]
+                        continue
+                    # All candidates failed — fall through to the normal path.
 
                 writer_input = {
                     "mode": mode,
@@ -542,7 +714,7 @@ class PipelineOrchestrator:
                     "context": scene_context,
                     "previous_ending": previous_ending,
                     "original_text": state["scene_text"],
-                    "issues": state.get("blocking_issues", []),
+                    "issues": writer_issues,
                     "state_context": state.get("consistency_context", ""),
                     "stream_callback": stream_scene_token,
                 }
@@ -788,11 +960,290 @@ class PipelineOrchestrator:
                             )
                 graph_node = SCENE_GRAPH["editor"][0]
 
+            if graph_node == "verifier":
+                self._emit("agent_active", {
+                    "agent": "Verifier",
+                    "step": f"scene {scene_num}",
+                })
+                verifier_report = self._run_verifier(
+                    scene_text=state["scene_text"],
+                    scene=scene,
+                    chapter_num=chapter_num,
+                    trace_entries=trace_entries,
+                    step_counter=step_counter,
+                )
+                state["verifier_report"] = verifier_report
+                v_blocking = verifier_report.get("blocking_issues", [])
+
+                if v_blocking:
+                    # Feed verifier issues into the next writer rewrite without
+                    # colliding with fresh consistency issues from the critic.
+                    known_sigs = {
+                        self.consistency.issue_signature(issue)
+                        for issue in state.get("blocking_issues", [])
+                    }
+                    for issue in v_blocking:
+                        if self.consistency.issue_signature(issue) not in known_sigs:
+                            state.setdefault("verifier_issues", []).append(issue)
+
+                    v_fingerprint = "|".join(sorted(verifier_report.get("signatures", [])))
+                    if v_fingerprint and v_fingerprint == state.get("last_verifier_fingerprint", ""):
+                        state["verifier_repeat_count"] = state.get("verifier_repeat_count", 0) + 1
+                    else:
+                        state["verifier_repeat_count"] = 0
+                    state["last_verifier_fingerprint"] = v_fingerprint
+
+                    self._log(
+                        f"Verifier: {len(v_blocking)} blocking issue(s) in scene {scene_num}",
+                        level="warn",
+                        details={
+                            "issues": [i.get("detail", "") for i in v_blocking[:3]],
+                            "repeat_count": state["verifier_repeat_count"],
+                        },
+                    )
+
+                    if state["verifier_repeat_count"] >= config.VERIFIER_REVIEW_AFTER:
+                        state["needs_review"] = True
+                        self._log(
+                            f"Scene {scene_num}: verifier blocked on the same issues "
+                            f"{state['verifier_repeat_count']} times. Escalating to human review.",
+                            level="warn",
+                            details={
+                                "issues": [i.get("detail", "") for i in v_blocking[:5]],
+                            },
+                        )
+                        self._emit("needs_review", {
+                            "scene": scene_num,
+                            "chapter": chapter_num,
+                            "issues": [i.get("detail", "") for i in v_blocking[:5]],
+                        })
+                        if config.VERIFIER_HARD_STOP:
+                            raise RuntimeError(
+                                f"Scene {scene_num} in chapter {chapter_num} failed "
+                                f"verification {state['verifier_repeat_count']} times and "
+                                "VERIFIER_HARD_STOP is enabled."
+                            )
+                        graph_node = SCENE_GRAPH["verifier"][1]
+                    else:
+                        graph_node = SCENE_GRAPH["verifier"][0]
+                else:
+                    non_blocking = verifier_report.get("non_blocking_issues", [])
+                    if non_blocking:
+                        self._log(
+                            f"Verifier: {len(non_blocking)} non-blocking note(s)",
+                            level="info",
+                            details={"issues": [i.get("detail", "") for i in non_blocking[:3]]},
+                        )
+                    else:
+                        self._log("Verifier passed", level="success")
+
+                    # ── Deterministic quality gate (no LLM cost) ─────────
+                    # Score the finished scene; below threshold triggers ONE
+                    # guided rewrite with the scorer's issues, then accept.
+                    if config.QUALITY_GATE_ENABLED:
+                        qc_result = self.quality_ctrl.score(
+                            state["scene_text"], scene,
+                            previous_ending=previous_ending,
+                            context=state.get("consistency_context", ""),
+                        )
+                        state["quality_scores"] = qc_result.as_dict()
+                        # Stash pacing analysis for writer-rewrite injection.
+                        state["pacing_report"] = self.pacing.analyze(
+                            state["scene_text"], scene
+                        )
+                        if (qc_result.overall < config.QUALITY_GATE_THRESHOLD
+                                and not state.get("quality_rewrite_done")
+                                and not state.get("blocking_issues")
+                                and iteration < config.MAX_SCENE_ITERATIONS):
+                            state["quality_issues"] = [
+                                {"type": "quality", "detail": issue, "suggestion": issue}
+                                for issue in qc_result.issues[:5]
+                            ]
+                            state["quality_rewrite_done"] = True
+                            self._log(
+                                f"Quality gate: score {qc_result.overall:.2f} < "
+                                f"{config.QUALITY_GATE_THRESHOLD:.2f} in scene {scene_num}. "
+                                "Requesting one guided revision.",
+                                level="warn",
+                                details={"issues": qc_result.issues[:5]},
+                            )
+                            self._emit("status", (
+                                f"Quality gate flagged scene {scene_num} "
+                                f"(score {qc_result.overall:.2f}) — revising..."
+                            ))
+                            graph_node = SCENE_GRAPH["verifier"][0]
+                            continue
+                        elif not qc_result.passes:
+                            self._log(
+                                f"Quality gate: score {qc_result.overall:.2f} below target in "
+                                f"scene {scene_num}; accepting best effort.",
+                                level="info",
+                                details={"scores": state["quality_scores"]},
+                            )
+
+                    graph_node = SCENE_GRAPH["verifier"][1]
+                continue
+
         return {
             "status": "complete",
             "scene_text": self._sanitize_generated_text(state["scene_text"]),
             "iterations": iteration,
+            "needs_review": bool(state.get("needs_review")),
+            "verifier_report": state.get("verifier_report"),
+            "quality_scores": state.get("quality_scores"),
         }
+
+    # ─── Best-of-N candidate sampling ─────────────────────────────────────
+
+    def _best_of_n_count(self, scene: dict, scene_num: int, scenes_total: int) -> int:
+        """How many candidate drafts this scene deserves.
+
+        Key scenes (chapter opener, 'peak' scenes, chapter finale) get
+        BEST_OF_N_KEY_SCENES candidates; everything else single-sample.
+        """
+        n_key = max(1, int(getattr(config, "BEST_OF_N_KEY_SCENES", 1)))
+        n_normal = max(1, int(getattr(config, "BEST_OF_N_NORMAL_SCENES", 1)))
+        if n_key <= 1:
+            return 1
+        is_key = (
+            scene_num == 1
+            or (scene.get("type") == "peak")
+            or (scenes_total and scene_num >= scenes_total)
+        )
+        return n_key if is_key else n_normal
+
+    def _generate_best_of_n(
+        self,
+        chapter_num: int,
+        scene: dict,
+        scene_context: str,
+        previous_ending: str,
+        n_candidates: int,
+        trace_entries: list,
+        step_counter: dict,
+    ):
+        """Generate N candidate drafts sequentially and keep the best-scoring.
+
+        Candidates are screened with the deterministic QualityController so no
+        extra LLM critic calls are needed. Returns (text, scores_dict) or
+        (None, None) when every candidate fails hard.
+        """
+        scene_num = scene.get("scene_number", "?")
+        self._emit("status", (
+            f"Key scene {scene_num}: drafting {n_candidates} candidates..."
+        ))
+        best_text, best_score, best_scores = "", -1.0, None
+
+        for attempt in range(n_candidates):
+            if self._cancelled or self._scene_cancelled:
+                break
+            try:
+                candidate_input = {
+                    "mode": "write",
+                    "iteration": 1,
+                    "scene_plan": scene,
+                    "chapter_num": chapter_num,
+                    "context": scene_context,
+                    "previous_ending": previous_ending,
+                    "original_text": "",
+                    "issues": [],
+                    "state_context": "",
+                    # No streaming: only the winning draft reaches the UI feed.
+                    "stream_callback": None,
+                    "candidate": attempt + 1,
+                }
+                result = self.writer.run(candidate_input)
+                text = (result or {}).get("scene_text", "") if isinstance(result, dict) else ""
+                if not text or len(text.split()) < 120:
+                    continue
+                qc = self.quality_ctrl.score(
+                    text, scene, previous_ending=previous_ending, context=scene_context,
+                )
+                self._record_trace(
+                    trace_entries=trace_entries,
+                    chapter_num=chapter_num,
+                    scene_num=scene_num,
+                    step_idx=step_counter["steps"] + 1,
+                    agent="writer_candidate",
+                    agent_input={"candidate": attempt + 1},
+                    agent_output={"words": len(text.split()), **qc.as_dict()},
+                    latency_ms=0.0,
+                    next_action="select_best",
+                )
+                self._log(
+                    f"Candidate {attempt + 1}/{n_candidates} scored {qc.overall:.2f}",
+                    details={"issues": qc.issues[:3]},
+                )
+                if qc.overall > best_score:
+                    best_text, best_score, best_scores = text, qc.overall, qc.as_dict()
+            except Exception as exc:
+                logger.warning(
+                    "Best-of-N candidate %s failed for scene %s: %s",
+                    attempt + 1, scene_num, exc,
+                )
+
+        if best_text:
+            self._emit("status", (
+                f"Selected best of {n_candidates} drafts for scene {scene_num} "
+                f"(score {best_score:.2f})"
+            ))
+        return (best_text, best_scores) if best_text else (None, None)
+
+    def _verifier_windows(self, chapter_num: int, state: dict) -> tuple[list[str], list[str]]:
+        """Return (allowed_steps, forbidden_steps) for the verifier's LLM pass."""
+        steps = self._premise_steps(state.get("metadata", {}).get("premise", ""))
+        if not steps or self._premise_exhausted_from_state(steps, state):
+            return [], []
+        allowed_idx = self._allowed_premise_step_index_from_state(chapter_num, steps, state)
+        n = config.PREMISE_STEPS_PER_CHAPTER
+        start_idx = max(0, allowed_idx - n + 1)
+        return steps[start_idx:allowed_idx + 1], steps[allowed_idx + 1:]
+
+    def _run_verifier(
+        self,
+        scene_text: str,
+        scene: dict,
+        chapter_num: int,
+        trace_entries: list,
+        step_counter: dict,
+    ) -> dict:
+        """Run the post-generation verifier. Returns the verification report."""
+        if not config.VERIFIER_ENABLED:
+            return {
+                "is_consistent": True,
+                "blocking_issues": [],
+                "non_blocking_issues": [],
+                "issues": [],
+                "signatures": [],
+                "checks": [],
+                "needs_review": False,
+            }
+        state = self.state_manager.state
+        allowed_steps, forbidden_steps = self._verifier_windows(chapter_num, state)
+        run_llm = config.VERIFIER_LLM_ALWAYS or (
+            self._backend in {"groq", "gemini", "openrouter"}
+        )
+        verifier_input = {
+            "scene_text": scene_text,
+            "state_manager": self.state_manager,
+            "scene_plan": scene,
+            "chapter_num": chapter_num,
+            "allowed_steps": allowed_steps,
+            "forbidden_steps": forbidden_steps,
+            "narrative_phase": state.get("metadata", {}).get("narrative_phase", ""),
+            "premise_violation_fn": self._future_premise_violations,
+            "run_llm": run_llm,
+        }
+        result = self._run_agent_step(
+            chapter_num=chapter_num,
+            scene_num=scene.get("scene_number", "?"),
+            trace_entries=trace_entries,
+            step_counter=step_counter,
+            agent_name="verifier",
+            call_fn=lambda: self.verifier.run(verifier_input),
+            agent_input={"scene_words": len(scene_text.split())},
+        )
+        return result["output"]["report"]
 
     @staticmethod
     def _sanitize_generated_text(text: str) -> str:
@@ -926,6 +1377,8 @@ class PipelineOrchestrator:
                         level="success",
                     )
                     return fixed
+        except PipelineCancelledError:
+            raise
         except Exception as e:
             self._log(
                 f"Scene {scene_num}: truncation fix failed: {e}",
@@ -950,8 +1403,14 @@ class PipelineOrchestrator:
         scene_num = scene.get("scene_number", "?")
 
         for attempt in range(self._MAX_SCENE_RETRIES + 1):
+            if self._cancelled or self._scene_cancelled:
+                return scene_text
+
             # Try to fix truncated endings before full validation
             scene_text = self._fix_truncated_ending(scene_text, scene)
+
+            if self._cancelled or self._scene_cancelled:
+                return scene_text
 
             try:
                 self._validate_scene_completion(
@@ -969,6 +1428,8 @@ class PipelineOrchestrator:
                         level="warn",
                     )
                     time.sleep(3)  # Brief pause before retry
+                    if self._cancelled or self._scene_cancelled:
+                        break
                     try:
                         retry_result = self._run_scene_graph(
                             chapter_num=chapter_num,
@@ -987,6 +1448,8 @@ class PipelineOrchestrator:
                             scene_text, previous_ending
                         )
                         continue  # Re-validate the new text
+                    except PipelineCancelledError:
+                        break
                     except Exception as retry_err:
                         self._log(
                             f"Scene {scene_num} retry generation failed: {retry_err}",
@@ -1386,9 +1849,9 @@ class PipelineOrchestrator:
         the writer is never locked to a wrong hardcoded setting.
         """
         text_lower = (text or "").lower()
-        # Ordered longest/most-specific first so "shoreditch" beats "club", etc.
+        # Ordered longest/most-specific first so multi-word phrases beat
+        # their substrings (e.g. "dance floor" beats "club").
         LOCATION_KEYWORDS = [
-            ("shoreditch", "Nightclub in Shoreditch"),
             ("dance floor", "Nightclub dance floor"),
             ("nightclub", "Nightclub"),
             ("living room", "Living room"),
@@ -2278,7 +2741,9 @@ class PipelineOrchestrator:
     def _active_planning_model(self):
         if self._backend in {"groq", "gemini"} and self.cloud_model:
             return self.cloud_model
-        return self.local_model
+        model = self.local_model
+        self._install_cancel_hook(model)
+        return model
 
     def _enhance_manual_scene(
         self,
@@ -2315,6 +2780,8 @@ class PipelineOrchestrator:
             },
             "required": ["summary", "key_events"],
         }
+        if self._cancelled or self._scene_cancelled:
+            raise PipelineCancelledError("Scene enhancement cancelled by user")
         response = model.generate_with_retry(
             prompt=prompt,
             system=MANUAL_SCENE_ENHANCER_SYSTEM,
@@ -2322,6 +2789,8 @@ class PipelineOrchestrator:
             temperature=config.AGENT_TEMPERATURES["planner"],
             max_tokens=1200 if self._backend in {"groq", "gemini"} else None,
         )
+        if self._cancelled or self._scene_cancelled:
+            raise PipelineCancelledError("Scene enhancement cancelled by user")
         parsed = response.as_json() if response else None
         if not isinstance(parsed, dict):
             parsed = {}
@@ -2656,6 +3125,20 @@ class PipelineOrchestrator:
         if not brief:
             raise ValueError("scene_brief cannot be empty")
 
+        try:
+            return self._generate_manual_scene_impl(session, brief)
+        except PipelineCancelledError:
+            self._log("Manual scene cancelled by user", level="warn")
+            return {
+                "status": "cancelled",
+                "scene_number": session.get("scene_counter", 0) + 1,
+            }
+
+    def _generate_manual_scene_impl(
+        self,
+        session: dict,
+        brief: str,
+    ) -> dict:
         chapter_num = session["chapter_num"]
         chapter_title = session["chapter_title"]
         pacing = session["pacing"]
@@ -2736,6 +3219,8 @@ class PipelineOrchestrator:
             character_names=character_names,
             previous_scenes_summary=previous_scenes_summary,
         )
+        if self._cancelled or self._scene_cancelled:
+            return {"status": "cancelled", "scene_number": scene_number}
         total_known = scene_idx + 1  # Only know about current scene count
         scene["type"] = self._coerce_manual_scene_type(
             scene.get("type", ""),
@@ -2780,12 +3265,13 @@ class PipelineOrchestrator:
 
         # Retrieve scene-level context
         self._emit("agent_active", {"agent": "Retriever", "step": f"scene {scene_number}"})
+        _cloud = self._backend in {"groq", "gemini"}
         scene_context = self.retriever.retrieve_context(
             scene_plan=scene,
             chapter_num=chapter_num,
             previous_ending=previous_ending,
-            top_k=2 if self._backend in {"groq", "gemini"} else None,
-            max_chars=2200 if self._backend in {"groq", "gemini"} else None,
+            top_k=config.CLOUD_TOP_K_RETRIEVAL if _cloud else None,
+            max_chars=config.CLOUD_CONTEXT_CHARS if _cloud else None,
         )
 
         # ── Enrich writer context with completed-scene recap ─────────────
@@ -2818,6 +3304,15 @@ class PipelineOrchestrator:
         # completed scene text (the session cache may be a shorter extract)
         if completed_scenes:
             previous_ending = self._extract_ending(completed_scenes[-1])
+
+        # Inject character voice guidance into scene context (parity with the
+        # auto path so manual scenes keep character voices grounded too)
+        voice_guidance = self.voice.build_voice_guidance(
+            scene.get("characters_present", []),
+            self.state_manager.get_characters(),
+        )
+        if voice_guidance:
+            scene_context = f"{scene_context.rstrip()}\n\n{voice_guidance}\n"
 
         # Run the full scene graph (writer → critic → decision → editor)
         self._emit("scene_start", {
@@ -2859,6 +3354,8 @@ class PipelineOrchestrator:
             trace_entries=trace_entries,
             step_counter=step_counter,
         )
+        if self._cancelled or self._scene_cancelled:
+            return {"status": "cancelled", "scene_number": scene_number}
 
         post_edit_words = len(scene_text.split())
         session["estimated_tokens_used"] += int(post_edit_words * 1.35)
@@ -2870,7 +3367,17 @@ class PipelineOrchestrator:
         session["scene_counter"] = scene_idx + 1
         self._ensure_scene_characters_known(scene)
 
+        # Track the chapter's best-scored passage for the style-anchor
+        # ring buffer (recorded at finish_manual_chapter).
+        qc_scores = scene_result.get("quality_scores") or {}
+        qc_overall = qc_scores.get("overall")
+        best = session.get("best_passage") or {}
+        if qc_overall is not None and qc_overall >= (best.get("score") or -1.0):
+            session["best_passage"] = {"score": qc_overall, "text": scene_text}
+
         # Post-scene narrative evolution
+        if self._cancelled or self._scene_cancelled:
+            return {"status": "cancelled", "scene_number": scene_number}
         try:
             self._emit("status", "Analyzing narrative evolution...")
             evolve_after_scene(
@@ -2884,6 +3391,8 @@ class PipelineOrchestrator:
                 progress_callback=lambda msg: self._log(msg, level="info"),
             )
             self._log("Narrative evolution complete", level="success")
+        except PipelineCancelledError:
+            return {"status": "cancelled", "scene_number": scene_number}
         except Exception as e:
             self._log(
                 f"Evolution engine error (non-fatal): {e}",
@@ -3010,7 +3519,51 @@ class PipelineOrchestrator:
             f.write(full_chapter)
 
         self._log(f"Updated scene {index + 1} text in manual session ({len(new_text.split())} words).", level="info")
+        self._log(f"Updated scene {index + 1} in manual session.", level="info")
         return session
+
+    def prepare_manual_scene_regeneration(
+        self,
+        session: dict,
+        index: int,
+        scene_brief: str = "",
+    ) -> str:
+        """
+        Remove the LAST scene from a manual session and recover the brief
+        it was generated from, so it can be regenerated with fresh context.
+
+        Returns the recovered scene brief. The caller then invokes
+        ``generate_manual_scene`` as usual.
+        """
+        scenes = session.get("completed_scenes", [])
+        if index < 0 or index >= len(scenes):
+            raise IndexError("Scene index out of range.")
+        if index != len(scenes) - 1:
+            raise ValueError(
+                "Only the most recent scene can be regenerated. "
+                "Delete later scenes first."
+            )
+
+        plans = session.get("completed_scene_plans", [])
+        plan = plans[index] if index < len(plans) else {}
+
+        brief = (scene_brief or "").strip()
+        if not brief:
+            brief = str(plan.get("summary", "")).strip()
+        if plan.get("type") == "custom" and not (scene_brief or "").strip():
+            raise ValueError(
+                "This scene is user-typed content — there is no brief to "
+                "regenerate from. Provide an explicit scene_brief."
+            )
+        if not brief:
+            raise ValueError(
+                "No scene brief available for regeneration. "
+                "Provide an explicit scene_brief."
+            )
+
+        self.delete_manual_scene(session, index)
+        self._log(f"Prepared regeneration of scene {index + 1}.", level="info")
+        return brief
 
     def add_typed_scene(self, session: dict, text: str) -> dict:
         """
@@ -3113,6 +3666,24 @@ class PipelineOrchestrator:
         self.state_manager.add_chapter_summary(chapter_num, summary, title)
         self.state_manager.increment_scene_count(completed_scene_count)
 
+        # Persist the chapter's best-scored passage as a style anchor for
+        # future chapters (ring buffer of recent exemplars).
+        best_passage = session.get("best_passage") or {}
+        if (best_passage.get("text")
+                and (best_passage.get("score") or 0.0) >= config.QUALITY_GATE_THRESHOLD):
+            try:
+                self.state_manager.record_style_exemplar(
+                    chapter=chapter_num,
+                    score=best_passage["score"],
+                    text=best_passage["text"],
+                )
+                self._log(
+                    f"Style anchor recorded (score {best_passage['score']:.2f})",
+                    level="info",
+                )
+            except Exception as exc:
+                self._log(f"Style anchor recording failed (non-fatal): {exc}", level="warn")
+
         # ── Persist the premise step cursor ──────────────────────────────
         # Advance the cursor so the NEXT auto-generated chapter starts from
         # where this manual chapter left off.
@@ -3141,6 +3712,13 @@ class PipelineOrchestrator:
         # Track threads
         for thread in chapter_plan.get("new_threads_to_introduce", []):
             self.state_manager.add_unresolved_thread(thread)
+        # Record planted seeds as foreshadowing (payoff-awareness for later chapters)
+        try:
+            self.state_manager.add_foreshadowing(
+                chapter_plan.get("new_threads_to_introduce", []), chapter_num
+            )
+        except Exception as exc:
+            self._log(f"Foreshadowing recording failed (non-fatal): {exc}", level="warn")
 
         # Embed into vector store
         self._emit("status", "Embedding chapter into vector memory...")
@@ -3152,6 +3730,7 @@ class PipelineOrchestrator:
             n = self.vector_store.add_text(
                 text=part, chapter=chapter_num,
                 scene=i + 1, characters=chars, location=loc,
+                memory_type="auto",
             )
             total_chunks += n
         self._log(f"Embedded {total_chunks} chunks into vector store", level="success")
@@ -3274,7 +3853,6 @@ class PipelineOrchestrator:
         # Rotate API key at the start of each chapter
         from models.groq_model import GroqKeyManager
         GroqKeyManager.rotate()
-        self._cancelled = False
         self.state_manager.normalize_character_traits()
         state = self.state_manager.load()
 
@@ -3309,6 +3887,14 @@ class PipelineOrchestrator:
 
         chapter_num = state["metadata"]["current_chapter"] + 1
         chapter_start_time = time.time()
+
+        # If cancellation was requested (e.g. between chapters in a batch run),
+        # honour it instead of starting a fresh chapter. Only a brand-new
+        # generation (fresh orchestrator) reaches the reset below.
+        if self._cancelled:
+            self._log("Chapter skipped: cancellation was requested.", level="warn")
+            return self._cancel_result(chapter_num)
+        self._cancelled = False
 
         self._emit("chapter_start", {"chapter": chapter_num})
         self._log(f"═══ Starting Chapter {chapter_num} generation ═══", level="header",
@@ -3570,6 +4156,8 @@ class PipelineOrchestrator:
                 self._emit("status", f"Resuming from scene {start_scene_idx + 1}")
 
             graph_node = PIPELINE_GRAPH[graph_node][0]
+            # Best-scored passage of this chapter (style-anchor candidate)
+            chapter_best_passage = {"score": None, "text": ""}
             for i, scene in enumerate(scenes):
                 if i < start_scene_idx:
                     continue  # Skip already-completed scenes
@@ -3622,12 +4210,13 @@ class PipelineOrchestrator:
                     "agent": "Retriever", "step": f"scene {scene_num}",
                 })
                 self._log(f"Retriever: fetching context for scene {scene_num}...")
+                _cloud = self._backend in {"groq", "gemini"}
                 scene_context = self.retriever.retrieve_context(
                     scene_plan=scene,
                     chapter_num=chapter_num,
                     previous_ending=previous_ending,
-                    top_k=2 if self._backend in {"groq", "gemini"} else None,
-                    max_chars=2200 if self._backend in {"groq", "gemini"} else None,
+                    top_k=config.CLOUD_TOP_K_RETRIEVAL if _cloud else None,
+                    max_chars=config.CLOUD_CONTEXT_CHARS if _cloud else None,
                 )
 
                 # ── Enrich writer context with completed-scene recap ─────────────
@@ -3675,11 +4264,18 @@ class PipelineOrchestrator:
                     previous_ending=previous_ending,
                     trace_entries=trace_entries,
                     step_counter=step_counter,
+                    scenes_total=len(scenes),
                 )
                 if scene_result.get("status") == "cancelled":
                     return self._cancel_result(chapter_num)
                 if self._cancelled:
                     return self._cancel_result(chapter_num)
+                if scene_result.get("needs_review"):
+                    self._log(
+                        f"Scene {scene.get('scene_number')} flagged NEEDS REVIEW — "
+                        "persisting WIP for human inspection.",
+                        level="warn",
+                    )
 
                 scene_text = self._sanitize_generated_text(scene_result["scene_text"])
                 scene_text = self._remove_repeated_reference_sentences(
@@ -3696,12 +4292,21 @@ class PipelineOrchestrator:
                     trace_entries=trace_entries,
                     step_counter=step_counter,
                 )
+                if self._cancelled:
+                    return self._cancel_result(chapter_num)
                 post_edit_words = len(scene_text.split())
                 estimated_tokens_used += int(post_edit_words * 1.35)
 
                 chapter_text_parts.append(scene_text)
                 previous_ending = self._extract_ending(scene_text)
                 self._ensure_scene_characters_known(scene)
+
+                # Track the chapter's best-scored passage for the style anchor
+                qc_scores = scene_result.get("quality_scores") or {}
+                qc_overall = qc_scores.get("overall")
+                if (qc_overall is not None
+                        and qc_overall >= (chapter_best_passage["score"] or -1.0)):
+                    chapter_best_passage = {"score": qc_overall, "text": scene_text}
 
                 # Post-scene pacing analysis (deterministic, no LLM)
                 pacing_report = self.pacing.analyze(scene_text, scene)
@@ -3736,6 +4341,8 @@ class PipelineOrchestrator:
                         progress_callback=lambda msg: self._log(msg, level="info"),
                     )
                     self._log("Narrative evolution complete", level="success")
+                except PipelineCancelledError:
+                    return self._cancel_result(chapter_num)
                 except Exception as e:
                     self._log(
                         f"Evolution engine error (non-fatal): {e}",
@@ -3842,6 +4449,26 @@ class PipelineOrchestrator:
             self.state_manager.add_chapter_summary(chapter_num, summary, title)
             self.state_manager.increment_scene_count(completed_scene_count)
 
+            # Persist the chapter's best-scored passage as a style anchor for
+            # future chapters (ring buffer of recent exemplars).
+            if (chapter_best_passage.get("text")
+                    and (chapter_best_passage.get("score") or 0.0)
+                    >= config.QUALITY_GATE_THRESHOLD):
+                try:
+                    self.state_manager.record_style_exemplar(
+                        chapter=chapter_num,
+                        score=chapter_best_passage["score"],
+                        text=chapter_best_passage["text"],
+                    )
+                    self._log(
+                        f"Style anchor recorded "
+                        f"(score {chapter_best_passage['score']:.2f})",
+                        level="info",
+                    )
+                except Exception as exc:
+                    self._log(f"Style anchor recording failed (non-fatal): {exc}",
+                              level="warn")
+
             # ── Persist the premise step cursor ──────────────────────────────
             # Record which premise step index was covered last so the NEXT
             # chapter's planning starts exactly from the correct position.
@@ -3872,6 +4499,13 @@ class PipelineOrchestrator:
             # Track threads
             for thread in chapter_plan.get("new_threads_to_introduce", []):
                 self.state_manager.add_unresolved_thread(thread)
+            # Record planted seeds as foreshadowing (payoff-awareness later)
+            try:
+                self.state_manager.add_foreshadowing(
+                    chapter_plan.get("new_threads_to_introduce", []), chapter_num
+                )
+            except Exception as exc:
+                self._log(f"Foreshadowing recording failed (non-fatal): {exc}", level="warn")
             for thread in chapter_plan.get("unresolved_threads_to_address", []):
                 pass  # Will be resolved when actually paid off
 
@@ -3886,6 +4520,7 @@ class PipelineOrchestrator:
                 n = self.vector_store.add_text(
                     text=part, chapter=chapter_num,
                     scene=i + 1, characters=chars, location=loc,
+                    memory_type="auto",
                 )
                 total_chunks += n
             self._log(f"Embedded {total_chunks} chunks into vector store", level="success",
@@ -3926,6 +4561,11 @@ class PipelineOrchestrator:
             )
             return result
 
+        except PipelineCancelledError:
+            logger.info(f"Chapter {chapter_num} cancelled by user.")
+            if trace_entries:
+                self._save_trace(chapter_num, trace_entries)
+            return self._cancel_result(chapter_num)
         except Exception as e:
             logger.error(f"Pipeline failed at chapter {chapter_num}: {e}", exc_info=True)
             if trace_entries:
@@ -4403,6 +5043,216 @@ class PipelineOrchestrator:
         summary = self.quality_ctrl.summarise(result)
         self._log(f"Scene quality: {summary}", level="info" if result.passes else "warn")
         return result.as_dict()
+
+    # ─── Phase C: Branch options ───────────────────────────────────────
+
+    def generate_branch_options(
+        self,
+        count: int = 3,
+        direction_hint: str = "",
+    ) -> dict:
+        """Propose N distinct directions the NEXT chapter could take.
+
+        Uses the planning model once with a compact story-state prompt.
+        Returns {"status": "ok", "options": [{title, premise, new_threads, risk}]}.
+        """
+        count = max(2, min(int(count or 3), 5))
+        state = self.state_manager.load()
+        meta = state.get("metadata", {})
+        plot = state.get("plot", {})
+
+        summaries = plot.get("chapter_summaries", [])[-4:]
+        summary_text = "\n".join(
+            f"- Ch{s.get('chapter', '?')}: {str(s.get('summary', ''))[:200]}"
+            for s in summaries
+        ) or "- (No chapters written yet.)"
+
+        threads = plot.get("unresolved_threads", [])[:6]
+        threads_text = "\n".join(f"- {t}" for t in threads) or "- None."
+
+        seeds = [s for s in plot.get("foreshadowing", [])
+                 if isinstance(s, dict) and s.get("status") == "planted"][:5]
+        seeds_text = "\n".join(
+            f"- (Ch{s.get('chapter', '?')}) {str(s.get('text', ''))[:140]}"
+            for s in seeds
+        ) or "- None."
+
+        # Latest written ending for continuity grounding
+        latest_ending = ""
+        try:
+            chapter_files = sorted(
+                f for f in os.listdir(self.chapters_dir)
+                if re.match(r"^chapter_\d+\.md$", f)
+            )
+            if chapter_files:
+                with open(os.path.join(self.chapters_dir, chapter_files[-1]),
+                          encoding="utf-8") as f:
+                    tail = f.read()[-800:]
+                latest_ending = " ".join(tail.split())[-500:]
+        except OSError:
+            latest_ending = ""
+
+        hint_block = (
+            f"\n=== STEERING HINT (respect if compatible) ===\n{direction_hint.strip()}\n"
+            if direction_hint.strip() else ""
+        )
+
+        prompt = f"""Propose {count} DISTINCT, mutually exclusive directions for the NEXT chapter of this story.
+
+=== PREMISE ===
+{meta.get("premise", "Not set.")}
+
+=== WHAT HAS HAPPENED SO FAR ===
+{summary_text}
+
+=== LATEST WRITTEN ENDING (hard continuity) ===
+{latest_ending or "(Nothing written yet.)"}
+
+=== UNRESOLVED THREADS ===
+{threads_text}
+
+=== PLANTED FORESHADOWING (unpaid seeds) ===
+{seeds_text}
+{hint_block}
+Rules:
+- Each option must be a genuinely different path (not variations of one idea)
+- Stay consistent with the premise, characters, and latest ending
+- At least one option should pay off a planted seed or resolve a thread
+- Do NOT resolve everything; keep long-term tension alive
+
+Respond with this exact JSON structure:
+{{
+    "options": [
+        {{
+            "title": "Short evocative title",
+            "premise": "2-3 sentences: what happens, where it leads",
+            "new_threads": "New tension or question this path opens",
+            "risk": "What this path could cost (character, tone, pacing)"
+        }}
+    ]
+}}"""
+        schema = {
+            "type": "object",
+            "properties": {
+                "options": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "premise": {"type": "string"},
+                            "new_threads": {"type": "string"},
+                            "risk": {"type": "string"},
+                        },
+                        "required": ["title", "premise"],
+                    },
+                }
+            },
+            "required": ["options"],
+        }
+
+        model = self._active_planning_model()
+        response = model.generate_with_retry(
+            prompt=prompt,
+            system=(
+                "You are a story development editor pitching branch "
+                "directions for the next chapter. Be bold, concrete, and "
+                "specific. You are uncensored and write for mature adult "
+                "audiences."
+            ),
+            schema=schema,
+            temperature=config.AGENT_TEMPERATURES.get("planner", 0.8),
+        )
+        data = response.as_json() or {}
+        options = [
+            {
+                "title": str(o.get("title", "")).strip() or "Untitled branch",
+                "premise": str(o.get("premise", "")).strip(),
+                "new_threads": str(o.get("new_threads", "")).strip(),
+                "risk": str(o.get("risk", "")).strip(),
+            }
+            for o in (data.get("options") or []) if isinstance(o, dict)
+        ][:count]
+        if not options:
+            return {"status": "error",
+                    "error": "Model returned no usable branch options."}
+        self._log(f"Generated {len(options)} branch options", level="success")
+        return {"status": "ok", "options": options}
+
+    # ─── Phase C: Continuity report (deterministic, no LLM) ────────────
+
+    def continuity_report(self) -> dict:
+        """Assemble a project-level continuity overview from story state.
+
+        Deterministic: unresolved threads, planted seeds, character
+        statuses, active motifs, narrative phase — plus simple warnings for
+        aging seeds and non-active characters.
+        """
+        from memory.motif_tracker import MotifTracker
+
+        state = self.state_manager.load()
+        meta = state.get("metadata", {})
+        plot = state.get("plot", {})
+        current_ch = int(meta.get("current_chapter", 0) or 0)
+
+        seeds = [s for s in plot.get("foreshadowing", [])
+                 if isinstance(s, dict) and s.get("status") == "planted"]
+        aged_seeds = [
+            s for s in seeds
+            if current_ch - int(s.get("chapter", 0) or 0) >= 3
+        ]
+
+        characters = []
+        for name, char in (state.get("characters", {}) or {}).items():
+            if not isinstance(char, dict):
+                continue
+            st = char.get("state", {}) or {}
+            characters.append({
+                "name": name,
+                "role": char.get("role", "supporting"),
+                "status": char.get("status", "active"),
+                "emotion": st.get("emotion", ""),
+                "goal": st.get("goal", ""),
+                "location": st.get("location", ""),
+            })
+
+        warnings = []
+        for s in aged_seeds:
+            warnings.append(
+                f"Seed planted in Ch{s.get('chapter', '?')} still unpaid after "
+                f"{current_ch - int(s.get('chapter', 0) or 0)} chapters: "
+                f"{str(s.get('text', ''))[:100]}"
+            )
+        for c in characters:
+            if c["status"] != "active":
+                warnings.append(f"{c['name']} status is '{c['status']}'.")
+
+        motifs = MotifTracker.get_active_motifs(state, min_mentions=2)
+        motif_list = [
+            {"name": k.replace("_", " ").title(), "mentions": v.get("mentions", 0)}
+            for k, v in motifs.items()
+        ]
+
+        report = {
+            "status": "ok",
+            "current_chapter": current_ch,
+            "narrative_phase": meta.get("narrative_phase", "introduction"),
+            "chapters_written": len(plot.get("chapter_summaries", [])),
+            "unresolved_threads": list(plot.get("unresolved_threads", [])),
+            "planted_seeds": [
+                {"chapter": s.get("chapter", "?"), "text": s.get("text", "")}
+                for s in seeds
+            ],
+            "characters": characters,
+            "active_motifs": motif_list,
+            "warnings": warnings,
+        }
+        self._log(
+            f"Continuity report: {len(report['unresolved_threads'])} threads, "
+            f"{len(report['planted_seeds'])} seeds, {len(warnings)} warning(s)",
+            level="info",
+        )
+        return report
 
     # ─── Phase 5: World Bible ─────────────────────────────────────────
 

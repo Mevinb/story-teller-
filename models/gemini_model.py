@@ -6,25 +6,28 @@ just like Groq or llama.cpp.
 import json
 import logging
 import re
-import time
 from typing import Optional
 
 from google import genai
 from google.genai import types
 
 import config
-from .base import LLMInterface, LLMResponse
+from .base import ContentBlockedError, LLMInterface, LLMResponse, ReasoningStreamFilter
+from pipeline.errors import PipelineCancelledError
 
 logger = logging.getLogger(__name__)
 
-_REASONING_BLOCK_RE = re.compile(
-    r"<(?:think|analysis|reasoning)>.*?</(?:think|analysis|reasoning)>",
-    flags=re.IGNORECASE | re.DOTALL,
-)
-_REASONING_TAG_RE = re.compile(r"</?(?:think|analysis|reasoning)>", flags=re.IGNORECASE)
+_MODELS_WITHOUT_SAMPLING_PARAMS = ("gemini-3.6-flash", "gemini-3.5-flash-lite")
 
 
-class GeminiModel(LLMInterface):
+def _model_supports_sampling_params(model: str) -> bool:
+    """Gemini 3.6 Flash and 3.5 Flash-Lite ignore temperature/top_p/top_k."""
+    if not model:
+        return True
+    return not any(model.startswith(prefix) for prefix in _MODELS_WITHOUT_SAMPLING_PARAMS)
+
+
+class GeminiModel(ReasoningStreamFilter, LLMInterface):
     """Cloud LLM via Google Gemini API."""
 
     _last_request_time = 0.0
@@ -47,12 +50,6 @@ class GeminiModel(LLMInterface):
             self._client = genai.Client(api_key=self._api_key)
         return self._client
 
-    @staticmethod
-    def _strip_reasoning(text: str) -> str:
-        cleaned = _REASONING_BLOCK_RE.sub("", text or "")
-        cleaned = _REASONING_TAG_RE.sub("", cleaned)
-        return cleaned.strip()
-
     @property
     def was_content_blocked(self) -> bool:
         return self._content_blocked
@@ -63,7 +60,7 @@ class GeminiModel(LLMInterface):
         wait = max(0.0, self._MIN_REQUEST_INTERVAL - elapsed)
         if wait > 0:
             logger.debug("[Gemini] Throttling %.1fs before next request.", wait)
-            time.sleep(wait)
+            self._sleep_interruptible(wait)
         GeminiModel._last_request_time = time.time()
 
     def _build_contents(self, prompt: str, system: str = "") -> tuple:
@@ -103,15 +100,17 @@ class GeminiModel(LLMInterface):
                 raw=None,
             )
 
+        self._raise_if_cancelled()
         self._content_blocked = False
         self._throttle()
 
         # Build config
         gen_config_kwargs = {}
-        if temperature is not None:
-            gen_config_kwargs["temperature"] = temperature
-        else:
-            gen_config_kwargs["temperature"] = config.CLOUD_MODEL_PARAMS.get("temperature", 0.8)
+        if _model_supports_sampling_params(self.model):
+            if temperature is not None:
+                gen_config_kwargs["temperature"] = temperature
+            else:
+                gen_config_kwargs["temperature"] = config.CLOUD_MODEL_PARAMS.get("temperature", 0.8)
 
         if max_tokens:
             gen_config_kwargs["max_output_tokens"] = max_tokens
@@ -179,7 +178,7 @@ class GeminiModel(LLMInterface):
                 match = re.search(r"retry after (\d+)", error_str)
                 wait = float(match.group(1)) if match else 30.0
                 logger.warning(f"[Gemini] Rate limited — waiting {wait}s before propagating error...")
-                time.sleep(wait)
+                self._sleep_interruptible(wait)
                 raise
             raise
 
@@ -191,14 +190,16 @@ class GeminiModel(LLMInterface):
         max_tokens: Optional[int] = None,
     ):
         """Streaming generator — yields content chunks."""
+        self._raise_if_cancelled()
         self._content_blocked = False
         self._throttle()
 
         gen_config_kwargs = {}
-        if temperature is not None:
-            gen_config_kwargs["temperature"] = temperature
-        else:
-            gen_config_kwargs["temperature"] = config.CLOUD_MODEL_PARAMS.get("temperature", 0.8)
+        if _model_supports_sampling_params(self.model):
+            if temperature is not None:
+                gen_config_kwargs["temperature"] = temperature
+            else:
+                gen_config_kwargs["temperature"] = config.CLOUD_MODEL_PARAMS.get("temperature", 0.8)
 
         if max_tokens:
             gen_config_kwargs["max_output_tokens"] = max_tokens
@@ -222,6 +223,7 @@ class GeminiModel(LLMInterface):
                 )
 
                 for chunk in response:
+                    self._raise_if_cancelled()
                     if hasattr(chunk, 'text') and chunk.text:
                         cleaned = self._strip_reasoning(chunk.text)
                         if cleaned:
@@ -241,11 +243,12 @@ class GeminiModel(LLMInterface):
                     if "rate" in error_str or "quota" in error_str:
                         match = re.search(r"retry after (\d+)", error_str)
                         wait = float(match.group(1)) if match else 15.0
+                    self._raise_if_cancelled()
                     logger.warning(
                         f"[Gemini] Streaming attempt {attempt + 1}/{max_retries} failed: {e}. "
                         f"Retrying in {wait:.1f}s..."
                     )
-                    time.sleep(wait)
+                    self._sleep_interruptible(wait)
                     delay = min(delay * config.RETRY_BACKOFF_FACTOR, config.RETRY_MAX_DELAY)
                 else:
                     raise
@@ -278,7 +281,8 @@ class GeminiModel(LLMInterface):
                         f"[Gemini] Availability check attempt {attempt + 1}/{max_retries} failed: {e}. "
                         f"Retrying in {delay:.1f}s..."
                     )
-                    time.sleep(delay)
+                    # Interruptible so a cancel during startup isn't stuck sleeping.
+                    self._sleep_interruptible(delay)
                     delay *= 2.0
                 else:
                     logger.warning(f"[Gemini] Availability check failed: {e}")
@@ -288,7 +292,3 @@ class GeminiModel(LLMInterface):
     def get_name(self) -> str:
         return f"Gemini ({self.model})"
 
-
-class ContentBlockedError(Exception):
-    """Raised when Gemini's content safety blocks a request."""
-    pass

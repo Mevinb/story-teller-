@@ -190,6 +190,10 @@ def _empty_state() -> dict:
             "updated_at": datetime.now().isoformat(),
         },
         "characters": {},
+        # Authoritative entity registry (id -> record). Canonical identity layer
+        # that aliases map to; the verifier uses this to catch dead-character
+        # revivals and implicit new entities.
+        "entities": {},
         "world": {
             "locations": {},
             "rules": [],
@@ -273,17 +277,54 @@ def _create_default_character(info: Optional[dict] = None) -> dict:
     }
 
 
+def _create_default_entity(name: str, entity_type: str = "character", chapter: int = 0,
+                           aliases: Optional[list] = None, status: str = "active") -> dict:
+    """Return a well-formed entity registry record for ``name``."""
+    return {
+        "id": _canonical_character_key(name),
+        "canonical_name": str(name).strip(),
+        "type": entity_type,
+        "aliases": [str(a).strip() for a in (aliases or []) if str(a).strip()],
+        "first_chapter": int(chapter or 0),
+        "status": status,
+    }
+
+
+def _fuzzy_match_entity(name: str, existing_entities: dict) -> Optional[str]:
+    """Fuzzy-match a name against existing entity records (by canonical name).
+
+    Returns the canonical name of the matched entity, or None.
+    """
+    if _fuzz is None:
+        return None
+    target = _canonical_character_key(name)
+    if not target:
+        return None
+    best_score = 0
+    best_match = None
+    for entity_id, record in existing_entities.items():
+        if not isinstance(record, dict):
+            continue
+        canonical = _canonical_character_key(record.get("canonical_name", entity_id))
+        score = _fuzz.ratio(target, canonical)
+        if score > best_score and score >= FUZZY_MATCH_THRESHOLD:
+            best_score = score
+            best_match = record.get("canonical_name", entity_id)
+    return best_match
+
+
 class StateManager:
     """
     Manages the structured JSON state for a story project.
     This is the 'hard memory' — deterministic facts the model must respect.
     """
-
     def __init__(self, project_dir: str):
         self.project_dir = project_dir
         self.state_path = os.path.join(project_dir, "state.json")
         self.history_path = os.path.join(project_dir, "state_history.jsonl")
-        self._lock = threading.Lock()
+        # Reentrant: locked transitions may legitimately read state via
+        # helpers that go through the `state` property.
+        self._lock = threading.RLock()
         self._state: Optional[dict] = None
 
     # ─── Core I/O ────────────────────────────────────────────────────
@@ -421,13 +462,60 @@ class StateManager:
                 self._state = json.load(f)
             self._state.setdefault("metadata", {})
             self._state["metadata"].setdefault("state_version", 0)
-            if self._dedupe_characters_locked():
+            changed = self._dedupe_characters_locked()
+            if self._backfill_entities_locked():
+                changed = True
+            if changed:
                 self._save_locked()
             logger.debug(f"State loaded from {self.state_path}")
         else:
             self._state = _empty_state()
             self._save_locked()
             logger.info(f"Created fresh state at {self.state_path}")
+
+    def _backfill_entities_locked(self) -> bool:
+        """Derive entity registry records from existing characters/locations.
+
+        Idempotent migration so legacy projects (and projects that predate the
+        ``entities`` field) are automatically covered without manual fixes.
+        Returns True if the state was modified.
+        """
+        entities = self._state.setdefault("entities", {})
+        if not isinstance(entities, dict):
+            self._state["entities"] = entities = {}
+        changed = False
+
+        for name, info in self._state.get("characters", {}).items():
+            if not isinstance(info, dict):
+                info = {}
+            entity_id = _canonical_character_key(name)
+            if entity_id in entities:
+                continue
+            entities[entity_id] = _create_default_entity(
+                name,
+                entity_type="character",
+                chapter=int(info.get("first_seen") or 0),
+                aliases=info.get("aliases", []),
+                status=str(info.get("status", "active")),
+            )
+            changed = True
+            logger.info("Registered character entity '%s'", name)
+
+        for name, info in self._state.get("world", {}).get("locations", {}).items():
+            entity_id = _canonical_character_key(name)
+            if entity_id in entities:
+                continue
+            entities[entity_id] = _create_default_entity(
+                name,
+                entity_type="location",
+                chapter=0,
+                aliases=info.get("aliases", []) if isinstance(info, dict) else [],
+                status="active",
+            )
+            changed = True
+            logger.info("Registered location entity '%s'", name)
+
+        return changed
 
     def _dedupe_characters_locked(self) -> bool:
         chars = self._state.get("characters", {})
@@ -468,9 +556,15 @@ class StateManager:
 
     @property
     def state(self) -> dict:
-        if self._state is None:
-            self.load()
-        return self._state
+        """Return a deep copy of the current state.
+
+        Callers must never mutate this dict directly — it is a snapshot.
+        All mutations go through transition methods so writes stay atomic
+        and are recorded in the change history.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            return deepcopy(self._state)
 
     def get_metadata(self) -> dict:
         return deepcopy(self.state.get("metadata", {}))
@@ -492,6 +586,140 @@ class StateManager:
 
     def get_plot(self) -> dict:
         return deepcopy(self.state.get("plot", {}))
+
+    # ─── Entity Registry ─────────────────────────────────────────────
+
+    def get_entities(self) -> dict:
+        """Return a deep copy of the authoritative entity registry."""
+        return deepcopy(self.state.get("entities", {}))
+
+    def resolve_entity_name(self, name: str) -> Optional[str]:
+        """Map any alias/nickname/fuzzy variant to the canonical entity name.
+
+        Returns the canonical name or None if the name cannot be resolved to a
+        known entity.
+        """
+        if not name or not isinstance(name, str):
+            return None
+        entities = self.state.get("entities", {})
+        target = _canonical_character_key(name)
+        for entity_id, record in entities.items():
+            if not isinstance(record, dict):
+                continue
+            canonical = _canonical_character_key(record.get("canonical_name", entity_id))
+            if target and target == canonical:
+                return record.get("canonical_name", entity_id)
+            for alias in record.get("aliases", []):
+                if target and target == _canonical_character_key(alias):
+                    return record.get("canonical_name", entity_id)
+        fuzzy = _fuzzy_match_entity(name, entities)
+        if fuzzy:
+            return fuzzy
+        # Fall back to the character map (keeps backward compatibility)
+        chars = self.state.get("characters", {})
+        for key in chars:
+            if key.lower() == name.lower():
+                return key
+            if target and target == _canonical_character_key(key):
+                return key
+        return None
+
+    def get_entity_status(self, name: str) -> Optional[str]:
+        """Return the status of a known entity ('active'/'dead'/'missing').
+
+        Returns None for unknown entities so callers can distinguish 'does not
+        exist' from 'exists and is active'.
+        """
+        canonical = self.resolve_entity_name(name)
+        if not canonical:
+            return None
+        entities = self.state.get("entities", {})
+        target = _canonical_character_key(canonical)
+        record = entities.get(target)
+        if isinstance(record, dict) and record.get("status"):
+            return record.get("status")
+        # Fall back to the character record
+        char = self.get_character(canonical)
+        if char:
+            return str(char.get("status", "active"))
+        return None
+
+    def register_entity(self, name: str, entity_type: str = "character",
+                        chapter: int = 0, aliases: Optional[list] = None,
+                        status: str = "active") -> dict:
+        """Register (or update) an entity in the authoritative registry.
+
+        Idempotent: if the entity already exists (exact or fuzzy match), its
+        aliases are merged and the record returned. Otherwise a new record is
+        created. Returns the resulting registry record.
+        """
+        name = str(name or "").strip()
+        if not name:
+            raise ValueError("Entity name cannot be empty")
+        entity_id = _canonical_character_key(name)
+
+        def mutator(current: dict) -> dict:
+            entities = current.setdefault("entities", {})
+            existing = entities.get(entity_id)
+            matched_canonical = None
+            if existing is None:
+                matched_canonical = _fuzzy_match_entity(name, entities)
+            if matched_canonical is not None and matched_canonical in entities:
+                existing = entities[_canonical_character_key(matched_canonical)]
+            if isinstance(existing, dict):
+                alias_set = set(existing.get("aliases", []))
+                alias_set.update(a for a in (aliases or []) if a and a != existing.get("canonical_name"))
+                if status:
+                    existing["status"] = status
+                if not existing.get("canonical_name"):
+                    existing["canonical_name"] = name
+                existing["aliases"] = sorted(alias_set)
+                if entity_type != "location":
+                    existing["type"] = entity_type
+                if chapter:
+                    existing["first_chapter"] = min(int(existing.get("first_chapter") or 0), int(chapter)) or 1
+                return current
+            entities[entity_id] = _create_default_entity(
+                name, entity_type=entity_type, chapter=chapter,
+                aliases=aliases, status=status,
+            )
+            return current
+
+        self._transition("register_entity", {"name": name, "type": entity_type}, mutator)
+        return self.get_entity_status_typed(name)
+
+    def get_entity_status_typed(self, name: str) -> dict:
+        """Return the full registry record for ``name`` (resolved via aliases)."""
+        canonical = self.resolve_entity_name(name)
+        if not canonical:
+            return {}
+        entities = self.state.get("entities", {})
+        record = entities.get(_canonical_character_key(canonical))
+        return deepcopy(record) if isinstance(record, dict) else {}
+
+    def update_entity_status(self, name: str, status: str) -> None:
+        """Update the status of an entity, keeping the character record in sync."""
+        status = str(status or "active").strip().lower()
+
+        def mutator(current: dict) -> dict:
+            entities = current.setdefault("entities", {})
+            canonical = self.resolve_entity_name(name)
+            if canonical:
+                target = _canonical_character_key(canonical)
+                record = entities.get(target)
+                if isinstance(record, dict):
+                    record["status"] = status
+                char = current.get("characters", {}).get(canonical)
+                if isinstance(char, dict):
+                    char["status"] = status
+            else:
+                entity_id = _canonical_character_key(name)
+                entities[entity_id] = _create_default_entity(
+                    name, entity_type="character", status=status,
+                )
+            return current
+
+        self._transition("update_entity_status", {"name": name, "status": status}, mutator)
 
     def get_current_chapter(self) -> int:
         return self.state.get("metadata", {}).get("current_chapter", 0)
@@ -759,13 +987,28 @@ class StateManager:
             if max_chapter == 0:
                 plot["legend_memory"] = []
 
-            # foreshadowing — no chapter tag; wipe entirely on full reset
+            # foreshadowing — filter by chapter; wipe entirely on full reset
+            foreshadowing = plot.get("foreshadowing", [])
+            if isinstance(foreshadowing, list):
+                plot["foreshadowing"] = [
+                    f for f in foreshadowing
+                    if isinstance(f, dict)
+                    and chapter_num(f.get("chapter", 0)) <= max_chapter
+                ]
             if max_chapter == 0:
                 plot["foreshadowing"] = []
 
             # unresolved_threads — no chapter tag; wipe entirely on full reset
             if max_chapter == 0:
                 plot["unresolved_threads"] = []
+
+            # style_exemplars — filter by chapter (style anchors for retrieval)
+            style_exemplars = plot.get("style_exemplars", [])
+            if isinstance(style_exemplars, list):
+                plot["style_exemplars"] = [
+                    e for e in style_exemplars
+                    if chapter_num(e.get("chapter", 0)) <= max_chapter
+                ]
 
             # transitions — filter to only transitions whose from_chapter <= max_chapter
             transitions = current.get("transitions", [])
@@ -902,6 +1145,74 @@ class StateManager:
             return current
 
         self._transition("apply_state_update", {"keys": list(updates.keys())}, mutator)
+
+    def record_style_exemplar(
+        self, chapter: int, score: float, text: str, max_entries: int = 2
+    ) -> None:
+        """Store a chapter's best-scored passage as a style anchor.
+
+        Keeps a small ring buffer (most recent ``max_entries``) under
+        ``plot.style_exemplars``. The retriever surfaces the latest entry as a
+        STYLE ANCHOR block so the writer imitates the story's own proven
+        rhythm and diction instead of drifting.
+        """
+        text = " ".join(str(text or "").split())
+        if not text:
+            return
+        # Keep it a style sample, not a content dump (~300 words).
+        words = text.split()
+        if len(words) > 320:
+            text = " ".join(words[:320])
+
+        def mutator(current: dict) -> dict:
+            plot = current.setdefault("plot", {})
+            exemplars = plot.get("style_exemplars")
+            if not isinstance(exemplars, list):
+                exemplars = []
+            exemplars.append({
+                "chapter": int(chapter or 0),
+                "score": round(float(score or 0.0), 3),
+                "text": text,
+            })
+            plot["style_exemplars"] = exemplars[-max_entries:]
+            return current
+
+        self._transition("record_style_exemplar", {"chapter": chapter}, mutator)
+
+    def add_foreshadowing(self, items: list, chapter: int, max_entries: int = 12) -> None:
+        """Record seeds planted by a chapter under plot.foreshadowing.
+
+        Each entry is ``{"chapter", "text", "status": "planted"}``. The
+        retriever surfaces recent seeds so later chapters can pay them off.
+        Keeps a bounded list of the most recent entries.
+        """
+        clean = []
+        for item in items or []:
+            text = str(item).strip()
+            if text:
+                clean.append(text)
+        if not clean:
+            return
+
+        def mutator(current: dict) -> dict:
+            plot = current.setdefault("plot", {})
+            seeds = plot.get("foreshadowing")
+            if not isinstance(seeds, list):
+                seeds = []
+            existing = {str(s.get("text", "")).strip().lower() for s in seeds
+                        if isinstance(s, dict)}
+            for text in clean:
+                if text.lower() in existing:
+                    continue
+                seeds.append({
+                    "chapter": int(chapter or 0),
+                    "text": text,
+                    "status": "planted",
+                })
+            plot["foreshadowing"] = seeds[-max_entries:]
+            return current
+
+        self._transition("add_foreshadowing", {"chapter": chapter, "count": len(clean)}, mutator)
 
     def normalize_character_traits(self) -> dict:
         """

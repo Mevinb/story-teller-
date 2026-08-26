@@ -10,6 +10,7 @@ from collections import Counter
 
 from models.base import LLMInterface
 from models.groq_model import GroqModel, ContentBlockedError
+from pipeline.errors import PipelineCancelledError
 from .contract import AgentContract
 
 import config
@@ -725,6 +726,7 @@ class SceneWriter(AgentContract):
 
     def _stream_from_model(self, model, prompt, system, temperature, stream_callback, max_tokens=None):
         self._last_provider = "groq" if isinstance(model, GroqModel) else "llama.cpp"
+        cancel_check = getattr(model, "_cancel_requested", None)
         chunks = []
         for chunk in model.generate_streaming(
             prompt=prompt,
@@ -733,6 +735,8 @@ class SceneWriter(AgentContract):
             max_tokens=max_tokens,
         ):
             chunks.append(chunk)
+            if cancel_check and cancel_check():
+                break
             if stream_callback:
                 if stream_callback(chunk) is False:
                     break
@@ -786,6 +790,8 @@ class SceneWriter(AgentContract):
                 return self._sanitize_scene_text(response.content)
         except ContentBlockedError:
             logger.warning("Groq content blocked. Falling back to local uncensored model.")
+        except PipelineCancelledError:
+            raise
         except Exception as e:
             logger.warning(f"Groq failed: {e}. Falling back to local model.")
 
@@ -806,6 +812,8 @@ class SceneWriter(AgentContract):
             )
             self._last_provider = response.provider
             return self._sanitize_scene_text(response.content)
+        except PipelineCancelledError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Both generation backends failed: {e}")
 
