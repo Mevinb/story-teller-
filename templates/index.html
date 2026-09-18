@@ -3,144 +3,314 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Multi-Agent Story Generation Pipeline — AI-powered long-form narrative creation with memory and consistency">
-    <title>Story Teller — AI Story Generation</title>
-    <link rel="stylesheet" href="/static/css/style.css?v=5">
+    <meta name="description" content="Story Teller — Next-Gen Multi-Agent AI Narrative Engine & Long-Form Creative Suite">
+    <title>Story Teller — AI Narrative Creative Suite</title>
+    <link rel="stylesheet" href="/static/css/style.css?v=12">
     <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🖊️</text></svg>">
 </head>
 <body>
+    <!-- Toast Notification Container -->
     <div class="toast-container" id="toastContainer"></div>
 
-    <div class="app-container">
-        <!-- Header -->
-        <header class="app-header">
-            <div class="app-logo">
-                <span class="app-logo-icon">🖊️</span>
-                <div>
-                    <h1>Story Teller</h1>
-                    <span>Multi-Agent Narrative Engine</span>
+    <!-- Universal Model Switcher Modal -->
+    <div class="modal-overlay hidden" id="modelSwitcherModal">
+        <div class="modal-box">
+            <div class="modal-header">
+                <div class="flex items-center gap-2">
+                    <span style="font-size:1.4rem;">⚡</span>
+                    <div>
+                        <h3 style="font-size:1.1rem;font-weight:700;">Select Active AI Model</h3>
+                        <span class="text-xs text-dim">Choose your narrative engine backend and model</span>
+                    </div>
+                </div>
+                <button class="btn btn-sm btn-icon" onclick="closeModelModal()" title="Close">✕</button>
+            </div>
+            <div class="modal-body">
+                <!-- Provider Tabs in Modal -->
+                <div class="bible-tabs mb-4" id="modalProviderTabs">
+                    <button class="bible-tab-btn active" onclick="filterModalModels('all')">All Providers</button>
+                    <button class="bible-tab-btn" onclick="filterModalModels('groq')">⚡ Groq</button>
+                    <button class="bible-tab-btn" onclick="filterModalModels('gemini')">✨ Gemini</button>
+                    <button class="bible-tab-btn" onclick="filterModalModels('openrouter')">🌐 OpenRouter</button>
+                    <button class="bible-tab-btn" onclick="filterModalModels('local')">💻 Local GGUF</button>
+                    <button class="bible-tab-btn" onclick="filterModalModels('hybrid')">🔀 Hybrid</button>
+                </div>
+                <div id="modalModelCardsContainer" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;">
+                    <!-- Dynamic Model Cards Injected Here -->
                 </div>
             </div>
-            <div class="header-actions">
-                <div class="model-selector-wrap" style="display:inline-flex;align-items:center;gap:8px;margin-right:8px;">
-                    <label class="text-dim text-sm" for="modelSelect" style="white-space:nowrap;">Model:</label>
-                    <select class="form-select" id="modelSelect" style="width:auto;min-width:180px;font-size:0.85rem;" onchange="switchModel(this.value)">
-                        <option value="">Loading...</option>
-                    </select>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModelModal()">Close</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Generic Confirmation Modal -->
+    <div class="modal-overlay hidden" id="confirmModal">
+        <div class="modal-box" style="max-width:440px;">
+            <div class="modal-header">
+                <h3 id="confirmModalTitle" style="font-size:1.05rem;font-weight:700;">Confirm Action</h3>
+                <button class="btn btn-sm btn-icon" onclick="closeConfirmModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <p id="confirmModalMessage" style="font-size:0.9rem;line-height:1.6;color:var(--text-secondary);">Are you sure you want to proceed?</p>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="btnConfirmCancel" onclick="closeConfirmModal()">Cancel</button>
+                <button class="btn btn-danger" id="btnConfirmAction">Confirm</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="app-container">
+        <!-- Top App Header -->
+        <header class="app-header">
+            <div class="header-left">
+                <div class="app-logo" onclick="switchView('dashboard')">
+                    <div class="logo-badge">🖊️</div>
+                    <div class="logo-text">
+                        <h1>Story Teller <span class="version-tag">v2.5 PRO</span></h1>
+                        <span>Multi-Agent Narrative Engine</span>
+                    </div>
                 </div>
-                <button class="btn btn-sm" onclick="switchView('settings')" title="Settings">⚙️ Settings</button>
-                <button class="btn btn-sm" id="btnRefresh" onclick="loadProjects()" title="Refresh">🔄 Refresh</button>
+
+                <!-- Active Project Pill -->
+                <div class="header-project-pill hidden" id="headerProjectPill">
+                    <span class="project-dot"></span>
+                    <span class="project-name" id="headerProjectName">No Project</span>
+                    <span class="project-badge" id="headerProjectStats">0 Ch</span>
+                    <button class="btn btn-sm btn-icon" onclick="switchView('edit')" title="Edit Story Details" style="width:24px;height:24px;font-size:11px;border:none;background:transparent;">✏️</button>
+                </div>
+            </div>
+
+            <div class="header-actions">
+                <!-- Smart Model Picker -->
+                <div class="model-picker-wrap">
+                    <button class="model-picker-btn" id="btnModelPicker" onclick="openModelModal()" title="Click to switch model">
+                        <span id="headerProviderIcon">⚡</span>
+                        <span id="headerModelName">Loading model...</span>
+                        <span class="model-picker-badge badge-groq" id="headerProviderBadge">GROQ</span>
+                        <span style="font-size:10px;opacity:0.6;">▼</span>
+                    </button>
+                </div>
+
+                <button class="btn btn-primary" onclick="switchView('create')" title="Create a new story project">
+                    ✨ New Story
+                </button>
+                <button class="btn" onclick="switchView('settings')" title="Settings & API Keys">
+                    ⚙️ Settings
+                </button>
+                <button class="btn btn-icon" id="btnRefresh" onclick="refreshCurrentView()" title="Refresh current view">
+                    🔄
+                </button>
             </div>
         </header>
 
-        <!-- Navigation -->
-        <nav class="nav-tabs" id="navTabs">
-            <button class="nav-tab active" data-view="dashboard" onclick="switchView('dashboard')">📚 Projects</button>
-            <button class="nav-tab" data-view="create" onclick="switchView('create')">✨ New Story</button>
-            <button class="nav-tab hidden" data-view="generate" onclick="switchView('generate')" id="tabGenerate">⚡ Generate</button>
-            <button class="nav-tab hidden" data-view="premise" onclick="switchView('premise')" id="tabPremise">🎬 Premise Generator</button>
-            <button class="nav-tab hidden" data-view="manual" onclick="switchView('manual')" id="tabManual">🧩 Manual Page</button>
-            <button class="nav-tab hidden" data-view="reader" onclick="switchView('reader')" id="tabReader">📖 Reader</button>
-            <button class="nav-tab hidden" data-view="logs" onclick="switchView('logs')" id="tabLogs">📋 Logs</button>
-            <button class="nav-tab hidden" data-view="state" onclick="switchView('state')" id="tabState">🧠 State</button>
-            <button class="nav-tab hidden" data-view="combine" onclick="switchView('combine')" id="tabCombine">📦 Combine</button>
-            <button class="nav-tab hidden" data-view="edit" onclick="switchView('edit')" id="tabEdit">✏️ Edit Story</button>
-            <button class="nav-tab" data-view="vision" onclick="switchView('vision')" id="tabVision">👁️ Vision Lab</button>
-            <button class="nav-tab" data-view="settings" onclick="switchView('settings')">⚙️ Settings</button>
-        </nav>
+        <!-- Navigation Tabs Bar -->
+        <div class="nav-tabs-wrapper">
+            <nav class="nav-tabs" id="navTabs">
+                <button class="nav-tab active" data-view="dashboard" onclick="switchView('dashboard')">
+                    <span class="tab-icon">📚</span> Story Library
+                </button>
+                <button class="nav-tab" data-view="create" onclick="switchView('create')">
+                    <span class="tab-icon">✨</span> New Story
+                </button>
+                <button class="nav-tab hidden" data-view="premise" onclick="switchView('premise')" id="tabPremise">
+                    <span class="tab-icon">🎬</span> Premise Studio
+                </button>
+                <button class="nav-tab hidden" data-view="generate" onclick="switchView('generate')" id="tabGenerate">
+                    <span class="tab-icon">⚡</span> Auto Generator
+                </button>
+                <button class="nav-tab hidden" data-view="manual" onclick="switchView('manual')" id="tabManual">
+                    <span class="tab-icon">🧩</span> Interactive Manual
+                </button>
+                <button class="nav-tab hidden" data-view="reader" onclick="switchView('reader')" id="tabReader">
+                    <span class="tab-icon">📖</span> Story Reader
+                </button>
+                <button class="nav-tab hidden" data-view="combine" onclick="switchView('combine')" id="tabCombine">
+                    <span class="tab-icon">📦</span> Combine & Polish
+                </button>
+                <button class="nav-tab hidden" data-view="state" onclick="switchView('state')" id="tabState">
+                    <span class="tab-icon">🧠</span> Story Bible
+                </button>
+                <button class="nav-tab hidden" data-view="logs" onclick="switchView('logs')" id="tabLogs">
+                    <span class="tab-icon">📋</span> Pipeline Logs
+                </button>
+                <button class="nav-tab hidden" data-view="edit" onclick="switchView('edit')" id="tabEdit">
+                    <span class="tab-icon">✏️</span> Edit Story
+                </button>
+                <button class="nav-tab" data-view="vision" onclick="switchView('vision')" id="tabVision">
+                    <span class="tab-icon">👁️</span> Vision Lab
+                </button>
+                <button class="nav-tab" data-view="settings" onclick="switchView('settings')">
+                    <span class="tab-icon">⚙️</span> Settings
+                </button>
+            </nav>
+        </div>
 
-        <!-- Dashboard View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 1: Story Library / Dashboard
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view active" id="viewDashboard">
+            <div class="dashboard-header">
+                <div>
+                    <h2 style="font-size:1.4rem;font-weight:800;letter-spacing:-0.02em;">Story Library</h2>
+                    <span class="text-sm text-dim">Manage, continue, and explore your AI-crafted narratives</span>
+                </div>
+                <div class="flex gap-2 items-center">
+                    <input class="form-input" id="searchProjectsInput" placeholder="🔍 Search stories..." style="width:220px;padding:8px 14px;font-size:0.84rem;" oninput="filterProjectsList()">
+                    <select class="form-select" id="filterGenreSelect" style="width:160px;padding:8px 14px;font-size:0.84rem;" onchange="filterProjectsList()">
+                        <option value="all">All Genres</option>
+                        <option value="dark fantasy">Dark Fantasy</option>
+                        <option value="sci-fi">Sci-Fi</option>
+                        <option value="thriller">Thriller</option>
+                        <option value="romance">Romance</option>
+                        <option value="mystery">Mystery</option>
+                        <option value="horror">Horror</option>
+                        <option value="literary fiction">Literary Fiction</option>
+                    </select>
+                </div>
+            </div>
+
+            <!-- Stats Strip -->
+            <div class="dashboard-stats-strip" id="dashboardStatsStrip">
+                <div class="stat-pill-card">
+                    <div class="stat-pill-icon">📚</div>
+                    <div class="stat-pill-info">
+                        <h4 id="statTotalStories">0</h4>
+                        <span>Total Stories</span>
+                    </div>
+                </div>
+                <div class="stat-pill-card">
+                    <div class="stat-pill-icon">📑</div>
+                    <div class="stat-pill-info">
+                        <h4 id="statTotalChapters">0</h4>
+                        <span>Chapters Written</span>
+                    </div>
+                </div>
+                <div class="stat-pill-card">
+                    <div class="stat-pill-icon">✍️</div>
+                    <div class="stat-pill-info">
+                        <h4 id="statTotalWords">0k</h4>
+                        <span>Words Generated</span>
+                    </div>
+                </div>
+                <div class="stat-pill-card">
+                    <div class="stat-pill-icon">⚡</div>
+                    <div class="stat-pill-info">
+                        <h4 id="statActiveEngine">Groq</h4>
+                        <span>Active Engine</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Projects Grid -->
             <div class="projects-grid" id="projectsGrid">
-                <div class="empty-state">
+                <div class="empty-state" style="grid-column:1/-1;">
                     <span class="icon">📚</span>
-                    <h3>No stories yet</h3>
-                    <p>Create your first story project to get started.</p>
-                    <button class="btn btn-primary" onclick="switchView('create')">✨ Create Story</button>
+                    <h3>No stories in your library yet</h3>
+                    <p>Create your first narrative project to begin generating immersive, consistent multi-chapter novels.</p>
+                    <button class="btn btn-primary" onclick="switchView('create')">✨ Create First Story</button>
                 </div>
             </div>
         </div>
 
-        <!-- Create Project View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 2: Create New Story
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewCreate">
-            <div class="create-form">
+            <div class="create-story-container">
                 <div class="card">
                     <div class="card-header">
-                        <span class="card-title"><span class="icon">✨</span> New Story Project</span>
+                        <span class="card-title"><span class="icon">✨</span> Create New Story Project</span>
                     </div>
 
-                    <div class="form-group">
-                        <label class="form-label">Title</label>
-                        <input class="form-input" id="createTitle" placeholder="The Crimson Thread" required>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Genre</label>
-                        <select class="form-select" id="createGenre">
-                            <option value="dark fantasy">Dark Fantasy</option>
-                            <option value="romance">Romance</option>
-                            <option value="thriller">Thriller</option>
-                            <option value="sci-fi">Sci-Fi</option>
-                            <option value="horror">Horror</option>
-                            <option value="erotica">Erotica</option>
-                            <option value="urban fantasy">Urban Fantasy</option>
-                            <option value="mystery">Mystery</option>
-                            <option value="literary fiction">Literary Fiction</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Premise</label>
-                        <textarea class="form-textarea" id="createPremise" rows="3"
-                            placeholder="Describe the core idea of your story..."></textarea>
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Setting</label>
-                        <input class="form-input" id="createSetting" placeholder="Victorian London, 1888">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Themes (comma-separated)</label>
-                        <input class="form-input" id="createThemes" placeholder="betrayal, redemption, power">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Characters</label>
-                        <div class="character-list" id="characterList"></div>
-                        <div class="flex gap-2">
-                            <input class="form-input" id="charName" placeholder="Name" style="flex:1">
-                            <input class="form-input" id="charDesc" placeholder="Description" style="flex:2">
-                            <input class="form-input" id="charTraits" placeholder="Traits (comma-sep)" style="flex:1.5">
-                            <button class="btn btn-sm" onclick="addCharacter()">+ Add</button>
+                    <div class="grid-cols-2" style="display:grid;grid-template-columns:1.2fr 0.8fr;gap:20px;">
+                        <div class="form-group">
+                            <label class="form-label">Story Title</label>
+                            <input class="form-input" id="createTitle" placeholder="e.g., The Obsidian Citadel" required>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Genre</label>
+                            <select class="form-select" id="createGenre">
+                                <option value="dark fantasy">Dark Fantasy</option>
+                                <option value="sci-fi">Sci-Fi / Cyberpunk</option>
+                                <option value="thriller">Psychological Thriller</option>
+                                <option value="romance">Romance / Drama</option>
+                                <option value="horror">Horror / Supernatural</option>
+                                <option value="mystery">Mystery / Detective</option>
+                                <option value="urban fantasy">Urban Fantasy</option>
+                                <option value="literary fiction">Literary Fiction</option>
+                                <option value="erotica">Erotica / Romance</option>
+                            </select>
                         </div>
                     </div>
 
-                    <div class="mt-4">
-                        <button class="btn btn-primary" onclick="createProject()" id="btnCreateProject">
-                            🚀 Create Project
+                    <div class="form-group">
+                        <label class="form-label">Core Premise / Pitch</label>
+                        <textarea class="form-textarea" id="createPremise" rows="3"
+                            placeholder="Describe the central conflict, protagonist motivation, and high-level story arc..."></textarea>
+                    </div>
+
+                    <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                        <div class="form-group">
+                            <label class="form-label">World Setting</label>
+                            <input class="form-input" id="createSetting" placeholder="e.g., Sunken Neo-Venice, Year 2142">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Themes (comma-separated)</label>
+                            <input class="form-input" id="createThemes" placeholder="e.g., memory loss, corporate greed, AI soul">
+                        </div>
+                    </div>
+
+                    <!-- Character Builder -->
+                    <div class="form-group mt-2">
+                        <label class="form-label">
+                            <span>Story Characters</span>
+                            <span class="text-xs text-dim">Define cast members with distinct voices and traits</span>
+                        </label>
+                        <div class="character-builder-list" id="characterList"></div>
+                        
+                        <div class="flex gap-2" style="flex-wrap:wrap;">
+                            <input class="form-input" id="charName" placeholder="Name (e.g., Evelyn Crane)" style="flex:1.2;min-width:140px;">
+                            <input class="form-input" id="charDesc" placeholder="Role/Description (e.g., Rogue cyber-archivist)" style="flex:2;min-width:180px;">
+                            <input class="form-input" id="charTraits" placeholder="Traits (e.g., cynical, observant, secretive)" style="flex:1.5;min-width:160px;">
+                            <button class="btn btn-secondary" onclick="addCharacter()" type="button">➕ Add Character</button>
+                        </div>
+                    </div>
+
+                    <div class="mt-6 flex justify-end gap-3" style="border-top:1px solid var(--border-subtle);padding-top:20px;">
+                        <button class="btn btn-secondary" onclick="switchView('dashboard')">Cancel</button>
+                        <button class="btn btn-primary btn-lg" onclick="createProject()" id="btnCreateProject">
+                            🚀 Initialize Story Studio
                         </button>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Edit Project View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 3: Edit Story Details
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewEdit">
-            <div class="create-form">
+            <div class="create-story-container">
                 <div class="card">
                     <div class="card-header">
-                        <span class="card-title"><span class="icon">✏️</span> Edit Story Details</span>
+                        <span class="card-title"><span class="icon">✏️</span> Edit Story Lore & Metadata</span>
+                        <div class="flex gap-2">
+                            <button class="btn btn-danger btn-sm" onclick="deleteCurrentProject()" title="Delete this story">🗑️ Delete Project</button>
+                        </div>
                     </div>
 
-                    <div class="form-group">
-                        <label class="form-label">Title</label>
-                        <input class="form-input" id="editTitle">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Genre</label>
-                        <input class="form-input" id="editGenre">
+                    <div class="grid-cols-2" style="display:grid;grid-template-columns:1.2fr 0.8fr;gap:20px;">
+                        <div class="form-group">
+                            <label class="form-label">Title</label>
+                            <input class="form-input" id="editTitle">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Genre</label>
+                            <input class="form-input" id="editGenre">
+                        </div>
                     </div>
 
                     <div class="form-group">
@@ -148,956 +318,602 @@
                         <textarea class="form-textarea" id="editPremise" rows="3"></textarea>
                     </div>
 
-                    <div class="form-group">
-                        <label class="form-label">Setting</label>
-                        <input class="form-input" id="editSetting">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Themes (comma-separated)</label>
-                        <input class="form-input" id="editThemes">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Add/Update Character</label>
-                        <div class="flex gap-2">
-                            <input class="form-input" id="editCharName" placeholder="Name" style="flex:1">
-                            <input class="form-input" id="editCharDesc" placeholder="Description" style="flex:2">
-                            <input class="form-input" id="editCharTraits" placeholder="Traits (comma-sep)" style="flex:1.5">
-                            <button class="btn btn-sm" onclick="addEditCharacter()">+ Add/Update</button>
+                    <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">
+                        <div class="form-group">
+                            <label class="form-label">Setting</label>
+                            <input class="form-input" id="editSetting">
                         </div>
-                        <div class="text-sm text-dim mt-2" style="margin-bottom:8px">Note: This only updates the definition. Existing plot occurrences will remain in the text.</div>
-                        <div class="character-list" id="editCharacterList"></div>
+                        <div class="form-group">
+                            <label class="form-label">Themes (comma-separated)</label>
+                            <input class="form-input" id="editThemes">
+                        </div>
                     </div>
 
-                    <div class="mt-4">
+                    <div class="form-group mt-2">
+                        <label class="form-label">Add / Update Characters</label>
+                        <div class="flex gap-2" style="margin-bottom:12px;">
+                            <input class="form-input" id="editCharName" placeholder="Name" style="flex:1;">
+                            <input class="form-input" id="editCharDesc" placeholder="Description" style="flex:2;">
+                            <input class="form-input" id="editCharTraits" placeholder="Traits (comma-sep)" style="flex:1.5;">
+                            <button class="btn btn-secondary btn-sm" onclick="addEditCharacter()">+ Save Character</button>
+                        </div>
+                        <div class="character-builder-list" id="editCharacterList"></div>
+                    </div>
+
+                    <div class="mt-6 flex justify-end gap-3" style="border-top:1px solid var(--border-subtle);padding-top:20px;">
+                        <button class="btn btn-secondary" onclick="switchView('dashboard')">Cancel</button>
                         <button class="btn btn-primary" onclick="saveProjectEdits()" id="btnSaveEdits">
-                            💾 Save Changes
+                            💾 Save Story Changes
                         </button>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Premise Generator View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 4: Premise Studio
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewPremise">
-            <div class="premise-view-grid" style="display:grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                <!-- Left: Inputs -->
-                <div class="card" style="display:flex; flex-direction:column; gap:16px;">
-                    <div class="card-header" style="border-bottom: 1px solid var(--border); padding-bottom:12px;">
-                        <span class="card-title"><span class="icon">🎬</span> Story Premise Context</span>
+            <div class="premise-studio-grid">
+                <!-- Left: Outline Dump & Lore Context -->
+                <div class="card flex flex-col gap-3">
+                    <div class="card-header" style="border-bottom:1px solid var(--border-subtle);padding-bottom:14px;">
+                        <span class="card-title"><span class="icon">🎬</span> Story Lore & Rough Outline</span>
                     </div>
 
                     <div class="form-group">
-                        <label class="form-label">Setting</label>
+                        <label class="form-label">Setting Context</label>
                         <input class="form-input" id="premiseSetting" placeholder="e.g., Victorian London, 1888">
                     </div>
 
                     <div class="form-group">
-                        <label class="form-label">Themes (comma-separated)</label>
+                        <label class="form-label">Themes</label>
                         <input class="form-input" id="premiseThemes" placeholder="e.g., betrayal, redemption, power">
                     </div>
 
                     <div class="form-group">
-                        <label class="form-label">Active Characters</label>
-                        <div id="premiseCharactersList" class="character-list" style="max-height:120px; overflow-y:auto; background:rgba(0,0,0,0.15); padding:10px; border-radius:6px; border:1px solid var(--border);">
-                            <span class="text-dim text-sm">No characters loaded.</span>
+                        <label class="form-label">Cast Characters</label>
+                        <div id="premiseCharactersList" class="flex gap-2" style="flex-wrap:wrap;max-height:110px;overflow-y:auto;padding:8px;background:rgba(0,0,0,0.2);border-radius:var(--radius-sm);border:1px solid var(--border-subtle);">
+                            <span class="text-dim text-xs">No characters loaded.</span>
                         </div>
                     </div>
 
-                    <div class="form-group">
-                        <label class="form-label" style="display:flex; justify-content:space-between; align-items:center;">
+                    <div class="form-group" style="flex:1;display:flex;flex-direction:column;">
+                        <label class="form-label">
                             <span>Rough Story Idea / Timeline Dump</span>
-                            <span class="text-xs text-dim">Write your timeline/outlines in any order</span>
+                            <span class="text-xs text-dim">Unstructured notes, chapter ideas, or bullet beats</span>
                         </label>
-                        <textarea class="form-textarea" id="premiseIdeaText" rows="12" style="font-family:'Lora', serif; font-size:0.9rem;"
-                            placeholder="Dump your thoughts, character roles, chapter breakdowns, or rough timeline of events here. The AI will analyze this unstructured data and arrange it into a logical, sequential storyline..."></textarea>
+                        <textarea class="form-textarea" id="premiseIdeaText" rows="10" style="flex:1;font-family:var(--font-serif);font-size:0.9rem;"
+                            placeholder="Paste or dump your stream-of-consciousness story ideas, plot points, twists, or rough chapter outlines. The AI Story Architect will parse and organize them into chronological narrative beats..."></textarea>
                     </div>
 
-                    <div style="margin-top:auto;">
-                        <button class="btn btn-primary" id="btnPremiseGenerate" onclick="aiGeneratePremise()" style="width:100%;">
-                            ✨ Generate Structured Beats from Outline
-                        </button>
-                    </div>
+                    <button class="btn btn-primary w-full" id="btnPremiseGenerate" onclick="aiGeneratePremise()">
+                        ✨ Generate Structured Beats from Outline
+                    </button>
                 </div>
 
-                <!-- Right: Timeline beats -->
-                <div class="card" style="display:flex; flex-direction:column; gap:16px; min-height:600px;">
-                    <div class="card-header" style="border-bottom: 1px solid var(--border); padding-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+                <!-- Right: Timeline Beats Editor -->
+                <div class="card flex flex-col gap-3" style="min-height:640px;">
+                    <div class="card-header" style="border-bottom:1px solid var(--border-subtle);padding-bottom:14px;">
                         <span class="card-title"><span class="icon">📋</span> Narrative Timeline Beats</span>
                         <div class="flex gap-2">
-                            <button class="btn btn-sm" onclick="addBlankPremiseStep()" style="font-size:0.8rem; padding: 4px 10px;">➕ Add Step</button>
+                            <button class="btn btn-sm btn-secondary" onclick="addBlankPremiseStep()">➕ Add Beat</button>
                         </div>
                     </div>
 
-                    <p class="text-sm text-dim" style="margin-bottom:0;">
-                        Arrange the story events below in the exact chronological order they should occur. Each step represents a distinct segment of the narrative.
+                    <p class="text-xs text-dim" style="margin-bottom:0;">
+                        Chronological sequence of story events. The AI Pipeline generates chapters by advancing along these beats.
                     </p>
 
-                    <!-- Timeline container -->
-                    <div id="premiseTimelineContainer" style="flex:1; overflow-y:auto; max-height:500px; display:flex; flex-direction:column; gap:12px; padding-right:4px;">
+                    <!-- Timeline beats stream -->
+                    <div id="premiseTimelineContainer" style="flex:1;overflow-y:auto;max-height:480px;display:flex;flex-direction:column;gap:10px;padding-right:4px;">
                         <div class="empty-state">
                             <span class="icon">📋</span>
-                            <h3>No beats defined</h3>
-                            <p>Dump a rough outline on the left and click "Generate Structured beats" or add steps manually.</p>
+                            <h3>No beats generated yet</h3>
+                            <p>Enter your outline on the left and click "Generate Structured Beats" to populate your timeline.</p>
                         </div>
                     </div>
 
-                    <!-- Actions -->
-                    <div style="border-top:1px solid var(--border); padding-top:16px; display:flex; flex-direction:column; gap:12px;">
-                        <div class="flex gap-2" style="width:100%;">
-                            <button class="btn" id="btnPremiseRefine" onclick="aiRefinePremiseFlow()" style="flex:1; background:var(--accent-secondary); color:#fff;">
-                                ⚖️ Refine Pacing & Flow
+                    <!-- Actions Footer -->
+                    <div style="border-top:1px solid var(--border-subtle);padding-top:16px;display:flex;flex-direction:column;gap:10px;">
+                        <div class="flex gap-2 w-full">
+                            <button class="btn btn-secondary" id="btnPremiseRefine" onclick="aiRefinePremiseFlow()" style="flex:1;">
+                                ⚖️ Refine Flow & Pacing
                             </button>
-                            <button class="btn" id="btnPremiseExpand" onclick="aiExpandPremiseBeats()" style="flex:1; background:var(--accent-secondary); color:#fff;">
-                                🚀 Expand (Add Scenes)
+                            <button class="btn btn-secondary" id="btnPremiseExpand" onclick="aiExpandPremiseBeats()" style="flex:1;">
+                                🚀 Expand (Add Beats)
                             </button>
                         </div>
-                        <button class="btn btn-primary" id="btnPremiseSave" onclick="savePremiseToProject()" style="width:100%;">
-                            💾 Save Premise to Project
+                        <button class="btn btn-primary w-full" id="btnPremiseSave" onclick="savePremiseToProject()">
+                            💾 Save Timeline to Story Bible
                         </button>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Generate View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 5: Autonomous Generation Studio (Pipeline View)
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewGenerate">
-            <div class="gen-container">
-                <!-- Branch Options (Phase C) -->
-                <div class="card hidden" id="branchOptionsCard" style="grid-column: 1 / -1;">
-                    <div class="card-header">
-                        <span class="card-title"><span class="icon">🔀</span> Next Chapter — Branch Options</span>
-                        <div class="flex gap-2 items-center">
-                            <input class="form-input" id="branchDirectionHint" placeholder="Optional steering hint…"
-                                   style="width:220px;padding:4px 8px;font-size:0.85rem">
-                            <button class="btn btn-sm" onclick="loadBranchOptions()" id="btnBranchRefresh">🔄 Refresh</button>
-                            <button class="btn btn-sm" onclick="hideBranchOptions()" title="Close">✕</button>
-                        </div>
-                    </div>
-                    <div id="branchOptionsList" style="padding:12px">
-                        <div class="text-dim text-sm">Asking the story architect for directions…</div>
+            <!-- Branch Options Drawer -->
+            <div class="card hidden mb-4" id="branchOptionsCard">
+                <div class="card-header">
+                    <span class="card-title"><span class="icon">🔀</span> Next Chapter — Narrative Branch Directions</span>
+                    <div class="flex gap-2 items-center">
+                        <input class="form-input" id="branchDirectionHint" placeholder="Optional steering prompt..." style="width:220px;padding:5px 10px;font-size:0.82rem;">
+                        <button class="btn btn-sm btn-secondary" onclick="loadBranchOptions()" id="btnBranchRefresh">🔄 Propose</button>
+                        <button class="btn btn-sm btn-icon" onclick="hideBranchOptions()">✕</button>
                     </div>
                 </div>
+                <div id="branchOptionsList" style="padding:8px;">
+                    <div class="text-dim text-sm">Consulting Story Architect for next chapter paths...</div>
+                </div>
+            </div>
 
-                <!-- Continuity Report (Phase C) -->
-                <div class="card hidden" id="continuityCard" style="grid-column: 1 / -1;">
-                    <div class="card-header">
-                        <span class="card-title"><span class="icon">🧭</span> Continuity Report</span>
-                        <div class="flex gap-2">
-                            <button class="btn btn-sm" onclick="loadContinuityReport()" id="btnContinuityRefresh">🔄 Refresh</button>
-                            <button class="btn btn-sm" onclick="hideContinuityReport()" title="Close">✕</button>
-                        </div>
-                    </div>
-                    <div id="continuityReportBody" style="padding:12px">
-                        <div class="text-dim text-sm">Loading…</div>
+            <!-- Continuity Report Drawer -->
+            <div class="card hidden mb-4" id="continuityCard">
+                <div class="card-header">
+                    <span class="card-title"><span class="icon">🧭</span> Continuity & Thread Health Report</span>
+                    <div class="flex gap-2">
+                        <button class="btn btn-sm btn-secondary" onclick="loadContinuityReport()" id="btnContinuityRefresh">🔄 Refresh</button>
+                        <button class="btn btn-sm btn-icon" onclick="hideContinuityReport()">✕</button>
                     </div>
                 </div>
+                <div id="continuityReportBody" style="padding:10px;">
+                    <div class="text-dim text-sm">Analyzing narrative threads, lore rules, and character states...</div>
+                </div>
+            </div>
 
-                <!-- Main Output -->
-                <div class="card">
+            <!-- Generation Layout Grid -->
+            <div class="gen-layout">
+                <!-- Main Canvas & Stream -->
+                <div class="card flex flex-col gap-4">
                     <div class="card-header">
-                        <span class="card-title" id="genTitle"><span class="icon">✍️</span> Generation Output</span>
-                        <div class="flex gap-2">
-                            <select class="form-select" id="genPacing" style="width:auto">
-                                <option value="slow">🐌 Slow</option>
+                        <span class="card-title" id="genTitle"><span class="icon">✍️</span> Chapter Generation Studio</span>
+                        <div class="flex gap-2 items-center" style="flex-wrap:wrap;">
+                            <select class="form-select" id="genPacing" style="width:auto;min-width:120px;" title="Narrative Pacing">
+                                <option value="slow">🐌 Slow Build</option>
                                 <option value="moderate" selected>⚖️ Moderate</option>
-                                <option value="fast">⚡ Fast</option>
+                                <option value="fast">⚡ Fast Pace</option>
                                 <option value="climactic">🔥 Climactic</option>
                             </select>
-                            <select class="form-select" id="genChapterCount" style="width:auto" title="Number of chapters to generate">
+                            <select class="form-select" id="genChapterCount" style="width:auto;min-width:140px;" title="Number of chapters">
                                 <option value="1">1 Chapter</option>
                                 <option value="2">2 Chapters</option>
                                 <option value="3">3 Chapters</option>
                                 <option value="5">5 Chapters</option>
                                 <option value="10">10 Chapters</option>
-                                <option value="-1">📖 Entire Story (All Remaining Chapters)</option>
-                                <option value="-2">🎬 Until Premise Completed (Complete Story)</option>
+                                <option value="-1">📖 Entire Story</option>
+                                <option value="-2">🎬 Complete Timeline</option>
                             </select>
-                            <button class="btn" onclick="loadBranchOptions()" id="btnBranchOptions" title="Propose directions for the next chapter" style="background:var(--accent-secondary);color:#fff">
+                            <button class="btn btn-secondary" onclick="loadBranchOptions()" id="btnBranchOptions" title="Propose branching paths">
                                 🔀 Branch
                             </button>
-                            <button class="btn" onclick="loadContinuityReport()" id="btnContinuity" title="Threads, seeds, characters, motifs">
+                            <button class="btn btn-secondary" onclick="loadContinuityReport()" id="btnContinuity" title="Check continuity">
                                 🧭 Continuity
                             </button>
                             <button class="btn btn-primary" onclick="startGeneration()" id="btnGenerate">
-                                ▶ Generate
+                                ▶ Start Pipeline
                             </button>
                             <button class="btn btn-danger hidden" onclick="cancelGeneration()" id="btnCancel">
-                                ⏹ Cancel
+                                🛑 Cancel
                             </button>
                         </div>
                     </div>
-                    <div class="gen-output" id="genOutput">
+
+                    <!-- Output Stream Prose Canvas -->
+                    <div class="gen-prose-canvas" id="genOutput">
                         <div class="empty-state">
                             <span class="icon">✍️</span>
-                            <h3>Ready to generate</h3>
-                            <p>Click "Generate Chapter" to start the pipeline.</p>
+                            <h3>Autonomous Engine Ready</h3>
+                            <p>Select your pacing and chapter count, then click "Start Pipeline" to watch the multi-agent system craft your story in real time.</p>
                         </div>
                     </div>
                 </div>
 
-                <!-- Sidebar -->
-                <div class="gen-sidebar">
-                    <!-- Pipeline Monitor -->
+                <!-- Sidebar Monitor -->
+                <div class="flex flex-col gap-4">
+                    <!-- Multi-Agent Stage Tracker -->
                     <div class="card">
-                        <div class="card-header">
-                            <span class="card-title"><span class="icon">⚙️</span> Pipeline</span>
+                        <div class="card-header" style="margin-bottom:12px;">
+                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">⚙️</span> Agent Pipeline</span>
                         </div>
-                        <div id="pipelineStages">
-                            <div class="pipeline-stage idle" data-stage="retriever">
-                                <span class="stage-icon">🔍</span> Retriever
+                        <div class="pipeline-nodes-list" id="pipelineStages">
+                            <div class="pipeline-node" data-stage="retriever">
+                                <span class="node-icon">🔍</span> Retriever
+                                <span class="node-pulse-dot"></span>
                             </div>
-                            <div class="pipeline-stage idle" data-stage="architect">
-                                <span class="stage-icon">🏗️</span> Architect
+                            <div class="pipeline-node" data-stage="architect">
+                                <span class="node-icon">🏗️</span> Story Architect
+                                <span class="node-pulse-dot"></span>
                             </div>
-                            <div class="pipeline-stage idle" data-stage="planner">
-                                <span class="stage-icon">📋</span> Scene Planner
+                            <div class="pipeline-node" data-stage="planner">
+                                <span class="node-icon">📋</span> Scene Planner
+                                <span class="node-pulse-dot"></span>
                             </div>
-                            <div class="pipeline-stage idle" data-stage="writer">
-                                <span class="stage-icon">✍️</span> Scene Writer
+                            <div class="pipeline-node" data-stage="writer">
+                                <span class="node-icon">✍️</span> Scene Writer
+                                <span class="node-pulse-dot"></span>
                             </div>
-                            <div class="pipeline-stage idle" data-stage="consistency">
-                                <span class="stage-icon">🛡️</span> Consistency
+                            <div class="pipeline-node" data-stage="consistency">
+                                <span class="node-icon">🛡️</span> Consistency Engine
+                                <span class="node-pulse-dot"></span>
                             </div>
-                            <div class="pipeline-stage idle" data-stage="editor">
-                                <span class="stage-icon">✏️</span> Editor
+                            <div class="pipeline-node" data-stage="editor">
+                                <span class="node-icon">✏️</span> Quality Editor
+                                <span class="node-pulse-dot"></span>
                             </div>
-                            <div class="pipeline-stage idle" data-stage="storage">
-                                <span class="stage-icon">💾</span> Storage
+                            <div class="pipeline-node" data-stage="verifier">
+                                <span class="node-icon">🎯</span> Drift Verifier
+                                <span class="node-pulse-dot"></span>
+                            </div>
+                            <div class="pipeline-node" data-stage="storage">
+                                <span class="node-icon">💾</span> Storage & Vector Memory
+                                <span class="node-pulse-dot"></span>
                             </div>
                         </div>
-                        <div class="scene-progress mt-2" id="sceneProgress"></div>
+                        <div class="mt-3 text-xs text-dim" id="sceneProgress"></div>
                     </div>
 
-                    <!-- Stats -->
+                    <!-- Live Generation Stats -->
                     <div class="card">
-                        <div class="card-header">
-                            <span class="card-title"><span class="icon">📊</span> Stats</span>
+                        <div class="card-header" style="margin-bottom:12px;">
+                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">📊</span> Generation Telemetry</span>
                         </div>
-                        <div class="text-sm" id="genStats">
-                            <p>Words: <span id="statWords">0</span></p>
-                            <p>Scenes: <span id="statScenes">0/0</span></p>
-                            <p>Provider: <span id="statProvider">—</span></p>
-                            <p class="mt-2 text-dim" id="statStatus">Idle</p>
+                        <div class="flex flex-col gap-2 text-sm" id="genStats">
+                            <div class="flex justify-between"><span class="text-dim">Words:</span> <strong id="statWords">0</strong></div>
+                            <div class="flex justify-between"><span class="text-dim">Scenes:</span> <strong id="statScenes">0/0</strong></div>
+                            <div class="flex justify-between"><span class="text-dim">Provider:</span> <strong id="statProvider">—</strong></div>
+                            <div class="flex justify-between"><span class="text-dim">Status:</span> <span id="statStatus" class="badge badge-local" style="font-size:0.75rem;">Idle</span></div>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Manual Plan View (Interactive Scene-by-Scene) -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 6: Interactive Manual Generation Studio
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewManual">
             <div class="manual-container">
                 <!-- Phase 1: Start Chapter -->
                 <div class="card" id="manualStartCard">
                     <div class="card-header">
-                        <span class="card-title"><span class="icon">🧩</span> Interactive Manual Generation</span>
+                        <span class="card-title"><span class="icon">🧩</span> Interactive Chapter Studio</span>
                     </div>
-                    <p class="text-dim text-sm" style="margin-bottom:16px">
-                        Generate your chapter scene by scene. Enter a chapter title to start, then add scenes one at a time.
+                    <p class="text-sm text-secondary" style="margin-bottom:18px;">
+                        Direct and co-author your story scene by scene. Provide a custom prompt for each scene or write raw prose directly.
                     </p>
 
                     <div class="form-group">
-                        <label class="form-label">Chapter heading</label>
-                        <input class="form-input" id="manualChapterTitle" placeholder="Chapter title / heading">
+                        <label class="form-label">Chapter Title / Heading</label>
+                        <input class="form-input" id="manualChapterTitle" placeholder="e.g., Chapter 4: The Whispering Gallery">
                     </div>
 
-                    <div class="flex gap-2 items-center">
-                        <select class="form-select" id="manualPacing" style="width:auto">
-                            <option value="slow">🐌 Slow</option>
+                    <div class="flex gap-3 items-center">
+                        <select class="form-select" id="manualPacing" style="width:auto;">
+                            <option value="slow">🐌 Slow Build</option>
                             <option value="moderate" selected>⚖️ Moderate</option>
                             <option value="fast">⚡ Fast</option>
                             <option value="climactic">🔥 Climactic</option>
                         </select>
                         <button class="btn btn-primary" onclick="startManualChapter()" id="btnManualStart">
-                            🚀 Start Chapter
+                            🚀 Start Directing Chapter
                         </button>
                     </div>
                 </div>
 
-                <!-- Phase 2: Scene-by-Scene Generation (hidden until chapter started) -->
+                <!-- Phase 2: Active Scene-by-Scene Studio -->
                 <div class="card hidden" id="manualSceneCard">
                     <div class="card-header">
                         <span class="card-title" id="manualSessionTitle"><span class="icon">✍️</span> Chapter in Progress</span>
                         <div class="flex gap-2 items-center">
-                            <span class="text-dim text-sm" id="manualSceneCounter">Scene 0 completed</span>
-                            <button class="btn btn-sm btn-danger hidden" onclick="cancelManualSession()" id="btnManualCancel">✕ Cancel</button>
+                            <span class="text-xs text-dim" id="manualSceneCounter">0 scenes completed</span>
+                            <button class="btn btn-sm btn-danger" onclick="cancelManualSession()" id="btnManualCancel">✕ Reset Session</button>
                         </div>
                     </div>
 
-                    <!-- Completed scenes display -->
+                    <!-- Completed scenes stream -->
                     <div class="manual-completed-scenes" id="manualCompletedScenes"></div>
 
-                    <!-- Scene input area -->
+                    <!-- Next Scene Prompt Dock -->
                     <div id="manualSceneInputArea">
-                        <div class="form-group" style="margin-bottom:8px">
-                            <label class="form-label" id="manualSceneLabel">Scene 1 — Describe what should happen</label>
+                        <div class="form-group">
+                            <label class="form-label" id="manualSceneLabel">Scene 1 — What happens next?</label>
                             <textarea class="form-textarea" id="manualSceneBrief" rows="3"
-                                placeholder="Enter the theme/prompt for this scene... (e.g. 'The protagonist discovers a hidden letter in the attic')"></textarea>
+                                placeholder="Describe what should happen in this scene... (e.g., 'Evelyn discovers a hidden ledger in Lord Ronald\'s study, but hears footsteps approaching the door.')"></textarea>
                         </div>
-                        <div class="flex gap-2 items-center" style="flex-wrap:wrap">
+
+                        <div class="flex gap-2 items-center" style="flex-wrap:wrap;">
                             <button class="btn btn-primary" onclick="generateNextScene()" id="btnManualScene">
-                                ▶ Generate Scene
+                                ▶ Generate Scene (AI)
                             </button>
-                            <button class="btn" onclick="toggleTypedScenePanel()" id="btnManualTypeScene"
-                                style="background:var(--accent-secondary);color:#fff" title="Write a scene manually by typing it">
-                                ✍️ Type Scene
+                            <button class="btn btn-secondary" onclick="toggleTypedScenePanel()" id="btnManualTypeScene">
+                                ✍️ Write Scene (Manual Prose)
                             </button>
                             <button class="btn btn-danger hidden" onclick="stopManualScene()" id="btnManualStopScene">
-                                🛑 Stop Scene
+                                🛑 Stop Generation
                             </button>
-                            <button class="btn hidden" onclick="finishManualChapter()" id="btnManualFinish"
-                                style="background:var(--success);color:#fff">
-                                ✅ Finish Chapter
+                            <button class="btn btn-success hidden" onclick="finishManualChapter()" id="btnManualFinish">
+                                ✅ Finish & Save Chapter
                             </button>
-                            <span class="text-dim text-sm hidden" id="manualSceneStatus"></span>
+                            <span class="text-xs text-dim hidden" id="manualSceneStatus"></span>
                         </div>
                     </div>
 
-                    <!-- Typed scene panel (hidden by default) -->
-                    <div class="hidden" id="manualTypedScenePanel" style="margin-top:16px">
-                        <div class="card" style="background:var(--surface-2);padding:16px;border:2px dashed var(--accent-secondary);border-radius:8px">
-                            <div class="text-sm" style="margin-bottom:8px;font-weight:600;color:var(--accent-secondary)">✍️ Type your scene text directly</div>
-                            <p class="text-dim text-sm" style="margin-bottom:12px">Write the scene prose exactly as it should appear in the chapter. This bypasses AI generation entirely.</p>
+                    <!-- Typed Manual Scene Panel -->
+                    <div class="hidden mt-4" id="manualTypedScenePanel">
+                        <div class="card" style="background:rgba(0,0,0,0.25);border:2px dashed var(--accent-purple);padding:18px;">
+                            <div class="flex justify-between items-center mb-2">
+                                <strong style="color:var(--accent-purple);font-size:0.92rem;">✍️ Custom Scene Prose Canvas</strong>
+                                <span class="text-xs text-dim" id="typedSceneWordCount">0 words</span>
+                            </div>
                             <textarea class="form-textarea" id="manualTypedSceneText" rows="10"
-                                style="font-family:'Lora',serif;font-size:0.95rem;line-height:1.8;white-space:pre-wrap"
-                                placeholder="Type your scene text here..."></textarea>
-                            <div class="flex gap-2 items-center" style="margin-top:12px">
-                                <button class="btn btn-primary" onclick="addTypedScene()" id="btnAddTypedScene">
-                                    ✅ Add Scene
-                                </button>
-                                <button class="btn" onclick="toggleTypedScenePanel()">
-                                    ✕ Cancel
-                                </button>
-                                <span class="text-dim text-sm" id="typedSceneWordCount">0 words</span>
+                                style="font-family:var(--font-serif);font-size:0.95rem;line-height:1.8;"
+                                placeholder="Write your raw scene prose here. It will be committed directly into chapter memory without consuming LLM generation tokens..."></textarea>
+                            <div class="flex gap-2 mt-3 justify-end">
+                                <button class="btn btn-secondary btn-sm" onclick="toggleTypedScenePanel()">Cancel</button>
+                                <button class="btn btn-primary btn-sm" onclick="addTypedScene()" id="btnAddTypedScene">✅ Commit Scene</button>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Live streaming output for current scene -->
-                    <div class="hidden" id="manualStreamArea" style="margin-top:16px">
-                        <div class="card" style="background:var(--surface-2);padding:16px;max-height:400px;overflow-y:auto">
-                            <div class="text-sm text-dim" style="margin-bottom:8px">✍️ Writing scene...</div>
-                            <div id="manualStreamOutput" style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif"></div>
+                    <!-- Live stream container for current scene -->
+                    <div class="hidden mt-4" id="manualStreamArea">
+                        <div class="card" style="background:rgba(0,0,0,0.25);max-height:360px;overflow-y:auto;">
+                            <div class="text-xs text-dim mb-2">✍️ Scene Writer Streaming...</div>
+                            <div id="manualStreamOutput" style="font-family:var(--font-serif);line-height:1.8;white-space:pre-wrap;"></div>
                         </div>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Reader View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 7: Story Reader
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewReader">
-            <div class="reader-container">
-                <div class="card" style="padding:16px">
-                    <div class="card-title mb-4"><span class="icon">📖</span> Chapters</div>
-                    <div class="flex gap-2 mb-4">
-                        <input class="form-input" id="deleteFromChapter" type="number" min="1" placeholder="Delete from chapter #" style="flex:1">
-                        <button class="btn btn-danger" id="btnDeleteChapters" onclick="deleteChaptersFromUi()">
-                            🗑️ Delete from
-                        </button>
+            <div class="reader-layout">
+                <!-- Sidebar: Chapters List -->
+                <div class="reader-sidebar">
+                    <div class="card-title" style="font-size:0.95rem;"><span class="icon">📖</span> Chapters</div>
+                    <div class="flex gap-2 mb-2">
+                        <input class="form-input" id="deleteFromChapter" type="number" min="1" placeholder="Delete from #" style="padding:5px 8px;font-size:0.8rem;flex:1;">
+                        <button class="btn btn-danger btn-sm" id="btnDeleteChapters" onclick="deleteChaptersFromUi()">🗑️ Cut</button>
                     </div>
-                    <div class="chapter-list" id="chapterList"></div>
+                    <div class="flex flex-col gap-1" id="chapterList"></div>
                 </div>
-                <div class="card">
-                    <div class="card-header" id="readerCardHeader" style="display:none">
-                        <span class="card-title" id="readerChapterTitle"><span class="icon">📖</span> Chapter</span>
-                        <div class="flex gap-2">
-                            <button class="btn btn-sm" id="btnReaderEdit" onclick="toggleReaderEdit()" title="Edit this chapter's raw text">✏️ Edit</button>
-                            <button class="btn btn-sm hidden" id="btnReaderSave" onclick="saveReaderEdit()" style="background:var(--success);color:#fff" title="Save changes">💾 Save</button>
-                            <button class="btn btn-sm hidden" id="btnReaderCancel" onclick="cancelReaderEdit()" title="Discard changes">✕ Cancel</button>
+
+                <!-- Canvas: Story Reader & Toolbar -->
+                <div class="reader-canvas-card">
+                    <div class="reader-toolbar-bar">
+                        <span class="card-title" id="readerChapterTitle" style="font-size:1.05rem;"><span class="icon">📖</span> Select Chapter</span>
+                        
+                        <div class="flex gap-2 items-center">
+                            <!-- Typography controls -->
+                            <button class="btn btn-sm btn-secondary" onclick="adjustReaderFontSize(-1)" title="Decrease Font">A-</button>
+                            <button class="btn btn-sm btn-secondary" onclick="adjustReaderFontSize(1)" title="Increase Font">A+</button>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleReaderTheme()" id="btnReaderTheme" title="Switch Theme">🎨 Theme</button>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleReaderFont()" id="btnReaderFont" title="Switch Font">🔤 Font</button>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleReaderFullscreen()" title="Fullscreen Mode">📺 Fullscreen</button>
+                            <button class="btn btn-sm btn-secondary" id="btnReaderEdit" onclick="toggleReaderEdit()" title="Edit Chapter">✏️ Edit</button>
+                            <button class="btn btn-sm btn-success hidden" id="btnReaderSave" onclick="saveReaderEdit()">💾 Save</button>
+                            <button class="btn btn-sm btn-secondary hidden" id="btnReaderCancel" onclick="cancelReaderEdit()">✕ Cancel</button>
                         </div>
                     </div>
-                    <div class="reader-content" id="readerContent">
+
+                    <div class="reader-prose-container theme-obsidian font-serif-lora" id="readerContent">
                         <div class="empty-state">
                             <span class="icon">📖</span>
-                            <h3>Select a chapter</h3>
-                            <p>Choose a chapter from the sidebar to read.</p>
+                            <h3>No chapter selected</h3>
+                            <p>Choose a chapter from the index on the left to immerse in reading.</p>
                         </div>
                     </div>
-                    <textarea class="form-textarea hidden" id="readerEditor" style="width:100%;min-height:500px;font-family:'Lora',serif;font-size:0.95rem;line-height:1.8;padding:24px;background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border);border-radius:8px;resize:vertical;white-space:pre-wrap"></textarea>
+
+                    <textarea class="form-textarea hidden" id="readerEditor" style="width:100%;min-height:540px;font-family:var(--font-serif);font-size:0.96rem;line-height:1.85;padding:32px;background:rgba(12,12,24,0.95);border:none;resize:vertical;"></textarea>
                 </div>
             </div>
         </div>
 
-        <!-- State Inspector View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 8: Combine & Polish (Gemini Powered)
+             ═══════════════════════════════════════════════════════════════ -->
+        <div class="view" id="viewCombine">
+            <div class="flex flex-col gap-4" style="max-width:1080px;margin:0 auto;">
+                <div class="card">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">📦</span> Master Combiner & Polish Studio</span>
+                    </div>
+
+                    <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+                        <div class="form-group">
+                            <label class="form-label">
+                                <span>Polished Version History</span>
+                                <div class="flex gap-1">
+                                    <button class="btn btn-sm" id="btnRenameVersion" onclick="renameSelectedVersion()" style="padding:2px 8px;font-size:0.75rem;">✎ Rename</button>
+                                    <button class="btn btn-sm btn-danger" id="btnDeleteVersion" onclick="deleteSelectedVersion()" style="padding:2px 8px;font-size:0.75rem;">🗑️ Delete</button>
+                                </div>
+                            </label>
+                            <select class="form-select" id="combineVersionSelect" onchange="changeCombineVersion()">
+                                <option value="">No polished versions saved</option>
+                            </select>
+                        </div>
+
+                        <div class="form-group">
+                            <label class="form-label">Gemini Model for Polishing</label>
+                            <select class="form-select" id="combineModelSelect">
+                                <optgroup label="Gemini 3.x (Flagship)">
+                                    <option value="gemini-3.6-flash" selected>gemini-3.6-flash (Latest GA Flagship)</option>
+                                    <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                                    <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (Ultra Fast)</option>
+                                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+                                </optgroup>
+                                <optgroup label="Gemini 2.5 Series">
+                                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                                    <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+                                </optgroup>
+                                <optgroup label="Gemma Open Models">
+                                    <option value="gemma-4-31b-it">gemma-4-31b-it</option>
+                                    <option value="gemma-4-26b-a4b-it">gemma-4-26b-a4b-it</option>
+                                </optgroup>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="flex gap-3 mt-3" style="flex-wrap:wrap;">
+                        <button class="btn btn-gemini" onclick="startCombine()" id="btnCombine">
+                            <span style="font-size:1.1rem;">🔮</span> Combine & Polish Chapters
+                        </button>
+                        <button class="btn btn-gemini" onclick="startWholeStory()" id="btnWholeStory">
+                            <span style="font-size:1.1rem;">✨</span> Generate Whole Story (One Shot)
+                        </button>
+                    </div>
+
+                    <!-- Progress Indicator -->
+                    <div class="hidden mt-4 flex items-center gap-3" id="combineProgress" style="padding:14px;background:rgba(66,133,244,0.1);border:1px solid rgba(66,133,244,0.3);border-radius:var(--radius-md);">
+                        <span style="font-size:1.2rem;animation:spin 1s infinite;">🌀</span>
+                        <span id="combineStatusText" style="font-weight:600;font-size:0.86rem;">Polishing narrative...</span>
+                        <button class="btn btn-danger btn-sm" onclick="cancelCombine()" id="btnCancelCombine" style="margin-left:auto;">🛑 Stop</button>
+                    </div>
+                </div>
+
+                <!-- Continuity Analysis Collapsible -->
+                <div class="card hidden" id="combineAnalysisCard">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">🔍</span> Continuity & Character Arc Analysis</span>
+                        <button class="btn btn-sm btn-secondary" onclick="toggleCombineSection('combineAnalysis', 'btnToggleAnalysis')" id="btnToggleAnalysis">▼ Collapse</button>
+                    </div>
+                    <div class="combine-analysis text-sm" id="combineAnalysis" style="line-height:1.7;white-space:pre-wrap;font-family:var(--font-serif);"></div>
+                </div>
+
+                <!-- Polished Story Canvas -->
+                <div class="card hidden" id="combinePolishedCard">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">✨</span> Polished Complete Story</span>
+                        <div class="flex gap-2 items-center">
+                            <button class="btn btn-sm btn-secondary" onclick="adjustReaderFontSize(-1)">A-</button>
+                            <button class="btn btn-sm btn-secondary" onclick="adjustReaderFontSize(1)">A+</button>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleReaderTheme()">🎨 Theme</button>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleReaderFont()">🔤 Font</button>
+                            <button class="btn btn-sm btn-secondary" onclick="toggleCombineSection('combinePolished', 'btnTogglePolished')" id="btnTogglePolished">▼ Collapse</button>
+                        </div>
+                    </div>
+                    <div class="reader-prose-container theme-obsidian font-serif-lora" id="combinePolished" style="border-radius:var(--radius-md);"></div>
+                </div>
+
+                <!-- Downloads Bar -->
+                <div class="card hidden" id="combineDownloadCard">
+                    <div class="card-header">
+                        <span class="card-title"><span class="icon">📥</span> Export & Download Studio</span>
+                        <div class="text-xs text-dim" id="combineStats"></div>
+                    </div>
+                    <div class="flex gap-3" style="flex-wrap:wrap;">
+                        <button class="btn btn-secondary" onclick="downloadCombined('original')">📄 Download Original (.md)</button>
+                        <button class="btn btn-primary" onclick="downloadCombined('polished')">✨ Download Polished (.md)</button>
+                        <button class="btn btn-secondary" onclick="downloadCombined('analysis')">🔍 Download Analysis (.md)</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 9: Story Bible & State Inspector
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewState">
             <div class="card">
                 <div class="card-header">
-                    <span class="card-title"><span class="icon">🧠</span> Story State Inspector</span>
-                    <button class="btn btn-sm" onclick="refreshState()">🔄 Refresh</button>
+                    <span class="card-title"><span class="icon">🧠</span> Story Bible & Narrative State</span>
+                    <button class="btn btn-secondary btn-sm" onclick="refreshState()">🔄 Refresh State</button>
                 </div>
-                <pre class="state-json" id="stateJson">Loading...</pre>
+
+                <!-- Bible Tabs -->
+                <div class="bible-tabs">
+                    <button class="bible-tab-btn active" onclick="switchBibleTab('characters')">👥 Characters</button>
+                    <button class="bible-tab-btn" onclick="switchBibleTab('world')">🌍 World & Setting</button>
+                    <button class="bible-tab-btn" onclick="switchBibleTab('threads')">🧵 Narrative Threads</button>
+                    <button class="bible-tab-btn" onclick="switchBibleTab('json')">🧠 Raw State (JSON)</button>
+                </div>
+
+                <!-- Characters Tab -->
+                <div id="bibleTabCharacters" class="bible-tab-content">
+                    <div class="characters-cards-grid" id="bibleCharactersGrid">
+                        <span class="text-dim text-sm">Loading characters...</span>
+                    </div>
+                </div>
+
+                <!-- World Tab -->
+                <div id="bibleTabWorld" class="bible-tab-content hidden">
+                    <div class="flex flex-col gap-3" id="bibleWorldDetails" style="line-height:1.7;">
+                        <span class="text-dim text-sm">Loading world details...</span>
+                    </div>
+                </div>
+
+                <!-- Threads Tab -->
+                <div id="bibleTabThreads" class="bible-tab-content hidden">
+                    <div class="flex flex-col gap-3" id="bibleThreadsList">
+                        <span class="text-dim text-sm">Loading narrative threads...</span>
+                    </div>
+                </div>
+
+                <!-- Raw JSON Tab -->
+                <div id="bibleTabJson" class="bible-tab-content hidden">
+                    <pre class="state-json" id="stateJson" style="background:rgba(0,0,0,0.3);padding:18px;border-radius:var(--radius-md);overflow-x:auto;font-family:var(--font-mono);font-size:0.8rem;color:#c4b5fd;max-height:550px;">Loading state...</pre>
+                </div>
             </div>
         </div>
 
-        <!-- Live Logs View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 10: Live Pipeline Logs Terminal
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewLogs">
-            <div class="card" style="height: calc(100vh - 200px)">
-                <div class="card-header">
-                    <span class="card-title"><span class="icon">📋</span> Live Pipeline Logs</span>
-                    <div class="flex gap-2">
-                        <label class="flex items-center gap-2 text-sm" style="cursor:pointer">
-                            <input type="checkbox" id="logAutoScroll" checked style="accent-color:var(--accent-primary)"> Auto-scroll
+            <div class="terminal-card">
+                <div class="terminal-header">
+                    <div class="flex items-center gap-2">
+                        <span class="status-dot" style="background:var(--accent-purple);box-shadow:0 0 8px var(--accent-purple);"></span>
+                        <strong style="font-size:0.92rem;">Live Telemetry Terminal</strong>
+                    </div>
+                    <div class="flex gap-3 items-center">
+                        <input class="form-input" id="logFilterInput" placeholder="Filter logs..." style="padding:4px 10px;font-size:0.78rem;width:180px;" oninput="filterLogs()">
+                        <label class="flex items-center gap-2 text-xs text-dim" style="cursor:pointer;">
+                            <input type="checkbox" id="logAutoScroll" checked style="accent-color:var(--accent-purple);"> Auto-scroll
                         </label>
-                        <button class="btn btn-sm" onclick="clearLogs()">🗑️ Clear</button>
+                        <button class="btn btn-sm btn-secondary" onclick="clearLogs()">🗑️ Clear</button>
                     </div>
                 </div>
-                <div class="log-terminal" id="logTerminal">
-                    <div class="log-entry log-info">
-                        <span class="log-time">--:--:--.---</span>
-                        <span class="log-badge log-badge-info">SYS</span>
-                        <span class="log-msg">Waiting for generation to start...</span>
+
+                <div class="terminal-stream" id="logTerminal">
+                    <div class="log-row">
+                        <span class="log-time">--:--:--</span>
+                        <span class="log-tag tag-sys">SYS</span>
+                        <span style="color:var(--text-muted);">Pipeline log streamer initialized. Waiting for agent events...</span>
                     </div>
                 </div>
             </div>
         </div>
 
-        <!-- Combine & Polish View -->
-        <div class="view" id="viewCombine">
-            <div class="combine-container">
-                <div class="card combine-hero">
-                    <div class="card-header">
-                        <span class="card-title"><span class="icon">📦</span> Combine & Polish with Gemini</span>
-                    </div>
-                    <!-- Polished Story History -->
-                    <div class="form-group mb-4" id="combineVersionsContainer" style="margin-bottom: 16px;">
-                        <label class="form-label" style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 8px;">
-                            <span>Polished Story History (Oldest to Newest)</span>
-                            <div class="flex gap-2">
-                                <button class="btn btn-sm" id="btnRenameVersion" onclick="renameSelectedVersion()" title="Rename selected version" style="padding: 2px 8px; font-size: 0.8rem;">✎ Rename</button>
-                                <button class="btn btn-sm btn-danger" id="btnDeleteVersion" onclick="deleteSelectedVersion()" title="Delete selected version" style="padding: 2px 8px; font-size: 0.8rem;">🗑️ Delete</button>
-                            </div>
-                        </label>
-                        <select class="form-select" id="combineVersionSelect" onchange="changeCombineVersion()">
-                            <option value="">No versions available</option>
-                        </select>
-                    </div>
-
-                    <div class="form-group mb-4" style="margin-bottom: 16px;">
-                        <label class="form-label" for="combineModelSelect">Gemini Model for Combine & Polish</label>
-                        <select class="form-select" id="combineModelSelect">
-                            <optgroup label="Gemini 3.x (current)">
-                                <option value="gemini-3.6-flash">gemini-3.6-flash (latest GA)</option>
-                                <option value="gemini-3.5-flash">gemini-3.5-flash</option>
-                                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (latest lite)</option>
-                                <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
-                            </optgroup>
-                            <optgroup label="Gemini 2.5 (retiring Oct 2026)">
-                                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                                <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite</option>
-                            </optgroup>
-                            <optgroup label="Gemma Open Models">
-                                <option value="gemma-4-26b-a4b-it">gemma-4-26b-a4b-it</option>
-                                <option value="gemma-4-31b-it">gemma-4-31b-it</option>
-                            </optgroup>
-                        </select>
-                    </div>
-
-                    <div class="combine-actions" id="combineActions">
-                        <button class="btn btn-gemini" onclick="startCombine()" id="btnCombine">
-                            <span class="gemini-icon">🔮</span> Combine & Polish
-                        </button>
-                        <button class="btn btn-gemini" onclick="startWholeStory()" id="btnWholeStory">
-                            <span class="gemini-icon">✨</span> Generate Whole Story (One Shot)
-                        </button>
-                        <button class="btn btn-danger hidden" onclick="deleteCombineData()" id="btnDeleteCombine">
-                            🗑️ Delete Polished Version
-                        </button>
-                    </div>
-
-                    <!-- Generate Entire Story Callout -->
-                    <div class="mt-4 p-3 border rounded bg-dim" style="margin-top: 24px; padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: rgba(255, 255, 255, 0.03);">
-                        <h4 style="margin-top: 0; margin-bottom: 8px; display: flex; align-items: center; gap: 8px;">
-                            <span>✍️</span> Generate the Entire Story Instead
-                        </h4>
-                        <p class="text-sm text-dim" style="margin-bottom: 12px; font-size: 0.9rem; line-height: 1.4;">
-                            "Generate Whole Story" hands Gemini the complete story bible (premise, characters, world rules, existing chapters) and asks it to write the entire story in a single call — no multi-agent pipeline needed. Use it when you want the whole novel in one pass. For the agent-driven sequential generator, use the button below.
-                        </p>
-                        <button class="btn btn-sm btn-secondary" onclick="switchToEntireStoryGeneration()" style="font-size: 0.85rem; padding: 6px 12px;">
-                            🚀 Switch to Auto-Generation
-                        </button>
-                    </div>
-
-                    <!-- Progress -->
-                    <div class="combine-progress hidden" id="combineProgress">
-                        <div class="combine-spinner"></div>
-                        <div class="combine-status" id="combineStatusText">Initializing...</div>
-                        <button class="btn btn-danger" onclick="cancelCombine()" id="btnCancelCombine" style="margin-left: auto; padding: 6px 12px; font-size: 13px;">
-                            🛑 Stop
-                        </button>
-                    </div>
-                </div>
-
-                <!-- Analysis Result -->
-                <div class="card hidden" id="combineAnalysisCard">
-                    <div class="card-header">
-                        <span class="card-title"><span class="icon">🔍</span> Continuity Analysis</span>
-                        <button class="btn btn-sm" onclick="toggleCombineSection('combineAnalysis', 'btnToggleAnalysis')" id="btnToggleAnalysis">▼ Collapse</button>
-                    </div>
-                    <div class="combine-analysis" id="combineAnalysis"></div>
-                </div>
-
-                <!-- Polished Story Result -->
-                <div class="card hidden" id="combinePolishedCard">
-                    <div class="card-header">
-                        <span class="card-title"><span class="icon">📖</span> Polished Story</span>
-                        <div class="flex gap-2 items-center">
-                            <!-- Reader Toolbar -->
-                            <div class="reader-toolbar flex gap-1 items-center" style="border-right: 1px solid var(--border); padding-right: 8px; margin-right: 8px; display: inline-flex;">
-                                <button class="btn btn-sm" onclick="adjustReaderFontSize(-1)" title="Decrease Font Size" style="padding: 4px 8px; font-size: 11px;">A-</button>
-                                <button class="btn btn-sm" onclick="adjustReaderFontSize(1)" title="Increase Font Size" style="padding: 4px 8px; font-size: 11px;">A+</button>
-                                <button class="btn btn-sm" onclick="toggleReaderTheme()" id="btnReaderTheme" title="Change Theme" style="padding: 4px 8px; font-size: 11px;">🎨 Theme</button>
-                                <button class="btn btn-sm" onclick="toggleReaderFont()" id="btnReaderFont" title="Toggle Serif/Sans-Serif" style="padding: 4px 8px; font-size: 11px;">🔤 Font</button>
-                                <button class="btn btn-sm" onclick="toggleReaderFullscreen()" title="Fullscreen Mode" style="padding: 4px 8px; font-size: 11px;">📺 Fullscreen</button>
-                            </div>
-                            <button class="btn btn-sm" onclick="toggleCombineSection('combinePolished', 'btnTogglePolished')" id="btnTogglePolished">▼ Collapse</button>
-                        </div>
-                    </div>
-                    <div class="polished-story-reader theme-obsidian font-sans" id="combinePolished"></div>
-                </div>
-
-                <!-- Download Section -->
-                <div class="card hidden" id="combineDownloadCard">
-                    <div class="card-header">
-                        <span class="card-title"><span class="icon">📥</span> Download</span>
-                    </div>
-                    <div class="combine-stats" id="combineStats"></div>
-                    <div class="combine-downloads">
-                        <button class="btn btn-download" onclick="downloadCombined('original')">
-                            📄 Download Original
-                        </button>
-                        <button class="btn btn-download btn-download-primary" onclick="downloadCombined('polished')">
-                            ✨ Download Polished
-                        </button>
-                        <button class="btn btn-download" onclick="downloadCombined('analysis')">
-                            🔍 Download Analysis
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Settings View -->
-        <div class="view" id="viewSettings">
-            <div class="settings-container">
-                <div class="card settings-hero">
-                    <div class="card-header">
-                        <span class="card-title"><span class="icon">⚙️</span> Runtime Settings</span>
-                        <div class="flex gap-2">
-                            <button class="btn btn-sm" onclick="loadSettings()">🔄 Reload</button>
-                            <button class="btn btn-primary" onclick="saveSettings()" id="btnSaveSettings">💾 Save Settings</button>
-                        </div>
-                    </div>
-                    <div class="settings-summary" id="settingsSummary">Loading settings...</div>
-                </div>
-
-                <div class="settings-grid">
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Backend Mode</span>
-                        </div>
-                        <div class="settings-mode-grid" id="settingsBackendMode">
-                            <label class="settings-mode">
-                                <input type="radio" name="backendMode" value="local">
-                                <span>
-                                    <strong>Local only</strong>
-                                    <small>All agents use llama.cpp. Slowest on CPU, no cloud limits.</small>
-                                </span>
-                            </label>
-                            <label class="settings-mode">
-                                <input type="radio" name="backendMode" value="hybrid">
-                                <span>
-                                    <strong>Hybrid</strong>
-                                    <small>Groq writer, local planner/critic/editor. Best balance.</small>
-                                </span>
-                            </label>
-                            <label class="settings-mode">
-                                <input type="radio" name="backendMode" value="groq">
-                                <span>
-                                    <strong>Full Groq</strong>
-                                    <small>Every agent uses Groq. Fast but most likely to rate-limit.</small>
-                                </span>
-                            </label>
-                            <label class="settings-mode">
-                                <input type="radio" name="backendMode" value="gemini">
-                                <span>
-                                    <strong>Full Gemini</strong>
-                                    <small>Every agent uses Google Gemini. High quality, generous free tier.</small>
-                                </span>
-                            </label>
-                            <label class="settings-mode">
-                                <input type="radio" name="backendMode" value="openrouter">
-                                <span>
-                                    <strong>Full OpenRouter</strong>
-                                    <small>Every agent uses OpenRouter. Access to hundreds of models (Claude, GPT, Llama, etc).</small>
-                                </span>
-                            </label>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Model Selection</span>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Active model (local GGUF or cloud API)</label>
-                            <select class="form-select" id="settingsActiveModel"></select>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Local model path</label>
-                            <input class="form-input" id="setting_LLAMA_MODEL_PATH" data-setting="LLAMA_MODEL_PATH" placeholder="/path/to/model.gguf">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Models folder</label>
-                            <input class="form-input" id="setting_LLAMA_MODELS_DIR" data-setting="LLAMA_MODELS_DIR" placeholder="/path/to/models">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Prompt template</label>
-                            <select class="form-select" id="setting_LLAMA_PROMPT_TEMPLATE" data-setting="LLAMA_PROMPT_TEMPLATE">
-                                <option value="mistral">Mistral / INST</option>
-                                <option value="llama3">Llama 3</option>
-                                <option value="chatml">ChatML</option>
-                                <option value="plain">Plain</option>
-                            </select>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">API Keys</span>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Groq primary key</label>
-                            <input class="form-input" id="setting_GROQ_API_KEY" data-setting="GROQ_API_KEY" placeholder="gsk_...">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Groq key rotation list</label>
-                            <textarea class="form-textarea" id="setting_GROQ_API_KEYS" data-setting="GROQ_API_KEYS" rows="3" placeholder="gsk_1,gsk_2,gsk_3"></textarea>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Gemini API key</label>
-                            <input class="form-input" id="setting_GEMINI_API_KEY" data-setting="GEMINI_API_KEY" placeholder="AIza...">
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Cloud Models</span>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Groq model</label>
-                            <select class="form-select" id="setting_GROQ_MODEL" data-setting="GROQ_MODEL">
-                                <optgroup label="Alibaba Cloud">
-                                    <option value="qwen/qwen3-32b">qwen/qwen3-32b</option>
-                                </optgroup>
-                                <optgroup label="Canopy Labs">
-                                    <option value="canopylabs/orpheus-arabic-saudi">canopylabs/orpheus-arabic-saudi</option>
-                                    <option value="canopylabs/orpheus-v1-english">canopylabs/orpheus-v1-english</option>
-                                </optgroup>
-                                <optgroup label="Groq">
-                                    <option value="groq/compound">groq/compound</option>
-                                    <option value="groq/compound-mini">groq/compound-mini</option>
-                                </optgroup>
-                                <optgroup label="Meta">
-                                    <option value="llama-3.1-8b-instant">llama-3.1-8b-instant</option>
-                                    <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile</option>
-                                    <option value="meta-llama/llama-4-scout-17b-16e-instruct">meta-llama/llama-4-scout-17b-16e-instruct</option>
-                                    <option value="meta-llama/llama-prompt-guard-2-22m">meta-llama/llama-prompt-guard-2-22m</option>
-                                    <option value="meta-llama/llama-prompt-guard-2-86m">meta-llama/llama-prompt-guard-2-86m</option>
-                                </optgroup>
-                                <optgroup label="OpenAI">
-                                    <option value="openai/gpt-oss-120b">openai/gpt-oss-120b</option>
-                                    <option value="openai/gpt-oss-20b">openai/gpt-oss-20b</option>
-                                    <option value="openai/gpt-oss-safeguard-20b">openai/gpt-oss-safeguard-20b</option>
-                                    <option value="whisper-large-v3">whisper-large-v3</option>
-                                    <option value="whisper-large-v3-turbo">whisper-large-v3-turbo</option>
-                                </optgroup>
-                            </select>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Gemini model</label>
-                            <select class="form-select" id="setting_GEMINI_MODEL" data-setting="GEMINI_MODEL">
-                                <optgroup label="Gemini 3.x (current)">
-                                    <option value="gemini-3.6-flash">gemini-3.6-flash (latest GA)</option>
-                                    <option value="gemini-3.5-flash">gemini-3.5-flash</option>
-                                    <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite (latest lite)</option>
-                                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
-                                </optgroup>
-                                <optgroup label="Gemini 2.5 (retiring Oct 2026)">
-                                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
-                                    <option value="gemini-2.5-flash-lite" selected>gemini-2.5-flash-lite</option>
-                                </optgroup>
-                                <optgroup label="Gemma Open Models">
-                                    <option value="gemma-4-26b-a4b-it">gemma-4-26b-a4b-it</option>
-                                    <option value="gemma-4-31b-it">gemma-4-31b-it</option>
-                                </optgroup>
-                            </select>
-                        </div>
-
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Cloud max tokens</label>
-                                <input class="form-input" type="number" id="setting_CLOUD_MAX_TOKENS" data-setting="CLOUD_MAX_TOKENS">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Temperature</label>
-                                <input class="form-input" type="number" step="0.05" id="setting_CLOUD_TEMPERATURE" data-setting="CLOUD_TEMPERATURE">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Top P</label>
-                                <input class="form-input" type="number" step="0.05" id="setting_CLOUD_TOP_P" data-setting="CLOUD_TOP_P">
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Local Performance</span>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">GPU layers</label>
-                                <input class="form-input" type="number" id="setting_LLAMA_N_GPU_LAYERS" data-setting="LLAMA_N_GPU_LAYERS">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Batch</label>
-                                <input class="form-input" type="number" id="setting_LLAMA_N_BATCH" data-setting="LLAMA_N_BATCH">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Threads</label>
-                                <input class="form-input" type="number" id="setting_LLAMA_N_THREADS" data-setting="LLAMA_N_THREADS">
-                            </div>
-                        </div>
-                        <label class="settings-check">
-                            <input type="checkbox" id="setting_LLAMA_F16_KV" data-setting="LLAMA_F16_KV">
-                            <span>Use F16 KV cache</span>
-                        </label>
-                        <div class="settings-field-row mt-4">
-                            <div class="form-group">
-                                <label class="form-label">Context tokens</label>
-                                <input class="form-input" type="number" id="setting_LOCAL_NUM_CTX" data-setting="LOCAL_NUM_CTX">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Local max tokens</label>
-                                <input class="form-input" type="number" id="setting_LOCAL_MAX_TOKENS" data-setting="LOCAL_MAX_TOKENS">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Structured max</label>
-                                <input class="form-input" type="number" id="setting_LOCAL_STRUCTURED_MAX_TOKENS" data-setting="LOCAL_STRUCTURED_MAX_TOKENS">
-                            </div>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Local temperature</label>
-                                <input class="form-input" type="number" step="0.05" id="setting_LOCAL_TEMPERATURE" data-setting="LOCAL_TEMPERATURE">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Local top P</label>
-                                <input class="form-input" type="number" step="0.05" id="setting_LOCAL_TOP_P" data-setting="LOCAL_TOP_P">
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Groq Rate Limits</span>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Min request interval</label>
-                                <input class="form-input" type="number" step="0.5" id="setting_GROQ_MIN_REQUEST_INTERVAL" data-setting="GROQ_MIN_REQUEST_INTERVAL">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Retry buffer</label>
-                                <input class="form-input" type="number" step="0.5" id="setting_GROQ_RATE_LIMIT_BUFFER" data-setting="GROQ_RATE_LIMIT_BUFFER">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Continuations</label>
-                                <input class="form-input" type="number" min="0" max="5" id="setting_GROQ_CONTINUATION_ATTEMPTS" data-setting="GROQ_CONTINUATION_ATTEMPTS">
-                            </div>
-                        </div>
-                        <label class="settings-check">
-                            <input type="checkbox" id="setting_GROQ_ROTATE_ON_RATE_LIMIT" data-setting="GROQ_ROTATE_ON_RATE_LIMIT">
-                            <span>Rotate Groq keys aggressively on 429</span>
-                        </label>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">OpenRouter Settings</span>
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">API Key</label>
-                            <input class="form-input" id="setting_OPENROUTER_API_KEY" data-setting="OPENROUTER_API_KEY" placeholder="sk-or-...">
-                        </div>
-                        <div class="form-group">
-                            <label class="form-label">Model</label>
-                            <select class="form-select" id="setting_OPENROUTER_MODEL" data-setting="OPENROUTER_MODEL">
-                                <optgroup label="Free Models">
-                                    <option value="nvidia/nemotron-3-ultra-550b-a55b:free" selected>nvidia/nemotron-3-ultra-550b-a55b:free (550B)</option>
-                                    <option value="nvidia/nemotron-3-super-120b-a12b:free">nvidia/nemotron-3-super-120b-a12b:free (120B)</option>
-                                    <option value="google/gemma-4-31b-it:free">google/gemma-4-31b-it:free</option>
-                                    <option value="google/gemma-4-26b-a4b-it:free">google/gemma-4-26b-a4b-it:free</option>
-                                    <option value="nvidia/nemotron-3-nano-30b-a3b:free">nvidia/nemotron-3-nano-30b-a3b:free</option>
-                                    <option value="openai/gpt-oss-20b:free">openai/gpt-oss-20b:free</option>
-                                    <option value="meta-llama/llama-3.3-70b-instruct:free">meta-llama/llama-3.3-70b-instruct:free</option>
-                                    <option value="qwen/qwen3-32b:free">qwen/qwen3-32b:free</option>
-                                    <option value="mistralai/mistral-small-3.1-24b-instruct:free">mistralai/mistral-small-3.1-24b-instruct:free</option>
-                                </optgroup>
-                                <optgroup label="Anthropic">
-                                    <option value="anthropic/claude-sonnet-4">anthropic/claude-sonnet-4</option>
-                                    <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
-                                    <option value="anthropic/claude-3-haiku">anthropic/claude-3-haiku</option>
-                                </optgroup>
-                                <optgroup label="OpenAI">
-                                    <option value="openai/gpt-4o">openai/gpt-4o</option>
-                                    <option value="openai/gpt-4o-mini">openai/gpt-4o-mini</option>
-                                </optgroup>
-                                <optgroup label="Meta">
-                                    <option value="meta-llama/llama-3.1-70b-instruct">meta-llama/llama-3.1-70b-instruct</option>
-                                    <option value="meta-llama/llama-3.3-70b-instruct">meta-llama/llama-3.3-70b-instruct</option>
-                                </optgroup>
-                                <optgroup label="Mistral">
-                                    <option value="mistralai/mistral-large">mistralai/mistral-large</option>
-                                    <option value="mistralai/mistral-small">mistralai/mistral-small</option>
-                                </optgroup>
-                                <optgroup label="Other">
-                                    <option value="deepseek/deepseek-chat">deepseek/deepseek-chat</option>
-                                    <option value="qwen/qwen-2.5-72b-instruct">qwen/qwen-2.5-72b-instruct</option>
-                                    <option value="google/gemini-pro-1.5">google/gemini-pro-1.5</option>
-                                </optgroup>
-                            </select>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Min request interval</label>
-                                <input class="form-input" type="number" step="0.1" id="setting_OPENROUTER_MIN_REQUEST_INTERVAL" data-setting="OPENROUTER_MIN_REQUEST_INTERVAL">
-                            </div>
-                        </div>
-                        <div class="text-dim text-sm" style="margin-top:8px">
-                            OpenRouter routes to 300+ models via a single API key. Get yours at
-                            <a href="https://openrouter.ai/keys" target="_blank" style="color:var(--accent-primary)">openrouter.ai/keys</a>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Story Generation</span>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Scene words min</label>
-                                <input class="form-input" type="number" id="setting_WORDS_PER_SCENE_MIN" data-setting="WORDS_PER_SCENE_MIN">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Scene words max</label>
-                                <input class="form-input" type="number" id="setting_WORDS_PER_SCENE_MAX" data-setting="WORDS_PER_SCENE_MAX">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Min accepted words</label>
-                                <input class="form-input" type="number" id="setting_MIN_SCENE_WORDS" data-setting="MIN_SCENE_WORDS">
-                            </div>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Scene iterations</label>
-                                <input class="form-input" type="number" id="setting_MAX_SCENE_ITERATIONS" data-setting="MAX_SCENE_ITERATIONS">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Pipeline steps</label>
-                                <input class="form-input" type="number" id="setting_MAX_PIPELINE_STEPS" data-setting="MAX_PIPELINE_STEPS">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Token budget</label>
-                                <input class="form-input" type="number" id="setting_MAX_TOKEN_BUDGET" data-setting="MAX_TOKEN_BUDGET">
-                            </div>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Drafts per key scene</label>
-                                <input class="form-input" type="number" min="1" max="3" id="setting_BEST_OF_N_KEY_SCENES" data-setting="BEST_OF_N_KEY_SCENES">
-                                <small class="text-dim text-sm">1 = single draft (fast, cheap). 2+ generates extra candidate scenes for key moments — uses more tokens.</small>
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Drafts per normal scene</label>
-                                <input class="form-input" type="number" min="1" max="3" id="setting_BEST_OF_N_NORMAL_SCENES" data-setting="BEST_OF_N_NORMAL_SCENES">
-                                <small class="text-dim text-sm">Keep at 1 for normal scenes.</small>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="card">
-                        <div class="card-header">
-                            <span class="card-title">Retrieval & App</span>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Retrieval chunks</label>
-                                <input class="form-input" type="number" id="setting_TOP_K_RETRIEVAL" data-setting="TOP_K_RETRIEVAL">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Context budget</label>
-                                <input class="form-input" type="number" id="setting_CONTEXT_TOKEN_BUDGET" data-setting="CONTEXT_TOKEN_BUDGET">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">SSE queue size</label>
-                                <input class="form-input" type="number" id="setting_SSE_QUEUE_MAXSIZE" data-setting="SSE_QUEUE_MAXSIZE">
-                            </div>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Retry base delay</label>
-                                <input class="form-input" type="number" step="0.5" id="setting_RETRY_BASE_DELAY" data-setting="RETRY_BASE_DELAY">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Retry max delay</label>
-                                <input class="form-input" type="number" step="0.5" id="setting_RETRY_MAX_DELAY" data-setting="RETRY_MAX_DELAY">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Backoff factor</label>
-                                <input class="form-input" type="number" step="0.1" id="setting_RETRY_BACKOFF_FACTOR" data-setting="RETRY_BACKOFF_FACTOR">
-                            </div>
-                        </div>
-                        <div class="settings-field-row">
-                            <div class="form-group">
-                                <label class="form-label">Flask host</label>
-                                <input class="form-input" id="setting_FLASK_HOST" data-setting="FLASK_HOST">
-                            </div>
-                            <div class="form-group">
-                                <label class="form-label">Flask port</label>
-                                <input class="form-input" type="number" id="setting_FLASK_PORT" data-setting="FLASK_PORT">
-                            </div>
-                            <label class="settings-check settings-check-inline">
-                                <input type="checkbox" id="setting_FLASK_DEBUG" data-setting="FLASK_DEBUG">
-                                <span>Debug reload</span>
-                            </label>
-                        </div>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- Vision Lab View -->
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 11: Vision Lab
+             ═══════════════════════════════════════════════════════════════ -->
         <div class="view" id="viewVision">
-            <div class="card" style="max-width: 900px; margin: 0 auto;">
-                <div class="card-header flex justify-between items-center" style="margin-bottom: 16px;">
-                    <span class="card-title"><span class="icon">👁️</span> Person Recognition & Visual Breakdown Lab</span>
-                    <span class="badge badge-info" id="visionStatusBadge">Checking backend...</span>
+            <div class="card" style="max-width:880px;margin:0 auto;">
+                <div class="card-header">
+                    <span class="card-title"><span class="icon">👁️</span> Character & Person Recognition Lab</span>
+                    <span class="model-picker-badge badge-gemini" id="visionStatusBadge">Checking engine...</span>
                 </div>
-                
-                <div class="grid grid-cols-2 gap-4 mb-4">
+
+                <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
                     <div class="form-group">
                         <label class="form-label">Vision Engine Mode</label>
                         <select class="form-select" id="visionModeSelect">
-                            <option value="auto">Auto (Prefer Local, Fallback Cloud)</option>
-                            <option value="local" selected>Local Vision (Offline / Ollama)</option>
-                            <option value="cloud">Cloud Vision (Gemini 2.5 Flash)</option>
+                            <option value="auto">Auto (Local Ollama, Cloud Fallback)</option>
+                            <option value="local" selected>Local Moondream (Ollama Offline)</option>
+                            <option value="cloud">Google Gemini 2.5 Flash (Cloud)</option>
                         </select>
                     </div>
                     <div class="form-group">
-                        <label class="form-label">Extra Guidance / Focus Context (Optional)</label>
-                        <input class="form-input" id="visionPromptExtra" placeholder="e.g. Focus on facial features, body posture, or outfit details...">
+                        <label class="form-label">Visual Focus Context (Optional)</label>
+                        <input class="form-input" id="visionPromptExtra" placeholder="e.g., focus on outfit, expression, mood...">
                     </div>
                 </div>
 
@@ -1105,43 +921,226 @@
                 <div class="vision-dropzone" id="visionDropzone" onclick="document.getElementById('visionFileInput').click()">
                     <input type="file" id="visionFileInput" accept="image/*" style="display:none;" onchange="handleVisionFileSelect(this.files)">
                     <div id="visionDropzoneContent">
-                        <span style="font-size: 2.5rem;">📸</span>
-                        <h4 style="margin: 8px 0 4px;">Drag & Drop a Person/Character Image Here</h4>
-                        <p class="text-dim text-sm">Supports PNG, JPG, WEBP formats. Click to browse.</p>
+                        <span style="font-size:2.8rem;">📸</span>
+                        <h4 style="margin:8px 0 4px;font-weight:700;">Drag & Drop Character / Reference Portrait Here</h4>
+                        <p class="text-dim text-xs">Supports PNG, JPG, WEBP formats. Click to browse files.</p>
                     </div>
-                    <div id="visionImagePreview" style="display:none; text-align:center;">
-                        <img id="visionPreviewImg" style="max-height: 220px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); margin-bottom: 12px;" />
+                    <div id="visionImagePreview" style="display:none;text-align:center;">
+                        <img id="visionPreviewImg" style="max-height:220px;border-radius:8px;box-shadow:var(--shadow-md);margin-bottom:12px;" />
                         <div>
-                            <button class="btn btn-sm btn-outline" onclick="event.stopPropagation(); clearVisionFile();">Change Image</button>
+                            <button class="btn btn-sm btn-secondary" onclick="event.stopPropagation();clearVisionFile();">Change Image</button>
                         </div>
                     </div>
                 </div>
 
                 <div class="mt-4 flex justify-end gap-2">
-                    <button class="btn btn-primary" id="btnAnalyzeVision" onclick="runVisionAnalysis()" disabled>⚡ Analyze Person & Body</button>
+                    <button class="btn btn-primary" id="btnAnalyzeVision" onclick="runVisionAnalysis()" disabled>
+                        ⚡ Analyze Visual Breakdown
+                    </button>
                 </div>
             </div>
 
-            <!-- Chat Interface -->
-            <div id="visionChatInterface" class="mt-6" style="display:none; max-width: 900px; margin: 24px auto 0;">
-                <div class="card" style="display: flex; flex-direction: column; height: 600px;">
-                    <div class="card-header flex justify-between items-center" style="border-bottom: 1px solid var(--border); padding-bottom: 12px; margin-bottom: 0;">
-                        <span class="card-title"><span class="icon">🔥</span> Grok Vision Chat</span>
-                        <span class="badge badge-success" id="visionChatSessionBadge">Session Active</span>
+            <!-- Grok Vision Chat -->
+            <div id="visionChatInterface" class="mt-6 hidden" style="max-width:880px;margin:24px auto 0;">
+                <div class="card flex flex-col" style="height:540px;">
+                    <div class="card-header" style="border-bottom:1px solid var(--border-subtle);padding-bottom:12px;margin-bottom:0;">
+                        <span class="card-title"><span class="icon">🔥</span> Vision Narrative Chat</span>
                     </div>
-                    
-                    <!-- Chat History -->
-                    <div id="visionChatHistory" style="flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 16px; background: rgba(0,0,0,0.2);">
-                        <!-- Messages will be appended here -->
-                    </div>
-                    
-                    <!-- Chat Input -->
-                    <div style="border-top: 1px solid var(--border); padding: 16px; background: var(--bg-secondary);">
+                    <div id="visionChatHistory" style="flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:12px;background:rgba(0,0,0,0.2);"></div>
+                    <div style="border-top:1px solid var(--border-subtle);padding:14px;background:var(--bg-secondary);">
                         <div class="flex gap-2">
-                            <input type="text" class="form-input" id="visionChatMessage" placeholder="Tell Grok what to focus on..." style="flex: 1;" onkeypress="handleVisionChatKeyPress(event)">
-                            <button class="btn btn-primary" id="btnVisionChatSend" onclick="sendVisionChatMessage()">
-                                💬 Send
-                            </button>
+                            <input class="form-input" id="visionChatMessage" placeholder="Ask about visual details, personality, or lore..." onkeypress="handleVisionChatKeyPress(event)">
+                            <button class="btn btn-primary" id="btnVisionChatSend" onclick="sendVisionChatMessage()">💬 Send</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══════════════════════════════════════════════════════════════
+             VIEW 12: Settings & Backends Configuration
+             ═══════════════════════════════════════════════════════════════ -->
+        <div class="view" id="viewSettings">
+            <div class="flex flex-col gap-4" style="max-width:1160px;margin:0 auto;">
+                <div class="card">
+                    <div class="card-header">
+                        <div>
+                            <span class="card-title"><span class="icon">⚙️</span> Runtime Engine Settings</span>
+                            <span class="text-xs text-dim" id="settingsSummary">Configure AI model providers, API keys, and pipeline tuning</span>
+                        </div>
+                        <div class="flex gap-2">
+                            <button class="btn btn-secondary" onclick="loadSettings()">🔄 Reload</button>
+                            <button class="btn btn-primary" onclick="saveSettings()" id="btnSaveSettings">💾 Save Settings</button>
+                        </div>
+                    </div>
+
+                    <!-- Backend Provider Selection Cards -->
+                    <label class="form-label mb-2">Active Generation Backend Mode</label>
+                    <div class="settings-providers-grid" id="settingsBackendMode">
+                        <label class="provider-card-select selected" data-mode="groq">
+                            <input type="radio" name="backendMode" value="groq" checked>
+                            <div class="provider-card-title"><span style="color:#f59e0b;">⚡</span> Full Groq</div>
+                            <div class="provider-card-desc">All agents use Groq cloud. Ultra-fast inference with automatic TPM pacing & key rotation.</div>
+                        </label>
+                        <label class="provider-card-select" data-mode="gemini">
+                            <input type="radio" name="backendMode" value="gemini">
+                            <div class="provider-card-title"><span style="color:#3b82f6;">✨</span> Full Gemini</div>
+                            <div class="provider-card-desc">All agents use Google Gemini. 1M context window, high reasoning, generous free tier.</div>
+                        </label>
+                        <label class="provider-card-select" data-mode="openrouter">
+                            <input type="radio" name="backendMode" value="openrouter">
+                            <div class="provider-card-title"><span style="color:#10b981;">🌐</span> OpenRouter</div>
+                            <div class="provider-card-desc">Access 300+ models (Claude, Nemotron, GPT-4o, Llama 70B, DeepSeek) through one key.</div>
+                        </label>
+                        <label class="provider-card-select" data-mode="hybrid">
+                            <input type="radio" name="backendMode" value="hybrid">
+                            <div class="provider-card-title"><span style="color:#ec4899;">🔀</span> Hybrid Mode</div>
+                            <div class="provider-card-desc">Groq for Scene Writer prose, local GGUF for Planning/Critic/Editor. Best token economy.</div>
+                        </label>
+                        <label class="provider-card-select" data-mode="local">
+                            <input type="radio" name="backendMode" value="local">
+                            <div class="provider-card-title"><span style="color:#8b5cf6;">💻</span> Local GGUF</div>
+                            <div class="provider-card-desc">100% offline llama.cpp execution on GPU/CPU. Zero cloud dependencies or rate limits.</div>
+                        </label>
+                    </div>
+                </div>
+
+                <!-- Settings Grid -->
+                <div class="settings-grid-layout">
+                    <!-- Card 1: API Keys -->
+                    <div class="card">
+                        <div class="card-header" style="margin-bottom:14px;">
+                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">🔑</span> API Credentials</span>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Groq Primary API Key</label>
+                            <input class="form-input" type="password" id="setting_GROQ_API_KEY" data-setting="GROQ_API_KEY" placeholder="gsk_...">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Groq Key Rotation Pool (comma-separated)</label>
+                            <textarea class="form-textarea" id="setting_GROQ_API_KEYS" data-setting="GROQ_API_KEYS" rows="2" placeholder="gsk_key1, gsk_key2, gsk_key3..."></textarea>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Google Gemini API Key</label>
+                            <input class="form-input" type="password" id="setting_GEMINI_API_KEY" data-setting="GEMINI_API_KEY" placeholder="AIza...">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">OpenRouter API Key</label>
+                            <input class="form-input" type="password" id="setting_OPENROUTER_API_KEY" data-setting="OPENROUTER_API_KEY" placeholder="sk-or-...">
+                        </div>
+                    </div>
+
+                    <!-- Card 2: Model Selection Catalogs -->
+                    <div class="card">
+                        <div class="card-header" style="margin-bottom:14px;">
+                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">🤖</span> Active Models</span>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Active Model Selection</label>
+                            <select class="form-select" id="settingsActiveModel"></select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Groq Model</label>
+                            <select class="form-select" id="setting_GROQ_MODEL" data-setting="GROQ_MODEL">
+                                <option value="qwen/qwen3.8-27b">qwen/qwen3.8-27b (Strong & Fast)</option>
+                                <option value="openai/gpt-oss-120b">openai/gpt-oss-120b (Largest OSS)</option>
+                                <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (Meta 70B)</option>
+                                <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (Ultra Fast)</option>
+                                <option value="openai/gpt-oss-20b">openai/gpt-oss-20b</option>
+                                <option value="qwen/qwen3.6-27b">qwen/qwen3.6-27b</option>
+                                <option value="allam-2-7b">allam-2-7b</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Gemini Model</label>
+                            <select class="form-select" id="setting_GEMINI_MODEL" data-setting="GEMINI_MODEL">
+                                <option value="gemini-3.6-flash">gemini-3.6-flash (Latest GA Flagship)</option>
+                                <option value="gemini-3.5-flash">gemini-3.5-flash</option>
+                                <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+                                <option value="gemini-3.1-flash-lite" selected>gemini-3.1-flash-lite (Default)</option>
+                                <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                                <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+                                <option value="gemma-4-31b-it">gemma-4-31b-it</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">OpenRouter Model</label>
+                            <select class="form-select" id="setting_OPENROUTER_MODEL" data-setting="OPENROUTER_MODEL">
+                                <option value="nvidia/nemotron-3-ultra-550b-a55b:free">nvidia/nemotron-3-ultra-550b-a55b:free (550B Free)</option>
+                                <option value="google/gemma-4-31b-it:free">google/gemma-4-31b-it:free</option>
+                                <option value="meta-llama/llama-3.3-70b-instruct:free">meta-llama/llama-3.3-70b-instruct:free</option>
+                                <option value="mistralai/mistral-small-3.1-24b-instruct:free">mistralai/mistral-small-3.1-24b-instruct:free</option>
+                                <option value="openai/gpt-oss-20b:free">openai/gpt-oss-20b:free</option>
+                                <option value="anthropic/claude-3.5-sonnet">anthropic/claude-3.5-sonnet</option>
+                                <option value="openai/gpt-4o">openai/gpt-4o</option>
+                                <option value="deepseek/deepseek-chat">deepseek/deepseek-chat</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <!-- Card 3: Sampling & Creativity -->
+                    <div class="card">
+                        <div class="card-header" style="margin-bottom:14px;">
+                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">🎨</span> Sampling Parameters</span>
+                        </div>
+                        <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                            <div class="form-group">
+                                <label class="form-label">Cloud Temperature</label>
+                                <input class="form-input" type="number" step="0.05" id="setting_CLOUD_TEMPERATURE" data-setting="CLOUD_TEMPERATURE">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Cloud Top P</label>
+                                <input class="form-input" type="number" step="0.05" id="setting_CLOUD_TOP_P" data-setting="CLOUD_TOP_P">
+                            </div>
+                        </div>
+                        <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                            <div class="form-group">
+                                <label class="form-label">Cloud Max Tokens</label>
+                                <input class="form-input" type="number" id="setting_CLOUD_MAX_TOKENS" data-setting="CLOUD_MAX_TOKENS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Min Scene Words</label>
+                                <input class="form-input" type="number" id="setting_MIN_SCENE_WORDS" data-setting="MIN_SCENE_WORDS">
+                            </div>
+                        </div>
+                        <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+                            <div class="form-group">
+                                <label class="form-label">Scene Words Min</label>
+                                <input class="form-input" type="number" id="setting_WORDS_PER_SCENE_MIN" data-setting="WORDS_PER_SCENE_MIN">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Scene Words Max</label>
+                                <input class="form-input" type="number" id="setting_WORDS_PER_SCENE_MAX" data-setting="WORDS_PER_SCENE_MAX">
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Card 4: Local Hardware Tuning -->
+                    <div class="card">
+                        <div class="card-header" style="margin-bottom:14px;">
+                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">💻</span> Local Performance</span>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Local GGUF Path</label>
+                            <input class="form-input" id="setting_LLAMA_MODEL_PATH" data-setting="LLAMA_MODEL_PATH" placeholder="/path/to/model.gguf">
+                        </div>
+                        <div class="grid-cols-3" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+                            <div class="form-group">
+                                <label class="form-label">GPU Layers</label>
+                                <input class="form-input" type="number" id="setting_LLAMA_N_GPU_LAYERS" data-setting="LLAMA_N_GPU_LAYERS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Threads</label>
+                                <input class="form-input" type="number" id="setting_LLAMA_N_THREADS" data-setting="LLAMA_N_THREADS">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Batch Size</label>
+                                <input class="form-input" type="number" id="setting_LLAMA_N_BATCH" data-setting="LLAMA_N_BATCH">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Local Context (Tokens)</label>
+                            <input class="form-input" type="number" id="setting_LOCAL_NUM_CTX" data-setting="LOCAL_NUM_CTX">
                         </div>
                     </div>
                 </div>
@@ -1149,17 +1148,17 @@
         </div>
     </div>
 
-    <!-- Status Bar -->
-    <div class="status-bar">
+    <!-- Global Bottom Status Bar -->
+    <footer class="status-bar">
         <div class="status-indicator">
             <span class="status-dot" id="statusDot"></span>
-            <span id="statusText">Ready</span>
+            <span id="statusText">Engine Ready</span>
         </div>
-        <div class="flex gap-4 text-sm">
-            <span id="activeProject">No project selected</span>
+        <div class="flex gap-4 text-xs">
+            <span id="activeProject">No active story selected</span>
         </div>
-    </div>
+    </footer>
 
-    <script src="/static/js/app.js?v=3"></script>
+    <script src="/static/js/app.js?v=12"></script>
 </body>
 </html>

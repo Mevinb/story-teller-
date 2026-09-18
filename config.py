@@ -3,9 +3,11 @@ Central configuration for the multi-agent story generation pipeline.
 All tunable parameters live here.
 """
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ─── Model Configuration ────────────────────────────────────────────
 PROJECT_ROOT = os.path.dirname(__file__)
@@ -39,11 +41,13 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 # Available text-generation models on Groq (as of 2026).
 # The first entry is the default if GROQ_MODEL is unset.
 GROQ_MODELS = [
-    {"id": "qwen/qwen3.8-27b",        "name": "Qwen 3.8 27B",        "context": "256k", "notes": "Default — strong, fast"},
+    {"id": "qwen/qwen3.8-27b",        "name": "Qwen 3.8 27B",        "context": "256k", "notes": "Default — strong & fast for narrative prose"},
+    {"id": "openai/gpt-oss-120b",     "name": "GPT-OSS 120B",        "context": "128k", "notes": "Largest OSS — best coherence & depth"},
+    {"id": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B",      "context": "128k", "notes": "Flagship Meta instruction model"},
+    {"id": "llama-3.1-8b-instant",    "name": "Llama 3.1 8B Instant","context": "128k", "notes": "Ultra fast generation"},
+    {"id": "openai/gpt-oss-20b",      "name": "GPT-OSS 20B",         "context": "128k", "notes": "Balanced speed and quality"},
     {"id": "qwen/qwen3.6-27b",        "name": "Qwen 3.6 27B",        "context": "256k", "notes": "Previous-gen Qwen"},
-    {"id": "openai/gpt-oss-120b",     "name": "GPT-OSS 120B",        "context": "128k", "notes": "Largest available — best coherence"},
-    {"id": "openai/gpt-oss-20b",      "name": "GPT-OSS 20B",         "context": "128k", "notes": "Lighter OpenAI model"},
-    {"id": "allam-2-7b",              "name": "Allam 2 7B",           "context": "4k",   "notes": "Small — fast but limited"},
+    {"id": "allam-2-7b",              "name": "Allam 2 7B",          "context": "4k",   "notes": "Small & fast"},
 ]
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 USE_CLOUD_MODEL = os.getenv("USE_CLOUD_MODEL", "false").lower() in ("1", "true", "yes", "on")
@@ -70,10 +74,36 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_TPM_LIMIT = int(os.getenv("GEMINI_TPM_LIMIT", "200000"))
 
+# ─── Gemini Model Catalog ───────────────────────────────────────────
+GEMINI_MODELS = [
+    {"id": "gemini-3.6-flash",        "name": "Gemini 3.6 Flash",       "context": "1M",  "notes": "Latest GA flagship — highest reasoning"},
+    {"id": "gemini-3.5-flash",        "name": "Gemini 3.5 Flash",       "context": "1M",  "notes": "Fast, high intelligence"},
+    {"id": "gemini-3.5-flash-lite",   "name": "Gemini 3.5 Flash-Lite",  "context": "1M",  "notes": "Ultra high speed & throughput"},
+    {"id": "gemini-3.1-flash-lite",   "name": "Gemini 3.1 Flash-Lite",  "context": "1M",  "notes": "Default — reliable and generous limits"},
+    {"id": "gemini-2.5-flash",        "name": "Gemini 2.5 Flash",       "context": "1M",  "notes": "Gemini 2.5 series"},
+    {"id": "gemini-2.5-flash-lite",   "name": "Gemini 2.5 Flash-Lite",  "context": "1M",  "notes": "Lightweight Gemini 2.5"},
+    {"id": "gemma-4-31b-it",          "name": "Gemma 4 31B IT",         "context": "128k","notes": "Google open weights model"},
+    {"id": "gemma-4-26b-a4b-it",      "name": "Gemma 4 26B A4B IT",     "context": "128k","notes": "MoE open weights model"},
+]
+
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MIN_REQUEST_INTERVAL = float(os.getenv("OPENROUTER_MIN_REQUEST_INTERVAL", "1.0"))
+
+# ─── OpenRouter Model Catalog ───────────────────────────────────────
+OPENROUTER_MODELS = [
+    {"id": "nvidia/nemotron-3-ultra-550b-a55b:free", "name": "Nemotron 3 Ultra 550B (Free)", "context": "128k", "notes": "Massive 550B model free tier"},
+    {"id": "google/gemma-4-31b-it:free",              "name": "Gemma 4 31B IT (Free)",        "context": "128k", "notes": "Google open model free"},
+    {"id": "meta-llama/llama-3.3-70b-instruct:free",  "name": "Llama 3.3 70B (Free)",          "context": "128k", "notes": "Meta 70B free tier"},
+    {"id": "mistralai/mistral-small-3.1-24b-instruct:free", "name": "Mistral Small 3.1 24B (Free)", "context": "128k", "notes": "Mistral free tier"},
+    {"id": "openai/gpt-oss-20b:free",                 "name": "GPT-OSS 20B (Free)",           "context": "128k", "notes": "OpenAI OSS free"},
+    {"id": "anthropic/claude-3.5-sonnet",             "name": "Claude 3.5 Sonnet",            "context": "200k", "notes": "Exceptional prose & nuance"},
+    {"id": "anthropic/claude-3-haiku",                "name": "Claude 3 Haiku",               "context": "200k", "notes": "Fast Anthropic model"},
+    {"id": "openai/gpt-4o",                           "name": "OpenAI GPT-4o",                "context": "128k", "notes": "OpenAI flagship omni"},
+    {"id": "openai/gpt-4o-mini",                      "name": "OpenAI GPT-4o Mini",           "context": "128k", "notes": "Fast & cost-effective"},
+    {"id": "deepseek/deepseek-chat",                  "name": "DeepSeek V3",                  "context": "64k",  "notes": "High intelligence reasoning"},
+]
 
 # ─── Generation Parameters ──────────────────────────────────────────
 LOCAL_MODEL_PARAMS = {

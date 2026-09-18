@@ -1,69 +1,166 @@
 /**
- * Story Teller — Web UI Application Logic
- * Vanilla JS with SSE for live generation updates
+ * Story Teller — Next-Gen AI Narrative Creative Suite
+ * Complete, robust, fully featured application logic.
  */
 
-// ─── State ───────────────────────────────────────────────────────
+// ─── Global State ─────────────────────────────────────────────────
 let currentProject = null;
+let activeModel = '';
+let modelsCatalog = null;
+let runtimeSettings = null;
+let projectsList = [];
 let characters = [];
+let editCharacters = [];
 let isGenerating = false;
 let eventSource = null;
 let totalWords = 0;
 let scenesComplete = 0;
 let totalScenes = 0;
-let streamSceneNodes = new Map();
-let plannedChapters = 1;
-let completedChapters = 0;
-const GROQ_MODEL_OPTION = '__groq_api__';
-const GEMINI_MODEL_OPTION = '__gemini_api__';
-const OPENROUTER_MODEL_OPTION = '__openrouter_api__';
 
-// Manual interactive session state
+// Manual Interactive Session State
 let manualSessionActive = false;
 let manualScenesCompleted = 0;
 let manualChapterNum = 0;
 let manualIsGeneratingScene = false;
+let manualSceneTexts = new Map();
 
-// Premise Generator State
+// Premise Studio State
 let premiseSteps = [];
 let premiseCharacters = {};
 
-function isGroqProvider(provider) {
-    return String(provider || '').toLowerCase().includes('groq');
+// Reader State
+let currentChapterNumber = 1;
+let currentChapterRaw = '';
+let readerFontSize = 17;
+const readerThemes = ['obsidian', 'parchment', 'midnight', 'velvet'];
+let readerThemeIndex = 0;
+const readerFonts = ['font-serif-lora', 'font-serif-merriweather', 'font-sans-inter'];
+let readerFontIndex = 0;
+let readerIsFullscreen = false;
+let isReaderEditMode = false;
+
+// ─── Helpers: Model Formatting & Provider Detection ──────────────
+function parseModelProvider(modelId) {
+    if (!modelId) return 'local';
+    const str = String(modelId).toLowerCase();
+    if (str === 'hybrid' || str.startsWith('hybrid:')) return 'hybrid';
+    if (str.startsWith('groq:') || str === '__groq_api__') return 'groq';
+    if (str.startsWith('gemini:') || str === '__gemini_api__') return 'gemini';
+    if (str.startsWith('openrouter:') || str === '__openrouter_api__') return 'openrouter';
+    return 'local';
 }
 
-function isGeminiProvider(provider) {
-    return String(provider || '').toLowerCase().includes('gemini');
+function getProviderIcon(provider) {
+    switch (provider) {
+        case 'groq': return '⚡';
+        case 'gemini': return '✨';
+        case 'openrouter': return '🌐';
+        case 'hybrid': return '🔀';
+        default: return '💻';
+    }
 }
 
-function isOpenRouterProvider(provider) {
-    return String(provider || '').toLowerCase().includes('openrouter');
+function getProviderBadgeClass(provider) {
+    return 'badge-' + provider;
 }
 
-function providerBadge(provider) {
-    if (isGeminiProvider(provider)) return '✨ Gemini';
-    if (isOpenRouterProvider(provider)) return '🌐 OpenRouter';
-    return isGroqProvider(provider) ? '☁️ Groq' : '💻 llama.cpp';
-}
-
-function modelOptionLabel(modelId, groqModelName, geminiModelName, openrouterModelName) {
-    if (modelId === GROQ_MODEL_OPTION) {
-        return `☁️ Groq API (${groqModelName || 'default'})`;
+function formatModelDisplayName(modelId) {
+    if (!modelId) return 'Select Model';
+    if (modelId === 'hybrid' || modelId.startsWith('hybrid:')) {
+        return 'Hybrid (Groq + Local)';
     }
     if (modelId.startsWith('groq:')) {
-        const m = modelId.slice(5);
-        return `☁️ Groq — ${m.split('/').pop()}`;
+        const name = modelId.slice(5);
+        return name.split('/').pop();
     }
-    if (modelId === GEMINI_MODEL_OPTION) {
-        return `✨ Gemini API (${geminiModelName || 'default'})`;
+    if (modelId.startsWith('gemini:')) {
+        return modelId.slice(7);
     }
-    if (modelId === OPENROUTER_MODEL_OPTION) {
-        return `🌐 OpenRouter API (${openrouterModelName || 'default'})`;
+    if (modelId.startsWith('openrouter:')) {
+        const name = modelId.slice(11);
+        return name.split('/').pop().replace(':free', ' (Free)');
     }
-    return `💻 ${modelId}`;
+    if (modelId === '__groq_api__') return 'Groq Cloud';
+    if (modelId === '__gemini_api__') return 'Gemini Cloud';
+    if (modelId === '__openrouter_api__') return 'OpenRouter';
+    // Local GGUF
+    return modelId.split('/').pop().replace('.gguf', '');
 }
 
-// ─── Navigation ──────────────────────────────────────────────────
+function escHtml(str) {
+    if (str === null || str === undefined) return '';
+    return String(str)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+// ─── Toast Notifications ──────────────────────────────────────────
+function showToast(message, type = 'info', duration = 3800) {
+    const container = document.getElementById('toastContainer');
+    if (!container) return;
+
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+
+    let icon = 'ℹ️';
+    if (type === 'success') icon = '✅';
+    if (type === 'error') icon = '⚠️';
+
+    toast.innerHTML = `
+        <span style="font-size:1.15rem;">${icon}</span>
+        <span style="flex:1;line-height:1.4;">${escHtml(message)}</span>
+        <button onclick="this.parentElement.remove()" style="background:transparent;border:none;color:var(--text-muted);cursor:pointer;font-size:0.9rem;padding:2px;">✕</button>
+    `;
+
+    container.appendChild(toast);
+
+    setTimeout(() => {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(40px)';
+        setTimeout(() => toast.remove(), 250);
+    }, duration);
+}
+
+// ─── Status Indicator ─────────────────────────────────────────────
+function setStatus(state, text) {
+    const dot = document.getElementById('statusDot');
+    const textEl = document.getElementById('statusText');
+    if (!dot || !textEl) return;
+
+    dot.className = 'status-dot';
+    if (state === 'generating') dot.classList.add('generating');
+    else if (state === 'error') dot.classList.add('error');
+
+    textEl.textContent = text || 'Engine Ready';
+}
+
+// ─── Custom Modal Confirm ─────────────────────────────────────────
+function showConfirmModal(title, message, onConfirm) {
+    const modal = document.getElementById('confirmModal');
+    const titleEl = document.getElementById('confirmModalTitle');
+    const msgEl = document.getElementById('confirmModalMessage');
+    const actionBtn = document.getElementById('btnConfirmAction');
+    if (!modal) return;
+
+    titleEl.textContent = title || 'Confirm Action';
+    msgEl.textContent = message || 'Are you sure you want to proceed?';
+
+    actionBtn.onclick = () => {
+        closeConfirmModal();
+        if (typeof onConfirm === 'function') onConfirm();
+    };
+
+    modal.classList.remove('hidden');
+}
+
+function closeConfirmModal() {
+    document.getElementById('confirmModal')?.classList.add('hidden');
+}
+
+// ─── View Navigation ──────────────────────────────────────────────
 function switchView(viewName) {
     document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
     document.querySelectorAll('.nav-tab').forEach(t => t.classList.remove('active'));
@@ -74,2641 +171,690 @@ function switchView(viewName) {
     if (view) view.classList.add('active');
     if (tab) tab.classList.add('active');
 
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+
+    if (viewName === 'dashboard') loadProjects();
     if (viewName === 'reader' && currentProject) loadChapters();
     if (viewName === 'state' && currentProject) refreshState();
     if (viewName === 'combine' && currentProject) loadCombineVersions();
     if (viewName === 'edit' && currentProject) loadProjectForEdit();
     if (viewName === 'premise' && currentProject) loadProjectPremise();
-    if (viewName === 'dashboard') loadProjects();
     if (viewName === 'settings') loadSettings();
     if (viewName === 'vision') checkVisionStatus();
-    if (viewName === 'manual' && currentProject) {
-        // Fetch the current manual session status to restore UI state
-        fetch(`/api/project/${currentProject}/generate/manual/status`)
-            .then(res => res.json())
-            .then(data => {
-                if (data.active) {
-                    manualSessionActive = true;
-                    manualScenesCompleted = data.scenes_completed;
-                    manualIsGeneratingScene = Boolean(data.is_generating);
-                    document.getElementById('manualStartCard')?.classList.add('hidden');
-                    document.getElementById('manualSceneCard')?.classList.remove('hidden');
-                    document.getElementById('manualSessionTitle').innerHTML = `<span class="icon">✍️</span> Chapter ${data.chapter_num}: ${escHtml(data.chapter_title)}`;
-                    document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
-                    document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
-                    document.getElementById('btnManualScene').disabled = manualIsGeneratingScene;
-                    document.getElementById('btnManualScene').textContent = manualIsGeneratingScene ? '⏳ Generating...' : '▶ Generate Scene';
-                    document.getElementById('btnManualStopScene')?.classList.toggle('hidden', !manualIsGeneratingScene);
-                    if (data.completed_scenes) {
-                        renderManualScenes(data.completed_scenes);
-                    }
-                    if (manualScenesCompleted > 0 && !manualIsGeneratingScene) {
-                        document.getElementById('btnManualFinish').classList.remove('hidden');
-                    } else {
-                        document.getElementById('btnManualFinish').classList.add('hidden');
-                    }
-                } else {
-                    manualSessionActive = false;
-                    document.getElementById('manualStartCard')?.classList.remove('hidden');
-                    document.getElementById('manualSceneCard')?.classList.add('hidden');
-                }
-            })
-            .catch(() => showToast('Failed to sync manual session state', 'error'));
+    if (viewName === 'manual' && currentProject) syncManualStatus();
+}
+
+function refreshCurrentView() {
+    const activeTab = document.querySelector('.nav-tab.active');
+    const viewName = activeTab ? activeTab.getAttribute('data-view') : 'dashboard';
+    switchView(viewName);
+    loadModels();
+    showToast('Refreshed workspace', 'info');
+}
+
+// ─── Model Management (Universal Switcher & Modal) ────────────────
+async function loadModels() {
+    try {
+        const res = await fetch('/api/models');
+        if (!res.ok) throw new Error('Failed to fetch models');
+        modelsCatalog = await res.json();
+
+        activeModel = modelsCatalog.active || '';
+        const provider = parseModelProvider(activeModel);
+
+        // Update Header Button
+        const headerIcon = document.getElementById('headerProviderIcon');
+        const headerName = document.getElementById('headerModelName');
+        const headerBadge = document.getElementById('headerProviderBadge');
+
+        if (headerIcon) headerIcon.textContent = getProviderIcon(provider);
+        if (headerName) headerName.textContent = formatModelDisplayName(activeModel);
+        if (headerBadge) {
+            headerBadge.className = `model-picker-badge ${getProviderBadgeClass(provider)}`;
+            headerBadge.textContent = provider.toUpperCase();
+        }
+
+        // Update active engine in dashboard stats
+        const activeEngineStat = document.getElementById('statActiveEngine');
+        if (activeEngineStat) {
+            activeEngineStat.textContent = provider.toUpperCase();
+        }
+
+        // Render modal model cards
+        renderModalModelCards('all');
+
+        // Populate settings active model select
+        populateSettingsModelSelect(modelsCatalog);
+
+    } catch (e) {
+        console.error('Error loading models:', e);
+        showToast('Error loading models catalog', 'error');
     }
 }
 
-// Store raw scene text for edit mode
-let manualSceneTexts = new Map();
+function openModelModal() {
+    if (!modelsCatalog) loadModels();
+    document.getElementById('modelSwitcherModal')?.classList.remove('hidden');
+    filterModalModels('all');
+}
 
-function renderManualScenes(scenes) {
-    const completedDiv = document.getElementById('manualCompletedScenes');
-    completedDiv.innerHTML = '';
-    manualSceneTexts.clear();
-    if (scenes && scenes.length > 0) {
-        scenes.forEach((scene, idx) => {
-            // Handle both simple strings (from DB fallback) and dicts (from generate_manual_scene)
-            const sceneText = typeof scene === 'string' ? scene : scene.text;
-            const enhancedSummary = typeof scene === 'string' ? '' : (scene.enhanced_summary || '');
-            const wordCount = (sceneText || '').split(/\s+/).filter(Boolean).length;
-            const isLast = idx === scenes.length - 1;
+function closeModelModal() {
+    document.getElementById('modelSwitcherModal')?.classList.add('hidden');
+}
 
-            // Store raw text in Map for edit mode
-            manualSceneTexts.set(idx, sceneText || '');
+function filterModalModels(provider) {
+    document.querySelectorAll('#modalProviderTabs .bible-tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+        if (btn.textContent.toLowerCase().includes(provider) || (provider === 'all' && btn.textContent.includes('All'))) {
+            btn.classList.add('active');
+        }
+    });
+    renderModalModelCards(provider);
+}
 
-            const sceneHtml = `
-                <div class="manual-scene-result" style="position:relative; margin-bottom:16px;padding:16px;background:var(--surface-2);border-radius:8px;border-left:3px solid var(--accent-primary)">
-                    <div style="position:absolute;top:12px;right:12px;z-index:10;display:flex;gap:4px">
-                        ${isLast ? `<button class="btn btn-sm" style="font-size:0.8rem;padding:4px 8px;background:var(--accent-primary);color:#fff" onclick="regenerateManualScene(${idx})" title="Discard and regenerate this scene">🔄</button>` : ''}
-                        <button class="btn btn-sm" style="font-size:0.8rem;padding:4px 8px;background:var(--accent-secondary);color:#fff" onclick="editManualScene(${idx})" title="Edit this scene's text">✏️</button>
-                        <button class="btn btn-sm btn-danger" style="font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${idx})" title="Delete this scene">🗑️</button>
+function renderModalModelCards(filter) {
+    const container = document.getElementById('modalModelCardsContainer');
+    if (!container || !modelsCatalog) return;
+
+    let cardsHtml = '';
+
+    // Hybrid Option
+    if (filter === 'all' || filter === 'hybrid') {
+        const isSelected = activeModel === 'hybrid' || activeModel.startsWith('hybrid:');
+        cardsHtml += `
+            <div class="card ${isSelected ? 'selected' : ''}" style="cursor:pointer;padding:16px;border:1px solid ${isSelected ? 'var(--accent-purple)' : 'var(--border-subtle)'};background:${isSelected ? 'rgba(139,92,246,0.18)' : 'var(--bg-surface)'};" onclick="switchModel('hybrid')">
+                <div class="flex justify-between items-center mb-2">
+                    <span class="model-picker-badge badge-hybrid">HYBRID</span>
+                    <span style="font-size:0.75rem;color:var(--text-muted);">Writer: Groq / Planner: Local</span>
+                </div>
+                <strong style="font-size:0.95rem;color:var(--text-primary);display:block;margin-bottom:4px;">🔀 Hybrid Architecture</strong>
+                <p class="text-xs text-dim" style="line-height:1.4;">Routes prose writing to Groq cloud and planning/critic/editor passes to local GGUF. Optimal speed and zero token waste.</p>
+            </div>
+        `;
+    }
+
+    // Groq Models
+    if (filter === 'all' || filter === 'groq') {
+        const groqList = modelsCatalog.groq_models || [];
+        groqList.forEach(m => {
+            const modelKey = `groq:${m.id}`;
+            const isSelected = activeModel === modelKey;
+            cardsHtml += `
+                <div class="card ${isSelected ? 'selected' : ''}" style="cursor:pointer;padding:16px;border:1px solid ${isSelected ? 'var(--accent-purple)' : 'var(--border-subtle)'};background:${isSelected ? 'rgba(139,92,246,0.18)' : 'var(--bg-surface)'};" onclick="switchModel('${escHtml(modelKey)}')">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="model-picker-badge badge-groq">GROQ</span>
+                        <span class="model-option-ctx">${escHtml(m.context || '128k')}</span>
                     </div>
-                    <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:${isLast ? '120px' : '80px'}">Scene ${idx + 1}</div>
-                    ${enhancedSummary ? `<div class="text-dim text-sm" style="margin-bottom:6px">Enhanced: ${escHtml(enhancedSummary)}</div>` : ''}
-                    <div style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif;font-size:0.92rem;max-height:300px;overflow-y:auto">${escHtml(sceneText || '')}</div>
-                    <div class="text-dim text-sm" style="margin-top:8px">${wordCount} words</div>
+                    <strong style="font-size:0.95rem;color:var(--text-primary);display:block;margin-bottom:4px;">⚡ ${escHtml(m.name || m.id)}</strong>
+                    <p class="text-xs text-dim" style="line-height:1.4;">${escHtml(m.notes || 'Ultra-fast inference on Groq LPU hardware.')}</p>
                 </div>
             `;
-            completedDiv.insertAdjacentHTML('beforeend', sceneHtml);
         });
     }
-    completedDiv.scrollTop = completedDiv.scrollHeight;
-}
 
-async function deleteManualScene(index) {
-    if (!confirm('Are you sure you want to delete this scene?')) return;
-    try {
-        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${index}`, { method: 'DELETE' });
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to delete scene');
-
-        manualScenesCompleted = data.scenes_completed;
-        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
-        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
-        renderManualScenes(data.completed_scenes);
-
-        if (manualScenesCompleted === 0) {
-            document.getElementById('btnManualFinish').classList.add('hidden');
-        }
-        showToast('Scene deleted', 'success');
-    } catch (e) {
-        showToast(e.message, 'error');
+    // Gemini Models
+    if (filter === 'all' || filter === 'gemini') {
+        const geminiList = modelsCatalog.gemini_models || [];
+        geminiList.forEach(m => {
+            const modelKey = `gemini:${m.id}`;
+            const isSelected = activeModel === modelKey;
+            cardsHtml += `
+                <div class="card ${isSelected ? 'selected' : ''}" style="cursor:pointer;padding:16px;border:1px solid ${isSelected ? 'var(--accent-purple)' : 'var(--border-subtle)'};background:${isSelected ? 'rgba(139,92,246,0.18)' : 'var(--bg-surface)'};" onclick="switchModel('${escHtml(modelKey)}')">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="model-picker-badge badge-gemini">GEMINI</span>
+                        <span class="model-option-ctx">${escHtml(m.context || '1M')}</span>
+                    </div>
+                    <strong style="font-size:0.95rem;color:var(--text-primary);display:block;margin-bottom:4px;">✨ ${escHtml(m.name || m.id)}</strong>
+                    <p class="text-xs text-dim" style="line-height:1.4;">${escHtml(m.notes || 'Flagship reasoning and vast 1M context window.')}</p>
+                </div>
+            `;
+        });
     }
+
+    // OpenRouter Models
+    if (filter === 'all' || filter === 'openrouter') {
+        const orList = modelsCatalog.openrouter_models || [];
+        orList.forEach(m => {
+            const modelKey = `openrouter:${m.id}`;
+            const isSelected = activeModel === modelKey;
+            cardsHtml += `
+                <div class="card ${isSelected ? 'selected' : ''}" style="cursor:pointer;padding:16px;border:1px solid ${isSelected ? 'var(--accent-purple)' : 'var(--border-subtle)'};background:${isSelected ? 'rgba(139,92,246,0.18)' : 'var(--bg-surface)'};" onclick="switchModel('${escHtml(modelKey)}')">
+                    <div class="flex justify-between items-center mb-2">
+                        <span class="model-picker-badge badge-openrouter">OPENROUTER</span>
+                        <span class="model-option-ctx">${escHtml(m.context || '128k')}</span>
+                    </div>
+                    <strong style="font-size:0.95rem;color:var(--text-primary);display:block;margin-bottom:4px;">🌐 ${escHtml(m.name || m.id)}</strong>
+                    <p class="text-xs text-dim" style="line-height:1.4;">${escHtml(m.notes || 'OpenRouter unified API model.')}</p>
+                </div>
+            `;
+        });
+    }
+
+    // Local GGUF Models
+    if (filter === 'all' || filter === 'local') {
+        const localList = modelsCatalog.local_models || [];
+        if (localList.length === 0) {
+            cardsHtml += `
+                <div class="card" style="padding:16px;grid-column:1/-1;">
+                    <div class="text-xs text-dim">No .gguf model files detected in models folder. Add GGUFs to models/ directory to run offline.</div>
+                </div>
+            `;
+        } else {
+            localList.forEach(m => {
+                const isSelected = activeModel === m;
+                cardsHtml += `
+                    <div class="card ${isSelected ? 'selected' : ''}" style="cursor:pointer;padding:16px;border:1px solid ${isSelected ? 'var(--accent-purple)' : 'var(--border-subtle)'};background:${isSelected ? 'rgba(139,92,246,0.18)' : 'var(--bg-surface)'};" onclick="switchModel('${escHtml(m)}')">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="model-picker-badge badge-local">LOCAL GGUF</span>
+                            <span class="model-option-ctx">Offline</span>
+                        </div>
+                        <strong style="font-size:0.95rem;color:var(--text-primary);display:block;margin-bottom:4px;">💻 ${escHtml(m)}</strong>
+                        <p class="text-xs text-dim" style="line-height:1.4;">100% offline llama.cpp execution on your hardware.</p>
+                    </div>
+                `;
+            });
+        }
+    }
+
+    container.innerHTML = cardsHtml;
 }
 
-// ─── Scene Regeneration (Manual Mode) ──────────────���──────────────
-async function regenerateManualScene(index) {
-    if (!currentProject || !manualSessionActive || manualIsGeneratingScene) return;
-    if (!confirm('Discard this scene and write a new version?')) return;
-
-    const btn = document.getElementById('btnManualScene');
-    const stopBtn = document.getElementById('btnManualStopScene');
-    const finishBtn = document.getElementById('btnManualFinish');
-    const statusEl = document.getElementById('manualSceneStatus');
+async function switchModel(modelId) {
+    if (!modelId) return;
+    setStatus('generating', 'Switching model...');
 
     try {
-        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${index}/regenerate`, {
+        const res = await fetch('/api/models/switch', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({}),
+            body: JSON.stringify({ model: modelId }),
         });
+
         const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to regenerate scene');
-
-        manualIsGeneratingScene = true;
-        if (btn) { btn.disabled = true; btn.textContent = '⏳ Generating...'; }
-        if (stopBtn) stopBtn.classList.remove('hidden');
-        if (finishBtn) finishBtn.classList.add('hidden');
-        if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Regenerating scene...'; }
-
-        // Show streaming area
-        document.getElementById('manualStreamArea').classList.remove('hidden');
-        document.getElementById('manualStreamOutput').textContent = '';
-        streamSceneNodes = new Map();
-
-        // Reconnect SSE if needed (manual_scene_done will finalize UI state)
-        if (!eventSource) {
-            eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
-            eventSource.onmessage = handleSSE;
-            eventSource.onerror = () => {
-                if (eventSource) { eventSource.close(); eventSource = null; }
-            };
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to switch model');
         }
-        showToast(`Regenerating scene ${index + 1}...`, 'info');
+
+        activeModel = data.active || modelId;
+        const provider = parseModelProvider(activeModel);
+        showToast(`Switched active engine to ${formatModelDisplayName(activeModel)} (${provider.toUpperCase()})`, 'success');
+        
+        closeModelModal();
+        await loadModels();
+        setStatus('online', 'Engine Ready');
+
     } catch (e) {
-        // Scene was already removed server-side only on success path; safe to just report
-        manualIsGeneratingScene = false;
-        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
-        if (statusEl) statusEl.classList.add('hidden');
-        if (stopBtn) stopBtn.classList.add('hidden');
-        showToast(e.message, 'error');
+        showToast(e.message || 'Model switch error', 'error');
+        setStatus('error', 'Model Error');
+        loadModels();
     }
 }
 
-// ─── Typed Scene Panel (Manual Mode) ─────────────────────────────
-function toggleTypedScenePanel() {
-    const panel = document.getElementById('manualTypedScenePanel');
-    if (panel.classList.contains('hidden')) {
-        panel.classList.remove('hidden');
-        document.getElementById('manualTypedSceneText').value = '';
-        document.getElementById('typedSceneWordCount').textContent = '0 words';
-        document.getElementById('manualTypedSceneText').focus();
-    } else {
-        panel.classList.add('hidden');
-    }
-}
+function populateSettingsModelSelect(catalog) {
+    const select = document.getElementById('settingsActiveModel');
+    if (!select || !catalog) return;
 
-// Live word counter for typed scene textarea
-document.addEventListener('DOMContentLoaded', () => {
-    const ta = document.getElementById('manualTypedSceneText');
-    if (ta) {
-        ta.addEventListener('input', () => {
-            const words = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
-            document.getElementById('typedSceneWordCount').textContent = `${words} word${words !== 1 ? 's' : ''}`;
+    let optHtml = '';
+
+    // Hybrid
+    optHtml += `<optgroup label="Hybrid Architecture"><option value="hybrid" ${catalog.active === 'hybrid' ? 'selected' : ''}>🔀 Hybrid (Groq Writer + Local Planning)</option></optgroup>`;
+
+    // Groq
+    if (catalog.groq_models?.length) {
+        optHtml += '<optgroup label="Groq Cloud LPU">';
+        catalog.groq_models.forEach(m => {
+            const val = `groq:${m.id}`;
+            optHtml += `<option value="${escHtml(val)}" ${catalog.active === val ? 'selected' : ''}>⚡ ${escHtml(m.name || m.id)}</option>`;
         });
-    }
-});
-
-async function addTypedScene() {
-    if (!currentProject || !manualSessionActive) {
-        showToast('No active manual session', 'error');
-        return;
+        optHtml += '</optgroup>';
     }
 
-    const text = document.getElementById('manualTypedSceneText').value.trim();
-    if (!text) {
-        showToast('Type some scene text first', 'error');
-        return;
-    }
-
-    const btn = document.getElementById('btnAddTypedScene');
-    btn.disabled = true;
-    btn.textContent = '⏳ Adding...';
-
-    try {
-        // Use the scene API to add typed text as a "generated" scene via a special brief
-        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/typed`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text }),
+    // Gemini
+    if (catalog.gemini_models?.length) {
+        optHtml += '<optgroup label="Google Gemini">';
+        catalog.gemini_models.forEach(m => {
+            const val = `gemini:${m.id}`;
+            optHtml += `<option value="${escHtml(val)}" ${catalog.active === val ? 'selected' : ''}>✨ ${escHtml(m.name || m.id)}</option>`;
         });
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to add typed scene');
-
-        manualScenesCompleted = data.scenes_completed;
-        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
-        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
-        renderManualScenes(data.completed_scenes);
-
-        document.getElementById('btnManualFinish').classList.remove('hidden');
-        toggleTypedScenePanel();
-        showToast(`Typed scene added (${data.words} words)`, 'success');
-    } catch (e) {
-        showToast(e.message, 'error');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '✅ Add Scene';
-    }
-}
-
-// ─── Edit Scene Inline (Manual Mode) ─────────────────────────────
-function editManualScene(index) {
-    const container = document.getElementById('manualCompletedScenes');
-    const sceneEl = container.children[index];
-    if (!sceneEl) return;
-
-    // Get the raw text from our Map
-    const rawText = manualSceneTexts.get(index) || '';
-
-    // Replace the text display with a textarea
-    const oldHtml = sceneEl.innerHTML;
-    sceneEl.setAttribute('data-old-html', oldHtml);
-    sceneEl.innerHTML = `
-        <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary)">Scene ${index + 1} — Editing</div>
-        <textarea class="form-textarea" id="editSceneTextarea_${index}" rows="12"
-            style="font-family:'Lora',serif;font-size:0.92rem;line-height:1.7;width:100%;white-space:pre-wrap">${escHtml(rawText)}</textarea>
-        <div class="flex gap-2 items-center" style="margin-top:10px">
-            <button class="btn btn-primary" onclick="saveManualSceneEdit(${index})" style="font-size:0.85rem;padding:6px 14px">💾 Save</button>
-            <button class="btn" onclick="cancelManualSceneEdit(${index})" style="font-size:0.85rem;padding:6px 14px">✕ Cancel</button>
-            <span class="text-dim text-sm" id="editSceneWordCount_${index}"></span>
-        </div>
-    `;
-
-    // Word counter for edit textarea
-    const ta = document.getElementById(`editSceneTextarea_${index}`);
-    const wc = document.getElementById(`editSceneWordCount_${index}`);
-    const updateWc = () => {
-        const w = ta.value.trim() ? ta.value.trim().split(/\s+/).length : 0;
-        wc.textContent = `${w} words`;
-    };
-    updateWc();
-    ta.addEventListener('input', updateWc);
-    ta.focus();
-}
-
-function cancelManualSceneEdit(index) {
-    const container = document.getElementById('manualCompletedScenes');
-    const sceneEl = container.children[index];
-    if (!sceneEl) return;
-    const oldHtml = sceneEl.getAttribute('data-old-html');
-    if (oldHtml) {
-        sceneEl.innerHTML = oldHtml;
-    }
-}
-
-async function saveManualSceneEdit(index) {
-    const ta = document.getElementById(`editSceneTextarea_${index}`);
-    if (!ta) return;
-    const newText = ta.value.trim();
-    if (!newText) {
-        showToast('Scene text cannot be empty', 'error');
-        return;
+        optHtml += '</optgroup>';
     }
 
-    try {
-        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${index}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ text: newText }),
+    // OpenRouter
+    if (catalog.openrouter_models?.length) {
+        optHtml += '<optgroup label="OpenRouter Hub">';
+        catalog.openrouter_models.forEach(m => {
+            const val = `openrouter:${m.id}`;
+            optHtml += `<option value="${escHtml(val)}" ${catalog.active === val ? 'selected' : ''}>🌐 ${escHtml(m.name || m.id)}</option>`;
         });
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save scene edit');
-
-        manualScenesCompleted = data.scenes_completed;
-        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
-        renderManualScenes(data.completed_scenes);
-        showToast(`Scene ${index + 1} updated (${data.words} words)`, 'success');
-    } catch (e) {
-        showToast(e.message, 'error');
+        optHtml += '</optgroup>';
     }
+
+    // Local
+    if (catalog.local_models?.length) {
+        optHtml += '<optgroup label="Local GGUF Models">';
+        catalog.local_models.forEach(m => {
+            optHtml += `<option value="${escHtml(m)}" ${catalog.active === m ? 'selected' : ''}>💻 ${escHtml(m)}</option>`;
+        });
+        optHtml += '</optgroup>';
+    }
+
+    select.innerHTML = optHtml;
+    select.onchange = (e) => switchModel(e.target.value);
 }
 
-function showProjectTabs() {
-    document.getElementById('tabGenerate').classList.remove('hidden');
-    document.getElementById('tabPremise').classList.remove('hidden');
-    document.getElementById('tabManual').classList.remove('hidden');
-    document.getElementById('tabReader').classList.remove('hidden');
-    document.getElementById('tabLogs').classList.remove('hidden');
-    document.getElementById('tabState').classList.remove('hidden');
-    document.getElementById('tabCombine').classList.remove('hidden');
-    document.getElementById('tabEdit').classList.remove('hidden');
-}
-
-// ─── Projects ────────────────────────────────────────────────────
+// ─── Project Management & Story Library ───────────────────────────
 async function loadProjects() {
     try {
         const res = await fetch('/api/projects');
+        if (!res.ok) throw new Error('Failed to load projects');
         const data = await res.json();
-        renderProjects(data.projects);
+        projectsList = Array.isArray(data) ? data : (data.projects || []);
+
+        // Calculate Totals
+        let totalCh = 0;
+        let totalW = 0;
+        projectsList.forEach(p => {
+            totalCh += p.total_chapters || p.current_chapter || 0;
+            totalW += p.word_count || 0;
+        });
+
+        const statTotalStories = document.getElementById('statTotalStories');
+        const statTotalChapters = document.getElementById('statTotalChapters');
+        const statTotalWords = document.getElementById('statTotalWords');
+
+        if (statTotalStories) statTotalStories.textContent = projectsList.length;
+        if (statTotalChapters) statTotalChapters.textContent = totalCh;
+        if (statTotalWords) statTotalWords.textContent = totalW >= 1000 ? `${(totalW / 1000).toFixed(1)}k` : totalW;
+
+        renderProjectsGrid(projectsList);
+
     } catch (e) {
-        showToast('Failed to load projects', 'error');
+        console.error('Error loading stories:', e);
+        showToast('Error loading story library', 'error');
     }
 }
 
-function renderProjects(projects) {
+function filterProjectsList() {
+    const searchVal = (document.getElementById('searchProjectsInput')?.value || '').toLowerCase().trim();
+    const genreVal = document.getElementById('filterGenreSelect')?.value || 'all';
+
+    const filtered = projectsList.filter(p => {
+        const title = (p.title || p.name || '').toLowerCase();
+        const premise = (p.premise || '').toLowerCase();
+        const genre = (p.genre || '').toLowerCase();
+
+        const matchesSearch = !searchVal || title.includes(searchVal) || premise.includes(searchVal);
+        const matchesGenre = genreVal === 'all' || genre.includes(genreVal.toLowerCase());
+        return matchesSearch && matchesGenre;
+    });
+
+    renderProjectsGrid(filtered);
+}
+
+function renderProjectsGrid(list) {
     const grid = document.getElementById('projectsGrid');
-    if (!projects.length) {
+    if (!grid) return;
+
+    if (!list || list.length === 0) {
         grid.innerHTML = `
-            <div class="empty-state">
+            <div class="empty-state" style="grid-column:1/-1;">
                 <span class="icon">📚</span>
-                <h3>No stories yet</h3>
-                <p>Create your first story project to get started.</p>
-                <button class="btn btn-primary" onclick="switchView('create')">✨ Create Story</button>
-            </div>`;
-        return;
-    }
-
-    grid.innerHTML = projects.map(p => `
-        <div class="card project-card">
-            <div onclick="selectProject('${p.name}')" style="cursor:pointer">
-                <div class="project-title">${escHtml(p.title)}</div>
-                <div class="project-genre">${escHtml(p.genre)}</div>
-                <div class="project-stats">
-                    <span>📖 ${p.current_chapter} chapters</span>
-                    <span>🎬 ${p.total_scenes} scenes</span>
-                    <span>👥 ${p.characters.length} characters</span>
-                </div>
+                <h3>No matching stories found</h3>
+                <p>Try adjusting your search or genre filters, or create a brand new story.</p>
+                <button class="btn btn-primary" onclick="switchView('create')">✨ Create New Story</button>
             </div>
-            <div class="flex gap-2 mt-2" style="justify-content:flex-end">
-                <button class="btn btn-sm" onclick="event.stopPropagation();exportStory('${p.name}')" title="Export full story (Markdown)">📥 Export</button>
-                <button class="btn btn-sm" onclick="event.stopPropagation();exportEpub('${p.name}')" title="Export story as EPUB e-book" style="background:var(--accent-secondary);color:#fff">📗 EPUB</button>
-                <button class="btn btn-sm" onclick="event.stopPropagation();resetProject('${p.name}','${escHtml(p.title)}')" title="Reset generated content" style="background:var(--warning);color:#000">🔄 Reset</button>
-                <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteProject('${p.name}','${escHtml(p.title)}')" title="Delete project">🗑️ Delete</button>
-            </div>
-        </div>
-    `).join('');
-}
-
-async function selectProject(name) {
-    currentProject = name;
-    document.getElementById('activeProject').textContent = name;
-    showProjectTabs();
-
-    try {
-        const res = await fetch(`/api/project/${name}`);
-        const data = await res.json();
-        document.getElementById('genTitle').innerHTML =
-            `<span class="icon">✍️</span> ${escHtml(data.info.title)}`;
-            
-        // Restore Combine view state if data exists
-        if (data.combine_data) {
-            populateCombineUI(data.combine_data);
-        } else {
-            // Reset combine view
-            document.getElementById('combineAnalysisCard').classList.add('hidden');
-            document.getElementById('combinePolishedCard').classList.add('hidden');
-            document.getElementById('combineDownloadCard').classList.add('hidden');
-            document.getElementById('btnDeleteCombine').classList.add('hidden');
-            document.getElementById('btnCombine').disabled = false;
-            document.getElementById('btnCombine').innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
-        }
-
-        loadCombineVersions();
-
-        switchView('generate');
-    } catch (e) {
-        showToast('Failed to load project', 'error');
-    }
-}
-
-// ─── Edit Project ────────────────────────────────────────────────
-let editCharacters = [];
-
-async function loadProjectForEdit() {
-    if (!currentProject) return;
-    try {
-        const res = await fetch(`/api/project/${currentProject}`);
-        const data = await res.json();
-        
-        const metadata = data.state.metadata || {};
-        document.getElementById('editTitle').value = metadata.title || '';
-        document.getElementById('editGenre').value = metadata.genre || '';
-        document.getElementById('editPremise').value = metadata.premise || '';
-        document.getElementById('editSetting').value = metadata.setting || '';
-        document.getElementById('editThemes').value = (metadata.themes || []).join(', ');
-
-        const charsObj = data.state.characters || {};
-        editCharacters = Object.keys(charsObj).map(name => ({
-            name: name,
-            description: charsObj[name].description || '',
-            traits: charsObj[name].traits || [],
-            originalName: name
-        }));
-        renderEditCharacterList();
-    } catch (e) {
-        showToast('Failed to load project for editing', 'error');
-    }
-}
-
-function renderEditCharacterList() {
-    const list = document.getElementById('editCharacterList');
-    list.innerHTML = editCharacters.map((c, i) => `
-        <div class="character-entry">
-            <span class="char-name">${escHtml(c.name)}</span>
-            <span>${escHtml(c.description)}</span>
-            <span class="text-dim">${c.traits.join(', ')}</span>
-            <span class="char-remove" onclick="removeEditCharacter(${i})">✕</span>
-        </div>
-    `).join('');
-}
-
-function addEditCharacter() {
-    const name = document.getElementById('editCharName').value.trim();
-    const desc = document.getElementById('editCharDesc').value.trim();
-    const traits = document.getElementById('editCharTraits').value.trim();
-
-    if (!name) { showToast('Enter a character name', 'error'); return; }
-
-    const existingIndex = editCharacters.findIndex(c => c.name.toLowerCase() === name.toLowerCase());
-    if (existingIndex >= 0) {
-        editCharacters[existingIndex].description = desc;
-        editCharacters[existingIndex].traits = traits ? traits.split(',').map(t => t.trim()) : [];
-    } else {
-        editCharacters.push({
-            name,
-            description: desc,
-            traits: traits ? traits.split(',').map(t => t.trim()) : [],
-            isNew: true
-        });
-    }
-
-    renderEditCharacterList();
-    document.getElementById('editCharName').value = '';
-    document.getElementById('editCharDesc').value = '';
-    document.getElementById('editCharTraits').value = '';
-    document.getElementById('editCharName').focus();
-}
-
-function removeEditCharacter(index) {
-    editCharacters.splice(index, 1);
-    renderEditCharacterList();
-}
-
-async function saveProjectEdits() {
-    if (!currentProject) return;
-
-    const title = document.getElementById('editTitle').value.trim();
-    const genre = document.getElementById('editGenre').value.trim();
-    const premise = document.getElementById('editPremise').value.trim();
-    const setting = document.getElementById('editSetting').value.trim();
-    const themesStr = document.getElementById('editThemes').value.trim();
-
-    if (!title) { showToast('Title cannot be empty', 'error'); return; }
-
-    const btn = document.getElementById('btnSaveEdits');
-    btn.disabled = true;
-    btn.textContent = '⏳ Saving...';
-
-    const metadataUpdate = {
-        title, genre, premise, setting,
-        themes: themesStr ? themesStr.split(',').map(t => t.trim()) : []
-    };
-
-    const charactersUpdate = {};
-    editCharacters.forEach(c => {
-        charactersUpdate[c.name] = {
-            description: c.description,
-            traits: c.traits
-        };
-    });
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/state`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                metadata: metadataUpdate,
-                characters: charactersUpdate
-            }),
-        });
-
-        const data = await res.json();
-        if (data.status === 'ok') {
-            showToast('Story details saved successfully', 'success');
-            // If title changed, we might want to update the sidebar/header
-            document.getElementById('genTitle').innerHTML = `<span class="icon">✍️</span> ${escHtml(title)}`;
-        } else {
-            showToast(data.error || 'Failed to save edits', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to save edits', 'error');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '💾 Save Changes';
-    }
-}
-
-// ─── Create Project ──────────────────────────────────────────────
-function addCharacter() {
-    const name = document.getElementById('charName').value.trim();
-    const desc = document.getElementById('charDesc').value.trim();
-    const traits = document.getElementById('charTraits').value.trim();
-
-    if (!name) { showToast('Enter a character name', 'error'); return; }
-
-    characters.push({
-        name,
-        description: desc,
-        traits: traits ? traits.split(',').map(t => t.trim()) : [],
-    });
-
-    renderCharacterList();
-    document.getElementById('charName').value = '';
-    document.getElementById('charDesc').value = '';
-    document.getElementById('charTraits').value = '';
-    document.getElementById('charName').focus();
-}
-
-function removeCharacter(index) {
-    characters.splice(index, 1);
-    renderCharacterList();
-}
-
-function renderCharacterList() {
-    const list = document.getElementById('characterList');
-    list.innerHTML = characters.map((c, i) => `
-        <div class="character-entry">
-            <span class="char-name">${escHtml(c.name)}</span>
-            <span>${escHtml(c.description)}</span>
-            <span class="text-dim">${c.traits.join(', ')}</span>
-            <span class="char-remove" onclick="removeCharacter(${i})">✕</span>
-        </div>
-    `).join('');
-}
-
-async function createProject() {
-    const title = document.getElementById('createTitle').value.trim();
-    const genre = document.getElementById('createGenre').value;
-    const premise = document.getElementById('createPremise').value.trim();
-    const setting = document.getElementById('createSetting').value.trim();
-    const themes = document.getElementById('createThemes').value.trim();
-
-    if (!title) { showToast('Enter a title', 'error'); return; }
-    if (!premise) { showToast('Enter a premise', 'error'); return; }
-
-    const charObj = {};
-    characters.forEach(c => {
-        charObj[c.name] = { description: c.description, traits: c.traits };
-    });
-
-    const btn = document.getElementById('btnCreateProject');
-    btn.disabled = true;
-    btn.textContent = '⏳ Creating...';
-
-    try {
-        const res = await fetch('/api/project/create', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                title, genre, premise, setting,
-                themes: themes ? themes.split(',').map(t => t.trim()) : [],
-                characters: charObj,
-            }),
-        });
-
-        const data = await res.json();
-        if (data.status === 'ok') {
-            showToast(`Project "${title}" created!`, 'success');
-            characters = [];
-            renderCharacterList();
-            currentProject = data.project;
-            document.getElementById('activeProject').textContent = data.project;
-            showProjectTabs();
-            switchView('generate');
-            document.getElementById('genTitle').innerHTML =
-                `<span class="icon">✍️</span> ${escHtml(title)}`;
-        } else {
-            showToast(data.error || 'Creation failed', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to create project', 'error');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '🚀 Create Project';
-    }
-}
-
-// ─── Generation ──────────────────────────────────────────────────
-
-// Old batch manual helpers (kept for backwards compat but unused in new flow)
-function syncManualSceneInputs() { /* no-op in interactive mode */ }
-
-// ─── Interactive Manual Generation ───────────────────────────────
-async function startManualChapter() {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    if (isGenerating || manualSessionActive) return;
-
-    const chapterTitle = document.getElementById('manualChapterTitle')?.value.trim() || '';
-    const pacing = document.getElementById('manualPacing')?.value || 'moderate';
-    const selectedModel = document.getElementById('modelSelect')?.value || '';
-
-    if (!chapterTitle) {
-        showToast('Enter a chapter heading', 'error');
+        `;
         return;
     }
 
-    const btn = document.getElementById('btnManualStart');
-    if (btn) { btn.disabled = true; btn.textContent = '⏳ Starting...'; }
+    grid.innerHTML = list.map(p => {
+        const title = p.title || p.name || 'Untitled Story';
+        const genre = p.genre || 'Fiction';
+        const premise = p.premise || 'No premise outline set.';
+        const chaptersCount = p.total_chapters !== undefined ? p.total_chapters : (p.current_chapter || 0);
+        const wordsCount = p.word_count || 0;
+        const charNames = Array.isArray(p.characters) ? p.characters.slice(0, 4) : [];
+        const isCurrent = currentProject === p.name;
 
-    try {
-        const res = await fetch(`/api/project/${currentProject}/generate/manual/start`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chapter_title: chapterTitle, pacing, model: selectedModel }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-            throw new Error(data.error || 'Failed to start manual session');
-        }
-
-        // Session started successfully
-        manualSessionActive = true;
-        manualScenesCompleted = 0;
-        manualChapterNum = data.chapter_num || 0;
-        manualIsGeneratingScene = false;
-
-        // Connect SSE for live streaming
-        eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
-        eventSource.onmessage = handleSSE;
-        eventSource.onerror = () => {
-            // SSE errors in manual mode are recoverable — don't kill the session
-            if (eventSource) { eventSource.close(); eventSource = null; }
-        };
-
-        // Switch UI to scene input phase
-        document.getElementById('manualStartCard').classList.add('hidden');
-        document.getElementById('manualSceneCard').classList.remove('hidden');
-        document.getElementById('manualSessionTitle').innerHTML =
-            `<span class="icon">✍️</span> Chapter ${data.chapter_num}: ${escHtml(data.chapter_title)}`;
-        document.getElementById('manualSceneCounter').textContent = '0 scenes completed';
-        document.getElementById('manualCompletedScenes').innerHTML = '';
-        document.getElementById('manualSceneLabel').textContent = 'Scene 1 — Describe what should happen';
-        document.getElementById('manualSceneBrief').value = '';
-        document.getElementById('btnManualFinish').classList.add('hidden');
-        document.getElementById('btnManualCancel').classList.remove('hidden');
-
-        setStatus('online', 'Manual session active');
-        showToast(`Chapter ${data.chapter_num} session started!`, 'success');
-
-    } catch (e) {
-        showToast(e.message, 'error');
-    } finally {
-        if (btn) { btn.disabled = false; btn.textContent = '🚀 Start Chapter'; }
-    }
-}
-
-async function generateNextScene() {
-    if (!currentProject || !manualSessionActive || manualIsGeneratingScene) return;
-
-    const brief = document.getElementById('manualSceneBrief')?.value.trim() || '';
-    if (!brief) {
-        showToast('Enter a scene description', 'error');
-        return;
-    }
-
-    manualIsGeneratingScene = true;
-    const btn = document.getElementById('btnManualScene');
-    const stopBtn = document.getElementById('btnManualStopScene');
-    const finishBtn = document.getElementById('btnManualFinish');
-    const statusEl = document.getElementById('manualSceneStatus');
-    if (btn) { btn.disabled = true; btn.textContent = '⏳ Generating...'; }
-    if (stopBtn) stopBtn.classList.remove('hidden');
-    if (finishBtn) finishBtn.classList.add('hidden');
-    if (statusEl) { statusEl.classList.remove('hidden'); statusEl.textContent = 'Enhancing and writing scene...'; }
-
-    // Show streaming area
-    document.getElementById('manualStreamArea').classList.remove('hidden');
-    document.getElementById('manualStreamOutput').textContent = '';
-    streamSceneNodes = new Map();
-
-    // Reconnect SSE if needed
-    if (!eventSource) {
-        eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
-        eventSource.onmessage = handleSSE;
-        eventSource.onerror = () => {
-            if (eventSource) { eventSource.close(); eventSource = null; }
-        };
-    }
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ scene_brief: brief }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-            throw new Error(data.error || 'Failed to start scene generation');
-        }
-        // Scene generation is now running in background — SSE will deliver tokens + completion
-    } catch (e) {
-        manualIsGeneratingScene = false;
-        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
-        if (statusEl) statusEl.classList.add('hidden');
-        if (stopBtn) stopBtn.classList.add('hidden');
-        showToast(e.message, 'error');
-    }
-}
-
-async function stopManualScene() {
-    if (!currentProject || !manualSessionActive || !manualIsGeneratingScene) return;
-
-    try {
-        await fetch(`/api/project/${currentProject}/generate/manual/cancel_scene`, {
-            method: 'POST',
-        });
-        showToast('Stopping scene generation...', 'info');
-        // onManualSceneDone will be called by SSE with status='cancelled'
-    } catch (e) {
-        showToast('Failed to stop scene', 'error');
-    }
-}
-
-function onManualSceneDone(data) {
-    manualIsGeneratingScene = false;
-    
-    const btn = document.getElementById('btnManualScene');
-    const stopBtn = document.getElementById('btnManualStopScene');
-    const finishBtn = document.getElementById('btnManualFinish');
-    const statusEl = document.getElementById('manualSceneStatus');
-
-    if (stopBtn) stopBtn.classList.add('hidden');
-
-    if (data.status === 'cancelled') {
-        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
-        if (statusEl) statusEl.classList.add('hidden');
-        document.getElementById('manualStreamArea').classList.add('hidden');
-        if (manualScenesCompleted > 0 && finishBtn) finishBtn.classList.remove('hidden');
-        showToast('Scene generation stopped.', 'info');
-        return;
-    }
-
-    if (data.status === 'error') {
-        manualScenesCompleted = data.scenes_completed ?? manualScenesCompleted;
-        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
-        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
-        if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
-        if (statusEl) {
-            statusEl.classList.remove('hidden');
-            statusEl.textContent = 'Scene failed. Completed scenes are still saved.';
-        }
-        if (manualScenesCompleted > 0 && finishBtn) finishBtn.classList.remove('hidden');
-        showToast(data.error || 'Scene generation failed', 'error');
-        addLogEntry({
-            timestamp: new Date().toLocaleTimeString(),
-            level: 'error',
-            message: data.error || 'Scene generation failed',
-        });
-        loadChapters();
-        return;
-    }
-
-    manualScenesCompleted = data.scene_number || (manualScenesCompleted + 1);
-
-    // Add completed scene to the display
-    const completedDiv = document.getElementById('manualCompletedScenes');
-    const sceneIdx = manualScenesCompleted - 1;
-    manualSceneTexts.set(sceneIdx, data.scene_text || '');
-    const sceneHtml = `
-        <div class="manual-scene-result" style="position:relative; margin-bottom:16px;padding:16px;background:var(--surface-2);border-radius:8px;border-left:3px solid var(--accent-primary)">
-            <div style="position:absolute;top:12px;right:12px;z-index:10;display:flex;gap:4px">
-                <button class="btn btn-sm" style="font-size:0.8rem;padding:4px 8px;background:var(--accent-secondary);color:#fff" onclick="editManualScene(${sceneIdx})" title="Edit this scene's text">✏️</button>
-                <button class="btn btn-sm btn-danger" style="font-size:0.8rem;padding:4px 8px" onclick="deleteManualScene(${sceneIdx})" title="Delete this scene">🗑️</button>
-            </div>
-            <div style="font-weight:600;margin-bottom:8px;color:var(--accent-primary);padding-right:80px">Scene ${manualScenesCompleted}</div>
-            <div class="text-dim text-sm" style="margin-bottom:6px">Enhanced: ${escHtml(data.enhanced_summary || '')}</div>
-            <div style="white-space:pre-wrap;line-height:1.7;font-family:'Lora',serif;font-size:0.92rem;max-height:300px;overflow-y:auto">${escHtml(data.scene_text || '')}</div>
-            <div class="text-dim text-sm" style="margin-top:8px">${data.words || 0} words</div>
-        </div>
-    `;
-    completedDiv.insertAdjacentHTML('beforeend', sceneHtml);
-    completedDiv.scrollTop = completedDiv.scrollHeight;
-
-    // Reset input for next scene
-    document.getElementById('manualSceneBrief').value = '';
-    document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen`;
-    document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
-
-    // Show finish button after first scene
-    if (finishBtn) finishBtn.classList.remove('hidden');
-    document.getElementById('manualStreamArea').classList.add('hidden');
-
-    if (btn) { btn.disabled = false; btn.textContent = '▶ Generate Scene'; }
-    if (statusEl) statusEl.classList.add('hidden');
-
-    showToast(`Scene ${manualScenesCompleted} complete! (${data.words || 0} words)`, 'success');
-}
-
-async function finishManualChapter() {
-    if (!currentProject || !manualSessionActive || manualIsGeneratingScene) return;
-
-    if (manualScenesCompleted < 1) {
-        showToast('Generate at least one scene first', 'error');
-        return;
-    }
-
-    if (!confirm(`Finalize this chapter with ${manualScenesCompleted} scene(s)?\nThis will save it permanently.`)) {
-        return;
-    }
-
-    const btn = document.getElementById('btnManualFinish');
-    const sceneBtn = document.getElementById('btnManualScene');
-    if (btn) { btn.disabled = true; btn.textContent = '⏳ Finalizing...'; }
-    if (sceneBtn) sceneBtn.disabled = true;
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/generate/manual/finish`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-            throw new Error(data.error || 'Failed to finalize chapter');
-        }
-        // The SSE stream will send the 'done' event which calls resetManualSession
-    } catch (e) {
-        showToast(e.message, 'error');
-        if (btn) { btn.disabled = false; btn.textContent = '✅ Finish Chapter'; }
-        if (sceneBtn) sceneBtn.disabled = false;
-    }
-}
-
-async function cancelManualSession() {
-    if (!currentProject) return;
-    if (!confirm('Cancel this manual session? Unsaved progress will be lost.')) return;
-
-    // Cancel any active generation
-    if (manualIsGeneratingScene) {
-        try {
-            await fetch(`/api/project/${currentProject}/generate/cancel`, { method: 'POST' });
-        } catch (e) { /* ignore */ }
-    }
-
-    resetManualSession();
-    showToast('Manual session cancelled', 'info');
-}
-
-function resetManualSession() {
-    manualSessionActive = false;
-    manualScenesCompleted = 0;
-    manualChapterNum = 0;
-    manualIsGeneratingScene = false;
-    manualSceneTexts.clear();
-
-    if (eventSource) { eventSource.close(); eventSource = null; }
-
-    // Restore UI to start phase
-    document.getElementById('manualStartCard').classList.remove('hidden');
-    document.getElementById('manualSceneCard').classList.add('hidden');
-    document.getElementById('manualStreamArea')?.classList.add('hidden');
-    document.getElementById('manualTypedScenePanel')?.classList.add('hidden');
-    setStatus('online', 'Ready');
-}
-
-async function startGeneration() {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    if (isGenerating) return;
-
-    isGenerating = true;
-    totalWords = 0;
-    scenesComplete = 0;
-    totalScenes = 0;
-    streamSceneNodes = new Map();
-    plannedChapters = 1;
-    completedChapters = 0;
-
-    document.getElementById('btnGenerate').classList.add('hidden');
-    document.getElementById('btnCancel').classList.remove('hidden');
-    document.getElementById('genOutput').innerHTML = '';
-    setStatus('working', 'Generating...');
-    resetPipelineStages();
-
-    const pacing = document.getElementById('genPacing').value;
-    const chapterCount = parseInt(document.getElementById('genChapterCount').value) || 1;
-    const selectedModel = document.getElementById('modelSelect')?.value || '';
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/generate`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ pacing, chapter_count: chapterCount, model: selectedModel }),
-        });
-
-        if (!res.ok) {
-            const data = await res.json().catch(() => ({}));
-            throw new Error(data.error || 'Failed to start generation');
-        }
-        const startData = await res.json().catch(() => ({}));
-        plannedChapters = startData.chapters || chapterCount || 1;
-
-        // Connect SSE
-        eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
-        eventSource.onmessage = handleSSE;
-        eventSource.onerror = () => {
-            stopGeneration();
-            showToast('Connection lost', 'error');
-        };
-    } catch (e) {
-        stopGeneration();
-        showToast(e.message, 'error');
-    }
-}
-
-// Old batch manual generation (kept for API backwards compat)
-async function startManualGeneration() {
-    showToast('Please use the interactive scene-by-scene flow instead', 'info');
-    switchView('manual');
-}
-
-function handleSSE(event) {
-    const msg = JSON.parse(event.data);
-    const evt = msg.event || msg.type;
-    const data = msg.data ?? msg.payload ?? {};
-
-    switch (evt) {
-        case 'chapter_start':
-            scenesComplete = 0;
-            totalScenes = 0;
-            streamSceneNodes = new Map();
-            resetPipelineStages();
-            updateStats({ scenes: '0/0', status: `Starting chapter ${data.chapter}` });
-            if (data.chapter > 1) {
-                appendOutput('<hr style="border:none;border-top:2px solid var(--accent-primary);margin:32px 0">');
-            }
-            loadChapters(); // Refresh list to show WIP chapter
-            break;
-
-        case 'agent_active':
-            updatePipelineStage(data.agent);
-            updateStats({ status: `${data.agent}: ${data.step}` });
-            if (manualSessionActive && manualIsGeneratingScene) {
-                const statusEl = document.getElementById('manualSceneStatus');
-                if (statusEl && !statusEl.classList.contains('hidden')) {
-                    const phaseMap = {
-                        'Scene Writer':      '✍️ Writing scene...',
-                        'Consistency Engine':'🔍 Reviewing consistency...',
-                        'Editor':            '✂️ Polishing scene...',
-                        'Retriever':         '📚 Retrieving context...',
-                    };
-                    statusEl.textContent = phaseMap[data.agent] || `⚙️ ${data.agent}...`;
-                }
-            }
-            break;
-
-        case 'chapter_planned':
-            appendOutput(`<h2 style="color:var(--accent-primary);font-family:'Playfair Display',serif;margin:16px 0 8px">Chapter: ${escHtml(data.plan.chapter_title)}</h2>`);
-            appendOutput(`<p class="text-dim text-sm" style="margin-bottom:20px"><em>Tone: ${escHtml(data.plan.tone)} | Events: ${data.plan.key_events.join(', ')}</em></p>`);
-            break;
-
-        case 'scenes_planned':
-            totalScenes = data.count;
-            renderSceneProgress();
-            break;
-
-        case 'scene_start':
-            updateStats({ status: `Writing scene ${data.scene}/${data.total}` });
-            if (manualSessionActive && manualIsGeneratingScene) {
-                const statusEl = document.getElementById('manualSceneStatus');
-                if (statusEl && !statusEl.classList.contains('hidden')) {
-                    statusEl.textContent = '✍️ Writing scene...';
-                }
-            }
-            break;
-
-        case 'token':
-            if (manualSessionActive && manualIsGeneratingScene) {
-                // Stream tokens into the manual stream area
-                const streamOut = document.getElementById('manualStreamOutput');
-                if (streamOut && data.content) {
-                    streamOut.appendChild(document.createTextNode(data.content));
-                    const streamArea = document.getElementById('manualStreamArea');
-                    if (streamArea) {
-                        const scrollParent = streamArea.querySelector('.card') || streamArea;
-                        scrollParent.scrollTop = scrollParent.scrollHeight;
-                    }
-                }
-            } else {
-                appendToken(data.scene || 'current', data.content || '');
-            }
-            if (data.provider) {
-                updateStats({
-                    provider: providerBadge(data.provider),
-                });
-            }
-            break;
-
-        case 'scene_written':
-            totalWords += data.words;
-            updateStats({
-                words: totalWords,
-                provider: providerBadge(data.provider),
-            });
-            break;
-
-        case 'scene_complete':
-            scenesComplete++;
-            updateStats({ scenes: `${scenesComplete}/${totalScenes}` });
-            updateSceneDot(scenesComplete - 1, 'done');
-            if (scenesComplete < totalScenes) updateSceneDot(scenesComplete, 'active');
-            // Show scene text progressively
-            if (data.text && !streamSceneNodes.has(data.scene)) {
-                if (scenesComplete > 1) {
-                    appendOutput('<hr style="border:none;border-top:1px solid var(--border);margin:24px 0">');
-                }
-                appendOutput(`<p>${escHtml(data.text).replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br>')}</p>`);
-            }
-            loadChapters(); // Update word count/status in reader list
-            break;
-
-        case 'chapter_complete':
-            completedChapters += 1;
-            const planDisplay = plannedChapters < 0 ? 'Entire Story' : plannedChapters;
-            showToast(
-                `Chapter ${data.chapter_number} complete! ${completedChapters}/${planDisplay}`,
-                'success',
-            );
-            updateStats({ status: `Completed chapter ${completedChapters}/${planDisplay}` });
-            loadChapters(); // Update status from 'writing' to 'completed'
-            break;
-
-        case 'log':
-            addLogEntry(data);
-            break;
-
-        case 'trace':
-            addLogEntry({
-                timestamp: new Date().toLocaleTimeString(),
-                level: 'debug',
-                message: `Trace ${data.agent} (${Math.round(data.latency_ms || 0)}ms)`,
-                details: { step: data.step, next_action: data.next_action },
-            });
-            break;
-
-        case 'status':
-            updateStats({ status: data });
-            // Mirror live status into manual scene status label during generation
-            if (manualSessionActive && manualIsGeneratingScene) {
-                const statusEl = document.getElementById('manualSceneStatus');
-                if (statusEl && !statusEl.classList.contains('hidden')) {
-                    statusEl.textContent = typeof data === 'string' ? data : JSON.stringify(data);
-                }
-            }
-            break;
-
-        case 'error':
-            showToast(data.error || 'Generation failed', 'error');
-            addLogEntry({ timestamp: new Date().toLocaleTimeString(), level: 'error', message: data.error || 'Generation failed' });
-            stopGeneration();
-            break;
-
-        case 'manual_scene_done':
-            onManualSceneDone(data);
-            break;
-
-        case 'done':
-            if (data.status === 'cancelled') {
-                showToast('Generation stopped.', 'info');
-            }
-            if (manualSessionActive) {
-                resetManualSession();
-                if (data.status !== 'cancelled') {
-                    showToast('Chapter finalized successfully!', 'success');
-                }
-            }
-            stopGeneration();
-            break;
-
-        case 'heartbeat':
-            break;
-    }
-}
-
-async function loadChapterContent(num) {
-    try {
-        const res = await fetch(`/api/project/${currentProject}/chapter/${num}`);
-        const data = await res.json();
-        if (data.content) {
-            const html = markdownToHtml(data.content);
-            document.getElementById('genOutput').innerHTML = html;
-        }
-    } catch (e) { /* ignore */ }
-}
-
-async function cancelGeneration() {
-    if (!currentProject) return;
-    try {
-        await fetch(`/api/project/${currentProject}/generate/cancel`, { method: 'POST' });
-        showToast('Cancellation requested', 'info');
-    } catch (e) { /* ignore */ }
-    stopGeneration();
-}
-
-function stopGeneration() {
-    isGenerating = false;
-    document.getElementById('btnGenerate').classList.remove('hidden');
-    document.getElementById('btnCancel').classList.add('hidden');
-    setStatus('online', 'Ready');
-    // Only close SSE if not in manual session (manual session manages its own SSE)
-    if (!manualSessionActive && eventSource) { eventSource.close(); eventSource = null; }
-}
-
-// ─── Pipeline Stages ─────────────────────────────────────────────
-const agentToStage = {
-    'Retriever': 'retriever',
-    'Story Architect': 'architect',
-    'Scene Planner': 'planner',
-    'Scene Writer': 'writer',
-    'Consistency Engine': 'consistency',
-    'Editor': 'editor',
-};
-
-function resetPipelineStages() {
-    document.querySelectorAll('.pipeline-stage').forEach(s => {
-        s.className = 'pipeline-stage idle';
-    });
-    document.getElementById('sceneProgress').innerHTML = '';
-}
-
-function updatePipelineStage(agentName) {
-    const stageKey = agentToStage[agentName];
-    if (!stageKey) return;
-
-    // Mark previous active as done
-    document.querySelectorAll('.pipeline-stage.active').forEach(s => {
-        s.classList.remove('active');
-        s.classList.add('done');
-    });
-
-    const stage = document.querySelector(`[data-stage="${stageKey}"]`);
-    if (stage) {
-        stage.classList.remove('idle');
-        stage.classList.add('active');
-    }
-}
-
-function renderSceneProgress() {
-    const container = document.getElementById('sceneProgress');
-    container.innerHTML = Array.from({ length: totalScenes }, (_, i) =>
-        `<div class="scene-dot${i === 0 ? ' active' : ''}" data-scene="${i}"></div>`
-    ).join('');
-}
-
-function updateSceneDot(index, state) {
-    const dot = document.querySelector(`.scene-dot[data-scene="${index}"]`);
-    if (dot) {
-        dot.className = `scene-dot ${state}`;
-    }
-}
-
-// ─── Chapter Reader ──────────────────────────────────────────────
-async function loadChapters() {
-    if (!currentProject) return;
-    try {
-        const res = await fetch(`/api/project/${currentProject}/chapters`);
-        const data = await res.json();
-        renderChapterList(data.chapters);
-    } catch (e) {
-        showToast('Failed to load chapters', 'error');
-    }
-}
-
-function renderChapterList(chapters) {
-    const list = document.getElementById('chapterList');
-    if (!chapters.length) {
-        list.innerHTML = '<p class="text-dim text-sm">No chapters yet.</p>';
-        return;
-    }
-    list.innerHTML = chapters.map(ch => {
-        const isWriting = ch.status === 'writing';
-        const statusBadge = isWriting ? `<span class="badge badge-working" style="font-size:0.7rem;margin-left:8px">Writing...</span>` : '';
-        const progressInfo = isWriting ? `<div class="text-xs text-dim">${ch.scenes_completed}/${ch.scenes_total} scenes</div>` : '';
-        
         return `
-            <div class="chapter-item ${isWriting ? 'wip' : ''}" onclick="readChapter(${ch.number}, this)">
-                <div class="flex flex-col">
-                    <div class="flex items-center">
-                        <span class="ch-num">Chapter ${ch.number}</span>
-                        ${statusBadge}
-                    </div>
-                    ${progressInfo}
+            <div class="project-card ${isCurrent ? 'active-story' : ''}">
+                <div class="project-card-header">
+                    <span class="project-genre-badge">${escHtml(genre)}</span>
+                    <span class="text-xs text-dim">${p.created_at ? new Date(p.created_at).toLocaleDateString() : 'Active'}</span>
                 </div>
-                <div class="flex gap-2 items-center">
-                    <div class="ch-words">${ch.words} words</div>
-                    ${!isWriting ? `
-                        <button class="btn btn-sm btn-primary" onclick="event.stopPropagation();resumeChapter(${ch.number})" title="Edit this chapter (warning: deletes later chapters)">✎ Edit</button>
-                        <button class="btn btn-sm btn-danger" onclick="event.stopPropagation();deleteChaptersFrom(${ch.number})" title="Delete this chapter and all later chapters">Delete+</button>
-                    ` : ''}
+
+                <div class="project-card-title">${escHtml(title)}</div>
+                <div class="project-card-premise">${escHtml(premise)}</div>
+
+                <div class="project-meta-row">
+                    <div class="project-meta-item"><span>📑</span> <strong>${chaptersCount}</strong> Ch</div>
+                    <div class="project-meta-item"><span>✍️</span> <strong>${wordsCount}</strong> Words</div>
+                    ${charNames.length ? `<div class="project-meta-item"><span>👥</span> ${escHtml(charNames.join(', '))}${p.characters.length > 4 ? '...' : ''}</div>` : ''}
+                </div>
+
+                <div class="project-card-actions">
+                    <button class="btn btn-primary btn-sm" onclick="selectProject('${escHtml(p.name)}', 'generate')">⚡ Generate</button>
+                    <button class="btn btn-secondary btn-sm" onclick="selectProject('${escHtml(p.name)}', 'manual')">🧩 Manual</button>
+                    <button class="btn btn-secondary btn-sm" onclick="selectProject('${escHtml(p.name)}', 'reader')">📖 Read</button>
+                    <button class="btn btn-secondary btn-sm" onclick="selectProject('${escHtml(p.name)}', 'premise')">🎬 Premise</button>
+                    <button class="btn btn-secondary btn-sm" onclick="selectProject('${escHtml(p.name)}', 'edit')">✏️ Edit</button>
                 </div>
             </div>
         `;
     }).join('');
 }
 
-let readerCurrentChapter = null;
-let readerRawContent = '';
-let readerEditMode = false;
-
-async function readChapter(num, el = null) {
-    // Highlight active
-    document.querySelectorAll('.chapter-item').forEach(i => i.classList.remove('active'));
-    if (el) el.classList.add('active');
-
-    // Cancel edit mode if active
-    if (readerEditMode) cancelReaderEdit();
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/chapter/${num}`);
-        const data = await res.json();
-        if (data.content) {
-            readerCurrentChapter = num;
-            readerRawContent = data.content;
-            document.getElementById('readerContent').innerHTML = markdownToHtml(data.content);
-
-            // Show card header with chapter info
-            const header = document.getElementById('readerCardHeader');
-            header.style.display = '';
-            document.getElementById('readerChapterTitle').innerHTML = `<span class="icon">📖</span> Chapter ${num}`;
-            document.getElementById('btnReaderEdit').classList.remove('hidden');
-        }
-    } catch (e) {
-        showToast('Failed to load chapter', 'error');
-    }
-}
-
-function toggleReaderEdit() {
-    if (readerCurrentChapter === null) {
-        showToast('Open a chapter first', 'error');
-        return;
-    }
-    readerEditMode = true;
-
-    // Hide rendered content, show editor textarea
-    document.getElementById('readerContent').classList.add('hidden');
-    const editor = document.getElementById('readerEditor');
-    editor.classList.remove('hidden');
-    editor.value = readerRawContent;
-    editor.focus();
-
-    // Toggle buttons
-    document.getElementById('btnReaderEdit').classList.add('hidden');
-    document.getElementById('btnReaderSave').classList.remove('hidden');
-    document.getElementById('btnReaderCancel').classList.remove('hidden');
-}
-
-function cancelReaderEdit() {
-    readerEditMode = false;
-    document.getElementById('readerContent').classList.remove('hidden');
-    document.getElementById('readerEditor').classList.add('hidden');
-    document.getElementById('btnReaderEdit').classList.remove('hidden');
-    document.getElementById('btnReaderSave').classList.add('hidden');
-    document.getElementById('btnReaderCancel').classList.add('hidden');
-}
-
-async function saveReaderEdit() {
-    if (readerCurrentChapter === null) return;
-
-    const editor = document.getElementById('readerEditor');
-    const content = editor.value.trim();
-    if (!content) {
-        showToast('Chapter content cannot be empty', 'error');
-        return;
-    }
-
-    const btn = document.getElementById('btnReaderSave');
-    btn.disabled = true;
-    btn.textContent = '⏳ Saving...';
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/chapter/${readerCurrentChapter}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ content }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-            throw new Error(data.error || 'Failed to save chapter');
-        }
-
-        // Update stored raw content and re-render
-        readerRawContent = content;
-        document.getElementById('readerContent').innerHTML = markdownToHtml(content);
-        cancelReaderEdit();
-        loadChapters(); // Refresh word counts in sidebar
-        showToast(`Chapter ${readerCurrentChapter} saved (${data.words} words)`, 'success');
-    } catch (e) {
-        showToast(e.message, 'error');
-    } finally {
-        btn.disabled = false;
-        btn.textContent = '💾 Save';
-    }
-}
-
-async function resumeChapter(num) {
-    if (!confirm(`Are you sure you want to edit Chapter ${num}? WARNING: This will permanently DELETE all chapters after Chapter ${num}.`)) {
-        return;
-    }
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/chapter/${num}/resume`, {
-            method: 'POST'
-        });
-        const data = await res.json();
-        
-        if (!res.ok || data.error) {
-            throw new Error(data.error || 'Failed to resume chapter');
-        }
-
-        // Switch to manual tab
-        switchView('manual');
-        
-        // Restore manual session state
-        manualSessionActive = true;
-        manualScenesCompleted = data.scenes_completed || data.completed_scenes.length;
-        
-        document.getElementById('manualStartCard').classList.add('hidden');
-        document.getElementById('manualSceneCard').classList.remove('hidden');
-        document.getElementById('manualSessionTitle').innerHTML = `<span class="icon">✍️</span> Editing Chapter ${num}: ${escHtml(data.chapter_title)}`;
-        document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
-        
-        // Render completed scenes
-        if (data.completed_scenes) {
-            renderManualScenes(data.completed_scenes);
-        }
-        
-        document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — Describe what should happen next`;
-        document.getElementById('manualSceneBrief').value = '';
-        
-        document.getElementById('btnManualFinish').classList.remove('hidden');
-        document.getElementById('btnManualScene').disabled = false;
-        document.getElementById('btnManualScene').textContent = '▶ Generate Scene';
-        
-        showToast(`Resumed Chapter ${num}`, 'success');
-        
-        // Reconnect SSE
-        if (eventSource) {
-            eventSource.close();
-            eventSource = null;
-        }
-        eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
-        eventSource.onmessage = handleSSE;
-        eventSource.onerror = () => {
-            if (eventSource) { eventSource.close(); eventSource = null; }
-        };
-        
-        loadProjects(); // refresh stats
-        loadChapters(); // refresh chapter list
-    } catch (e) {
-        showToast(e.message, 'error');
-    }
-}
-
-async function deleteChaptersFromUi() {
-    const input = document.getElementById('deleteFromChapter');
-    const from = parseInt(input?.value, 10);
-    if (!from || from < 1) {
-        showToast('Enter a valid chapter number (>= 1)', 'error');
-        return;
-    }
-    await deleteChaptersFrom(from);
-}
-
-async function deleteChaptersFrom(fromChapter) {
-    if (!currentProject) {
-        showToast('Select a project first', 'error');
-        return;
-    }
-    if (!confirm(`Delete chapter ${fromChapter} and all later chapters?\n\nThis will also rewind state, WIP, and vector memory.`)) {
-        return;
-    }
-
-    const button = document.getElementById('btnDeleteChapters');
-    if (button) {
-        button.disabled = true;
-        button.textContent = '⏳ Deleting...';
-    }
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/chapters/delete`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ from_chapter: fromChapter }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) {
-            showToast(data.error || 'Delete failed', 'error');
-            return;
-        }
-
-        if (Array.isArray(data.deleted_chapters) && data.deleted_chapters.length) {
-            showToast(`Deleted chapters: ${data.deleted_chapters.join(', ')}`, 'success');
-        } else {
-            showToast(`No chapters found from ${fromChapter}`, 'info');
-        }
-        document.getElementById('readerContent').innerHTML = `<div class="empty-state">
-            <span class="icon">📖</span>
-            <h3>Select a chapter</h3>
-            <p>Choose a chapter from the sidebar to read.</p>
-        </div>`;
-        await reloadCurrentProjectInfo();
-        await loadChapters();
-        await refreshState();
-    } catch (e) {
-        showToast('Failed to delete chapters', 'error');
-    } finally {
-        if (button) {
-            button.disabled = false;
-            button.textContent = '🗑️ Delete from';
-        }
-    }
-}
-
-async function reloadCurrentProjectInfo() {
-    if (!currentProject) return;
-    try {
-        const res = await fetch(`/api/project/${currentProject}`);
-        const data = await res.json();
-        if (data?.info?.title) {
-            document.getElementById('genTitle').innerHTML =
-                `<span class="icon">✍️</span> ${escHtml(data.info.title)}`;
-        }
-        document.getElementById('activeProject').textContent = currentProject;
-    } catch (e) {
-        // no-op; caller handles user feedback
-    }
-}
-
-// ─── State Inspector ─────────────────────────────────────────────
-async function refreshState() {
-    if (!currentProject) return;
-    try {
-        const res = await fetch(`/api/project/${currentProject}/state`);
-        const data = await res.json();
-        document.getElementById('stateJson').innerHTML = syntaxHighlightJson(
-            JSON.stringify(data.state, null, 2)
-        );
-    } catch (e) {
-        showToast('Failed to load state', 'error');
-    }
-}
-
-// ─── Utilities ───────────────────────────────────────────────────
-function appendOutput(html) {
-    const output = document.getElementById('genOutput');
-    output.innerHTML += html;
-    output.scrollTop = output.scrollHeight;
-}
-
-function appendToken(scene, text) {
-    if (!text) return;
-    const output = document.getElementById('genOutput');
-    let node = streamSceneNodes.get(scene);
-    if (!node) {
-        if (streamSceneNodes.size > 0 || output.textContent.trim()) {
-            output.insertAdjacentHTML('beforeend', '<hr style="border:none;border-top:1px solid var(--border);margin:24px 0">');
-        }
-        const wrapper = document.createElement('div');
-        wrapper.className = 'stream-scene';
-        const paragraph = document.createElement('p');
-        paragraph.style.whiteSpace = 'pre-wrap';
-        wrapper.appendChild(paragraph);
-        output.appendChild(wrapper);
-        node = paragraph;
-        streamSceneNodes.set(scene, node);
-    }
-    node.appendChild(document.createTextNode(text));
-    output.scrollTop = output.scrollHeight;
-}
-
-function updateStats(updates) {
-    if (updates.words !== undefined) document.getElementById('statWords').textContent = updates.words;
-    if (updates.scenes !== undefined) document.getElementById('statScenes').textContent = updates.scenes;
-    if (updates.provider !== undefined) document.getElementById('statProvider').textContent = updates.provider;
-    if (updates.status !== undefined) document.getElementById('statStatus').textContent = updates.status;
-}
-
-function setStatus(state, text) {
-    const dot = document.getElementById('statusDot');
-    dot.className = 'status-dot' + (state === 'offline' ? ' offline' : state === 'working' ? ' working' : '');
-    document.getElementById('statusText').textContent = text;
-}
-
-function showToast(message, type = 'info') {
-    const container = document.getElementById('toastContainer');
-    const toast = document.createElement('div');
-    toast.className = `toast ${type}`;
-    toast.textContent = message;
-    container.appendChild(toast);
-    setTimeout(() => {
-        toast.style.animation = 'toastOut 300ms ease forwards';
-        setTimeout(() => toast.remove(), 300);
-    }, 4000);
-}
-
-function escHtml(str) {
-    const div = document.createElement('div');
-    div.textContent = str || '';
-    return div.innerHTML;
-}
-
-function markdownToHtml(md) {
-    if (!md) return '';
-    
-    // Normalize newlines
-    const lines = String(md).replace(/\r\n/g, '\n').split('\n');
-    let html = [];
-    let inList = false;
-    let listType = null; // 'ul' or 'ol'
-    let currentParagraph = [];
-
-    function closeList() {
-        if (inList) {
-            html.push(`</${listType}>`);
-            inList = false;
-            listType = null;
-        }
-    }
-
-    function closeParagraph() {
-        if (currentParagraph.length > 0) {
-            html.push(`<p>${inlineMarkdown(currentParagraph.join('<br>'))}</p>`);
-            currentParagraph = [];
-        }
-    }
-
-    for (let i = 0; i < lines.length; i++) {
-        const line = lines[i];
-        const trimmed = line.trim();
-
-        // Handle empty line (paragraph/list break)
-        if (!trimmed) {
-            closeList();
-            closeParagraph();
-            continue;
-        }
-
-        // Handle scene separator / horizontal rule
-        if (trimmed === '* * *' || trimmed === '---' || trimmed === '***') {
-            closeList();
-            closeParagraph();
-            html.push('<hr style="border:none;border-top:1px solid var(--border);margin:24px 0">');
-            continue;
-        }
-
-        // Handle headings
-        const hHeading = trimmed.match(/^(#{1,6})\s+(.+)$/);
-        if (hHeading) {
-            closeList();
-            closeParagraph();
-            const level = hHeading[1].length;
-            html.push(`<h${level}>${inlineMarkdown(hHeading[2])}</h${level}>`);
-            continue;
-        }
-
-        // Handle bullet lists (lines starting with -, *, or + followed by space)
-        const bulletMatch = line.match(/^(\s*)([-*+])\s+(.+)$/);
-        if (bulletMatch) {
-            closeParagraph();
-            if (!inList || listType !== 'ul') {
-                closeList();
-                html.push('<ul class="markdown-list">');
-                inList = true;
-                listType = 'ul';
-            }
-            html.push(`<li>${inlineMarkdown(bulletMatch[3])}</li>`);
-            continue;
-        }
-
-        // Handle numbered lists (lines starting with digits followed by dot and space)
-        const numberMatch = line.match(/^(\s*)(\d+)\.\s+(.+)$/);
-        if (numberMatch) {
-            closeParagraph();
-            if (!inList || listType !== 'ol') {
-                closeList();
-                html.push('<ol class="markdown-list">');
-                inList = true;
-                listType = 'ol';
-            }
-            html.push(`<li>${inlineMarkdown(numberMatch[3])}</li>`);
-            continue;
-        }
-
-        // It's a standard text line, append to paragraph
-        closeList();
-        currentParagraph.push(trimmed);
-    }
-
-    closeList();
-    closeParagraph();
-
-    return html.join('\n');
-}
-
-function inlineMarkdown(text) {
-    return escHtml(text)
-        .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-        .replace(/\*(.+?)\*/g, '<em>$1</em>');
-}
-
-function syntaxHighlightJson(json) {
-    return json
-        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-        .replace(/"([^"]+)"(?=\s*:)/g, '<span class="json-key">"$1"</span>')
-        .replace(/:\s*"([^"]*?)"/g, ': <span class="json-string">"$1"</span>')
-        .replace(/:\s*(\d+\.?\d*)/g, ': <span class="json-number">$1</span>')
-        .replace(/:\s*(true|false)/g, ': <span class="json-boolean">$1</span>')
-        .replace(/:\s*(null)/g, ': <span class="json-null">$1</span>');
-}
-
-// ─── Live Logs ───────────────────────────────────────────────────
-function addLogEntry(entry) {
-    const terminal = document.getElementById('logTerminal');
-    if (!terminal) return;
-
-    const level = entry.level || 'info';
-    const badgeMap = {
-        info: 'INFO', success: 'OK', warn: 'WARN',
-        error: 'ERR', header: '>>>',
-    };
-
-    let html = `<div class="log-entry log-${level}">`;
-    html += `<span class="log-time">${escHtml(entry.timestamp || '--:--:--.---')}</span>`;
-    html += `<span class="log-badge log-badge-${level}">${badgeMap[level] || 'LOG'}</span>`;
-    html += `<span class="log-msg">${escHtml(entry.message)}`;
-
-    // Render details inline
-    if (entry.details && typeof entry.details === 'object') {
-        html += `<div class="log-details">`;
-        for (const [key, val] of Object.entries(entry.details)) {
-            const display = Array.isArray(val) ? val.join(', ') :
-                           (typeof val === 'object' ? JSON.stringify(val) : val);
-            html += `<span><span class="detail-key">${escHtml(key)}</span>=<span class="detail-val">${escHtml(String(display))}</span></span>`;
-        }
-        html += `</div>`;
-    }
-
-    html += `</span></div>`;
-    terminal.insertAdjacentHTML('beforeend', html);
-
-    // Auto-scroll
-    const autoScroll = document.getElementById('logAutoScroll');
-    if (autoScroll && autoScroll.checked) {
-        terminal.scrollTop = terminal.scrollHeight;
-    }
-}
-
-function clearLogs() {
-    const terminal = document.getElementById('logTerminal');
-    if (terminal) {
-        terminal.innerHTML = `<div class="log-entry log-info">
-            <span class="log-time">--:--:--.---</span>
-            <span class="log-badge log-badge-info">SYS</span>
-            <span class="log-msg">Logs cleared. Waiting for generation...</span>
-        </div>`;
-    }
-}
-
-// ─── Project Management ──────────────────────────────────────────
-async function deleteProject(name, title) {
-    if (!confirm(`Delete "${title || name}"? This cannot be undone.`)) return;
-
-    try {
-        const res = await fetch(`/api/project/${name}/delete`, { method: 'POST' });
-        const data = await res.json();
-        if (data.status === 'ok') {
-            showToast(`"${title || name}" deleted`, 'success');
-            if (currentProject === name) {
-                currentProject = null;
-                document.getElementById('activeProject').textContent = 'No project selected';
-            }
-            loadProjects();
-        } else {
-            showToast(data.error || 'Delete failed', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to delete project', 'error');
-    }
-}
-
-async function resetProject(name, title) {
-    if (!confirm(`Reset "${title || name}"?\n\nThis will delete all generated chapters, scenes, and story memory.\nYour premise, characters, and settings will be kept.`)) return;
-
-    try {
-        const res = await fetch(`/api/project/${name}/reset`, { method: 'POST' });
-        const data = await res.json();
-        if (data.status === 'ok') {
-            showToast(`"${title || name}" reset — ready to regenerate`, 'success');
-            loadProjects();
-        } else {
-            showToast(data.error || 'Reset failed', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to reset project', 'error');
-    }
-}
-
-function exportStory(name) {
-    window.open(`/api/project/${name}/export`, '_blank');
-    showToast('Exporting story...', 'info');
-}
-
-// ─── EPUB / Multi-format Export (Phase C) ───────────────────────────
-async function exportEpub(name) {
-    await exportStoryFormat(name, 'epub');
-}
-
-async function exportStoryFormat(name, fmt) {
+async function selectProject(name, targetView = 'generate') {
     if (!name) return;
-    showToast(`Exporting ${fmt.toUpperCase()}...`, 'info');
+    currentProject = name;
+
+    // Show Project Pill in Header
+    const pill = document.getElementById('headerProjectPill');
+    const nameEl = document.getElementById('headerProjectName');
+    const statsEl = document.getElementById('headerProjectStats');
+
+    if (pill) pill.classList.remove('hidden');
+    if (nameEl) nameEl.textContent = name;
+
+    // Reveal story tabs
+    ['tabPremise', 'tabGenerate', 'tabManual', 'tabReader', 'tabCombine', 'tabState', 'tabLogs', 'tabEdit'].forEach(id => {
+        document.getElementById(id)?.classList.remove('hidden');
+    });
+
+    document.getElementById('activeProject').textContent = `Story: ${name}`;
+
     try {
-        const res = await fetch(`/api/project/${name}/export-story`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ format: fmt }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error || data.status === 'error') {
-            throw new Error(data.error || 'Export failed');
+        const res = await fetch(`/api/project/${name}`);
+        if (res.ok) {
+            const data = await res.json();
+            const chs = data.state?.chapters || [];
+            if (statsEl) statsEl.textContent = `${chs.length} Ch`;
         }
-        // Response: {status, format, files: {epub: "/path/to/file.epub"}}
-        const files = data.files || {};
-        const path = files[fmt] || files.markdown || files.txt || files.epub;
-        if (!path || typeof path !== 'string') throw new Error('No output file returned');
-        const file = path.split('/').pop();
-        window.open(`/api/project/${name}/export/download?file=${encodeURIComponent(file)}`, '_blank');
-        showToast(`${fmt.toUpperCase()} exported`, 'success');
-    } catch (e) {
-        showToast(e.message, 'error');
-    }
+    } catch (e) {}
+
+    showToast(`Loaded story: ${name}`, 'info', 2200);
+    switchView(targetView);
 }
 
-// ─── Branch Options (Phase C) ───────────────────────────────────────
-let branchOptions = [];
+// ─── Character Builder (Create & Edit) ────────────────────────────
+function renderCharacterList() {
+    const list = document.getElementById('characterList');
+    if (!list) return;
 
-async function loadBranchOptions() {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    const card = document.getElementById('branchOptionsCard');
-    const list = document.getElementById('branchOptionsList');
-    const btn = document.getElementById('btnBranchRefresh');
-    card.classList.remove('hidden');
-    const hint = document.getElementById('branchDirectionHint')?.value.trim() || '';
-    list.innerHTML = '<div class="text-dim text-sm">Asking the story architect for directions…</div>';
-    if (btn) { btn.disabled = true; btn.textContent = '⏳…'; }
-    try {
-        const res = await fetch(`/api/project/${currentProject}/branch-options`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ count: 3, direction_hint: hint }),
-        });
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to get branch options');
-        branchOptions = data.options || [];
-        renderBranchOptions();
-    } catch (e) {
-        list.innerHTML = `<div class="text-dim text-sm" style="color:var(--danger)">⚠️ ${escHtml(e.message)}</div>`;
-    } finally {
-        if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh'; }
-    }
-}
-
-function renderBranchOptions() {
-    const list = document.getElementById('branchOptionsList');
-    if (!branchOptions.length) {
-        list.innerHTML = '<div class="text-dim text-sm">No options returned.</div>';
+    if (characters.length === 0) {
+        list.innerHTML = '<span class="text-dim text-xs">No characters added yet. Use the fields below to add protagonists, antagonists, and allies.</span>';
         return;
     }
-    list.innerHTML = branchOptions.map((o, i) => `
-        <div style="border:1px solid var(--border);border-radius:8px;padding:12px;margin-bottom:10px;background:var(--surface-2)">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px">
-                <div style="font-weight:600;color:var(--accent-primary)">${escHtml(o.title)}</div>
-                <div style="display:flex;gap:4px;flex-shrink:0">
-                    <button class="btn btn-sm" style="font-size:0.8rem;padding:3px 8px" onclick="copyBranchOption(${i})" title="Copy premise to clipboard">📋 Copy</button>
-                    <button class="btn btn-sm" style="font-size:0.8rem;padding:3px 8px;background:var(--accent-secondary);color:#fff" onclick="useBranchOption(${i})" title="Use as scene brief in Manual Mode">✍️ Use</button>
-                </div>
+
+    list.innerHTML = characters.map((c, idx) => `
+        <div class="character-builder-item">
+            <div class="char-info-col">
+                <span class="char-info-name">${escHtml(c.name)}</span>
+                <span class="char-info-desc">${escHtml(c.description || '')} • <em>${escHtml(c.traits?.join(', ') || '')}</em></span>
             </div>
-            <div style="margin-top:6px;line-height:1.5">${escHtml(o.premise)}</div>
-            ${o.new_threads ? `<div class="text-dim text-sm" style="margin-top:6px"><strong>Opens:</strong> ${escHtml(o.new_threads)}</div>` : ''}
-            ${o.risk ? `<div class="text-dim text-sm" style="margin-top:2px"><strong>Risk:</strong> ${escHtml(o.risk)}</div>` : ''}
+            <button class="btn btn-sm btn-danger btn-icon" onclick="removeCharacter(${idx})" style="width:28px;height:28px;font-size:11px;">✕</button>
         </div>
     `).join('');
 }
 
-function copyBranchOption(i) {
-    const o = branchOptions[i];
-    if (!o) return;
-    const text = `${o.title}\n\n${o.premise}`;
-    if (navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(text).then(
-            () => showToast('Branch premise copied', 'success'),
-            () => showToast('Copy failed — select manually', 'error'),
-        );
-    } else {
-        showToast('Clipboard unavailable in this browser', 'error');
+function addCharacter() {
+    const nameInput = document.getElementById('charName');
+    const descInput = document.getElementById('charDesc');
+    const traitsInput = document.getElementById('charTraits');
+
+    const name = (nameInput?.value || '').trim();
+    if (!name) {
+        showToast('Character name is required', 'error');
+        return;
     }
+
+    const desc = (descInput?.value || '').trim();
+    const traits = (traitsInput?.value || '').split(',').map(t => t.trim()).filter(Boolean);
+
+    characters.push({ name, description: desc, traits });
+    nameInput.value = '';
+    descInput.value = '';
+    traitsInput.value = '';
+    nameInput.focus();
+
+    renderCharacterList();
 }
 
-function useBranchOption(i) {
-    const o = branchOptions[i];
-    if (!o) return;
-    switchView('manual');
-    const brief = document.getElementById('manualSceneBrief');
-    if (!brief) { showToast('Manual mode not available', 'error'); return; }
-    brief.value = o.premise + (o.new_threads ? `\n(Opens thread: ${o.new_threads})` : '');
-    brief.focus();
-    showToast(manualSessionActive
-        ? 'Branch premise loaded as next scene brief'
-        : 'Branch premise loaded — start a manual chapter to use it', 'info');
+function removeCharacter(idx) {
+    characters.splice(idx, 1);
+    renderCharacterList();
 }
 
-function hideBranchOptions() {
-    document.getElementById('branchOptionsCard').classList.add('hidden');
-}
+// ─── Create Story Action ──────────────────────────────────────────
+async function createProject() {
+    const titleInput = document.getElementById('createTitle');
+    const genreInput = document.getElementById('createGenre');
+    const premiseInput = document.getElementById('createPremise');
+    const settingInput = document.getElementById('createSetting');
+    const themesInput = document.getElementById('createThemes');
+    const btn = document.getElementById('btnCreateProject');
 
-// ─── Continuity Report (Phase C) ────────────────────────────────────
-async function loadContinuityReport() {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    const card = document.getElementById('continuityCard');
-    const body = document.getElementById('continuityReportBody');
-    const btn = document.getElementById('btnContinuityRefresh');
-    card.classList.remove('hidden');
-    body.innerHTML = '<div class="text-dim text-sm">Loading…</div>';
-    if (btn) { btn.disabled = true; btn.textContent = '⏳…'; }
-    try {
-        const res = await fetch(`/api/project/${currentProject}/continuity`);
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to load continuity report');
-        renderContinuityReport(data);
-    } catch (e) {
-        body.innerHTML = `<div class="text-dim text-sm" style="color:var(--danger)">⚠️ ${escHtml(e.message)}</div>`;
-    } finally {
-        if (btn) { btn.disabled = false; btn.textContent = '🔄 Refresh'; }
+    const title = (titleInput?.value || '').trim();
+    if (!title) {
+        showToast('Story title is required', 'error');
+        titleInput?.focus();
+        return;
     }
-}
 
-function renderContinuityReport(r) {
-    const body = document.getElementById('continuityReportBody');
-    const chips = (items, cls) => items.length
-        ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${items.map(t =>
-            `<span style="padding:2px 10px;border-radius:12px;font-size:0.8rem;${cls}">${escHtml(t)}</span>`).join('')}</div>`
-        : '<span class="text-dim text-sm">None</span>';
+    const genre = genreInput?.value || 'dark fantasy';
+    const premise = (premiseInput?.value || '').trim();
+    const setting = (settingInput?.value || '').trim();
+    const themes = (themesInput?.value || '').split(',').map(t => t.trim()).filter(Boolean);
 
-    const seeds = (r.planted_seeds || []).map(s => `Ch${s.chapter}: ${s.text}`);
-    const motifs = (r.active_motifs || []).map(m => `${m.name} ×${m.mentions}`);
-
-    const charRows = (r.characters || []).map(c => `
-        <tr>
-            <td style="padding:4px 10px"><strong>${escHtml(c.name)}</strong></td>
-            <td style="padding:4px 10px" class="text-dim">${escHtml(c.role)}</td>
-            <td style="padding:4px 10px" class="text-dim">${escHtml(c.status)}</td>
-            <td style="padding:4px 10px" class="text-dim">${escHtml(c.emotion || '—')}</td>
-            <td style="padding:4px 10px" class="text-dim">${escHtml(c.location || '—')}</td>
-        </tr>`).join('');
-
-    const warnings = (r.warnings || []).length
-        ? `<div style="margin-top:12px;padding:10px;border-left:3px solid var(--warning);background:var(--surface-2);border-radius:4px">
-             ${(r.warnings || []).map(w => `<div style="margin:2px 0">⚠️ ${escHtml(w)}</div>`).join('')}
-           </div>`
-        : '<div class="text-dim text-sm" style="margin-top:12px">✅ No continuity warnings</div>';
-
-    body.innerHTML = `
-        <div class="text-dim text-sm" style="margin-bottom:10px">
-            Phase: <strong>${escHtml(r.narrative_phase)}</strong> ·
-            Chapters written: <strong>${r.chapters_written}</strong> ·
-            Current: <strong>Ch${r.current_chapter}</strong>
-        </div>
-        <div style="margin-bottom:10px"><strong style="font-size:0.85rem">🧵 Unresolved threads</strong>
-            ${chips(r.unresolved_threads || [], 'background:var(--accent-primary);color:#fff')}</div>
-        <div style="margin-bottom:10px"><strong style="font-size:0.85rem">🌱 Planted seeds (unpaid)</strong>
-            ${chips(seeds, 'background:var(--accent-secondary);color:#fff')}</div>
-        <div style="margin-bottom:10px"><strong style="font-size:0.85rem">🔁 Active motifs</strong>
-            ${chips(motifs, 'background:var(--surface-2);border:1px solid var(--border)')}</div>
-        ${charRows ? `<div style="margin-bottom:10px;overflow-x:auto"><strong style="font-size:0.85rem">👥 Characters</strong>
-            <table style="width:100%;border-collapse:collapse;font-size:0.85rem;margin-top:4px">
-                <thead><tr class="text-dim"><th style="text-align:left;padding:4px 10px">Name</th><th style="text-align:left;padding:4px 10px">Role</th><th style="text-align:left;padding:4px 10px">Status</th><th style="text-align:left;padding:4px 10px">Emotion</th><th style="text-align:left;padding:4px 10px">Location</th></tr></thead>
-                <tbody>${charRows}</tbody>
-            </table></div>` : ''}
-        ${warnings}
-    `;
-}
-
-function hideContinuityReport() {
-    document.getElementById('continuityCard').classList.add('hidden');
-}
-
-// ─── Combine & Polish (Gemini) ───────────────────────────────────
-let combineEventSource = null;
-let isCombining = false;
-
-async function startCombine() {
-    await startCombineMode('polish', 'Combining with Gemini...', 'Starting combine pipeline...');
-}
-
-async function startWholeStory() {
-    await startCombineMode('whole', 'Generating whole story with Gemini...', 'Starting one-shot whole-story generation...');
-}
-
-async function startCombineMode(mode, statusLabel, statusText) {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    if (isCombining) { showToast('Combine already in progress', 'info'); return; }
-
-    isCombining = true;
-    const btn = mode === 'whole' ? document.getElementById('btnWholeStory') : document.getElementById('btnCombine');
-    const progress = document.getElementById('combineProgress');
-    const analysisCard = document.getElementById('combineAnalysisCard');
-    const downloadCard = document.getElementById('combineDownloadCard');
-
-    if (btn) {
-        btn.disabled = true;
-        btn.innerHTML = '<span class="gemini-icon">⏳</span> Processing...';
-    }
-    progress.classList.remove('hidden');
-    analysisCard.classList.add('hidden');
-    downloadCard.classList.add('hidden');
-    document.getElementById('combineStatusText').textContent = statusText;
-    setStatus('working', statusLabel);
-
-    try {
-        const modelSelect = document.getElementById('combineModelSelect');
-        const selectedModel = modelSelect ? modelSelect.value : null;
-
-        const res = await fetch(`/api/project/${currentProject}/combine`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model: selectedModel, mode })
-        });
-
-        if (!res.ok) {
-            const data = await res.json().catch(() => ({}));
-            throw new Error(data.error || 'Failed to start combine');
-        }
-
-        // Connect SSE
-        combineEventSource = new EventSource(`/api/project/${currentProject}/combine/stream`);
-        combineEventSource.onmessage = handleCombineSSE;
-        combineEventSource.onerror = () => {
-            stopCombine();
-            showToast('Connection lost during combine', 'error');
+    // Format characters dictionary
+    const charsDict = {};
+    characters.forEach(c => {
+        charsDict[c.name] = {
+            description: c.description,
+            traits: c.traits,
         };
-    } catch (e) {
-        stopCombine();
-        showToast(e.message, 'error');
-    }
-}
-
-function handleCombineSSE(event) {
-    const msg = JSON.parse(event.data);
-    const evt = msg.event || msg.type;
-    const data = msg.data ?? msg.payload ?? {};
-
-    switch (evt) {
-        case 'combine_status':
-            document.getElementById('combineStatusText').textContent =
-                (typeof data === 'string') ? data : (data.step || 'Processing...');
-            break;
-
-        case 'combine_done': {
-            stopCombine();
-            showToast('Story combined and polished successfully!', 'success');
-            loadCombineVersions();
-            break;
-        }
-
-        case 'combine_error':
-            stopCombine();
-            showToast(data.error || 'Combine failed', 'error');
-            break;
-
-        case 'heartbeat':
-            break;
-    }
-}
-
-function stopCombine() {
-    isCombining = false;
-    const progress = document.getElementById('combineProgress');
-    const btnCancel = document.getElementById('btnCancelCombine');
-    const btnCombine = document.getElementById('btnCombine');
-    const btnWhole = document.getElementById('btnWholeStory');
-    if (btnCombine) {
-        btnCombine.disabled = false;
-        btnCombine.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
-    }
-    if (btnWhole) {
-        btnWhole.disabled = false;
-        btnWhole.innerHTML = '<span class="gemini-icon">✨</span> Generate Whole Story (One Shot)';
-    }
-    if (btnCancel) {
-        btnCancel.disabled = false;
-        btnCancel.textContent = '🛑 Stop';
-    }
-    if (progress) progress.classList.add('hidden');
-    setStatus('online', 'Ready');
-    if (combineEventSource) { combineEventSource.close(); combineEventSource = null; }
-}
-
-async function cancelCombine() {
-    if (!currentProject) return;
-    const btnCancel = document.getElementById('btnCancelCombine');
-    if (btnCancel) {
-        btnCancel.disabled = true;
-        btnCancel.textContent = '⏳ Stopping...';
-    }
-    try {
-        const res = await fetch(`/api/project/${currentProject}/combine/cancel`, {
-            method: 'POST'
-        });
-        if (res.ok) {
-            showToast('Cancellation requested', 'info');
-        } else {
-            showToast('Failed to request cancellation', 'error');
-            if (btnCancel) {
-                btnCancel.disabled = false;
-                btnCancel.textContent = '🛑 Stop';
-            }
-        }
-    } catch (e) {
-        showToast('Error requesting cancellation', 'error');
-        if (btnCancel) {
-            btnCancel.disabled = false;
-            btnCancel.textContent = '🛑 Stop';
-        }
-    }
-}
-
-function downloadCombined(type) {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    const select = document.getElementById('combineVersionSelect');
-    const suffix = select ? select.value : 'latest';
-    window.open(`/api/project/${currentProject}/combine/download/${type}?suffix=${suffix}`, '_blank');
-    showToast(`Downloading ${type} file...`, 'info');
-}
-
-// ─── Polished Story History Management ────────────────────────────
-let combineVersionsList = [];
-
-async function loadCombineVersions(selectSuffix = null) {
-    if (!currentProject) return;
-    try {
-        const res = await fetch(`/api/project/${currentProject}/combine/versions`);
-        const data = await res.json();
-        
-        const select = document.getElementById('combineVersionSelect');
-        if (!select) return;
-        
-        combineVersionsList = data.versions || [];
-        
-        if (combineVersionsList.length === 0) {
-            select.innerHTML = '<option value="">No versions available</option>';
-            document.getElementById('combineAnalysisCard').classList.add('hidden');
-            document.getElementById('combinePolishedCard').classList.add('hidden');
-            document.getElementById('combineDownloadCard').classList.add('hidden');
-            document.getElementById('btnDeleteCombine').classList.add('hidden');
-            const btn = document.getElementById('btnCombine');
-            if (btn) btn.innerHTML = '<span class="gemini-icon">🔮</span> Combine & Polish';
-            return;
-        }
-        
-        select.innerHTML = combineVersionsList.map(v => 
-            `<option value="${v.suffix}">${escHtml(v.label)} (${(v.revised_chars/1024).toFixed(1)} KB)</option>`
-        ).join('');
-        
-        let targetSuffix = selectSuffix;
-        if (!targetSuffix || !combineVersionsList.some(v => v.suffix === targetSuffix)) {
-            targetSuffix = combineVersionsList[combineVersionsList.length - 1].suffix;
-        }
-        
-        select.value = targetSuffix;
-        fetchCombineVersion(targetSuffix);
-    } catch (e) {
-        showToast('Failed to load polished story history', 'error');
-    }
-}
-
-async function changeCombineVersion() {
-    const select = document.getElementById('combineVersionSelect');
-    if (!select || !select.value) return;
-    fetchCombineVersion(select.value);
-}
-
-async function fetchCombineVersion(suffix) {
-    if (!currentProject) return;
-    try {
-        const res = await fetch(`/api/project/${currentProject}/combine/version/${suffix}`);
-        const data = await res.json();
-        if (res.ok) {
-            populateCombineUI(data);
-        } else {
-            showToast(data.error || 'Failed to fetch version', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to fetch version details', 'error');
-    }
-}
-
-async function renameSelectedVersion() {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    const select = document.getElementById('combineVersionSelect');
-    if (!select || !select.value) { showToast('No version selected', 'error'); return; }
-    
-    const suffix = select.value;
-    const currentLabel = select.options[select.selectedIndex].text.split(' (')[0];
-    
-    const newName = prompt(`Enter a new label for this polished version:`, currentLabel);
-    if (!newName || newName.trim() === '') return;
-    
-    try {
-        const res = await fetch(`/api/project/${currentProject}/combine/rename`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ suffix: suffix, new_name: newName.trim() })
-        });
-        const data = await res.json();
-        if (res.ok && data.status === 'ok') {
-            showToast('Polished version renamed successfully!', 'success');
-            loadCombineVersions(data.new_suffix);
-        } else {
-            showToast(data.error || 'Rename failed', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to rename version', 'error');
-    }
-}
-
-async function deleteSelectedVersion() {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    const select = document.getElementById('combineVersionSelect');
-    if (!select || !select.value) { showToast('No version selected', 'error'); return; }
-    
-    const suffix = select.value;
-    if (!confirm('Are you sure you want to delete this specific polished version and its analysis? This cannot be undone.')) return;
-    
-    try {
-        const res = await fetch(`/api/project/${currentProject}/combine/delete_version`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ suffix: suffix })
-        });
-        const data = await res.json();
-        if (res.ok && data.status === 'ok') {
-            showToast('Polished version deleted.', 'success');
-            loadCombineVersions();
-        } else {
-            showToast(data.error || 'Delete failed', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to delete version', 'error');
-    }
-}
-
-function populateCombineUI(data) {
-    const analysisCard = document.getElementById('combineAnalysisCard');
-    const polishedCard = document.getElementById('combinePolishedCard');
-    const downloadCard = document.getElementById('combineDownloadCard');
-    const analysisEl = document.getElementById('combineAnalysis');
-    const polishedEl = document.getElementById('combinePolished');
-    const statsEl = document.getElementById('combineStats');
-
-    if (data.analysis) {
-        analysisEl.innerHTML = markdownToHtml(data.analysis);
-        analysisCard.classList.remove('hidden');
-    } else {
-        analysisCard.classList.add('hidden');
-    }
-
-    if (data.revised) {
-        polishedEl.innerHTML = markdownToHtml(data.revised);
-        polishedCard.classList.remove('hidden');
-    } else {
-        polishedCard.classList.add('hidden');
-    }
-
-    statsEl.innerHTML = `
-        <div class="combine-stats-grid">
-            <div class="combine-stat">
-                <span class="combine-stat-label">Original</span>
-                <span class="combine-stat-value">${(data.original_chars || 0).toLocaleString()} chars</span>
-            </div>
-            <div class="combine-stat">
-                <span class="combine-stat-label">Polished</span>
-                <span class="combine-stat-value">${(data.revised_chars || 0).toLocaleString()} chars</span>
-            </div>
-            <div class="combine-stat">
-                <span class="combine-stat-label">Model</span>
-                <span class="combine-stat-value">${escHtml(data.model || 'unknown')}</span>
-            </div>
-        </div>
-    `;
-    downloadCard.classList.remove('hidden');
-    
-    const btn = document.getElementById('btnCombine');
-    if (btn) {
-        btn.innerHTML = '<span class="gemini-icon">🔮</span> Re-Combine & Polish';
-    }
-    const btnDel = document.getElementById('btnDeleteCombine');
-    if (btnDel) {
-        btnDel.classList.remove('hidden');
-    }
-}
-
-function toggleCombineSection(elId, btnId) {
-    const el = document.getElementById(elId);
-    const btn = document.getElementById(btnId);
-    if (!el || !btn) return;
-    
-    if (el.style.display === 'none') {
-        el.style.display = '';
-        btn.textContent = '▼ Collapse';
-    } else {
-        el.style.display = 'none';
-        btn.textContent = '▶ Expand';
-    }
-}
-
-async function deleteCombineData() {
-    if (!currentProject) { showToast('Select a project first', 'error'); return; }
-    if (!confirm('Are you sure you want to delete ALL polished versions and analyses? This cannot be undone.')) return;
-
-    try {
-        const res = await fetch(`/api/project/${currentProject}/combine/delete`, { method: 'POST' });
-        const data = await res.json();
-        
-        if (res.ok && data.status === 'ok') {
-            showToast('All polished versions deleted.', 'success');
-            loadCombineVersions();
-        } else {
-            showToast(data.error || 'Failed to delete polished versions', 'error');
-        }
-    } catch (e) {
-        showToast('Failed to delete polished versions', 'error');
-    }
-}
-
-// ─── Keyboard Shortcuts ──────────────────────────────────────────
-document.addEventListener('keydown', (e) => {
-    // Enter in character inputs → add character
-    if (e.key === 'Enter' && (e.target.id === 'charName' || e.target.id === 'charDesc' || e.target.id === 'charTraits')) {
-        e.preventDefault();
-        addCharacter();
-    }
-});
-
-// ─── Settings / Model Management ─────────────────────────────────
-function settingsFieldValue(el) {
-    if (!el) return '';
-    if (el.type === 'checkbox') return el.checked;
-    return el.value;
-}
-
-function setSettingsField(key, value) {
-    const el = document.querySelector(`[data-setting="${key}"]`);
-    if (!el) return;
-    if (el.type === 'checkbox') {
-        el.checked = Boolean(value);
-    } else {
-        el.value = value ?? '';
-    }
-}
-
-function currentBackendMode() {
-    return document.querySelector('input[name="backendMode"]:checked')?.value || 'local';
-}
-
-function renderSettingsSummary(data) {
-    const summary = document.getElementById('settingsSummary');
-    if (!summary) return;
-    const settings = data.settings || {};
-    const mode = data.backend_mode || settings.BACKEND_MODE || 'local';
-    const active = data.active_model || settings.ACTIVE_MODEL || settings.LLAMA_MODEL_PATH || 'none';
-    const localCount = (data.local_models || []).length;
-    summary.innerHTML = `
-        <div class="settings-pill"><strong>Mode</strong><span>${escHtml(mode)}</span></div>
-        <div class="settings-pill"><strong>Active</strong><span>${escHtml(active)}</span></div>
-        <div class="settings-pill"><strong>Local models</strong><span>${localCount}</span></div>
-        <div class="settings-pill"><strong>.env</strong><span>${escHtml(data.env_path || '.env')}</span></div>
-    `;
-}
-
-function populateSettings(data) {
-    const settings = data.settings || {};
-    Object.entries(settings).forEach(([key, value]) => setSettingsField(key, value));
-
-    const mode = settings.BACKEND_MODE || data.backend_mode || 'local';
-    const modeInput = document.querySelector(`input[name="backendMode"][value="${mode}"]`);
-    if (modeInput) modeInput.checked = true;
-
-    const activeModel = document.getElementById('settingsActiveModel');
-    if (activeModel) {
-        const models = data.local_models || [];
-        const active = settings.ACTIVE_MODEL || data.active_model || '';
-
-        const options = [];
-        const listedValues = new Set();
-        if (models.length) {
-            options.push('<optgroup label="💻 Local GGUF models">');
-            models.forEach(model => {
-                listedValues.add(model);
-                options.push(`<option value="${escHtml(model)}" ${model === active ? 'selected' : ''}>${escHtml(model)}</option>`);
-            });
-            options.push('</optgroup>');
-        }
-        const groqModels = data.groq_models || [];
-        if (groqModels.length) {
-            options.push('<optgroup label="☁️ Groq API models">');
-            groqModels.forEach(m => {
-                const id = `groq:${m.id}`;
-                listedValues.add(id);
-                options.push(`<option value="${escHtml(id)}" ${id === active ? 'selected' : ''}>${escHtml(m.name)} (${m.id})</option>`);
-            });
-            options.push('</optgroup>');
-        }
-        options.push('<optgroup label="✨ Other cloud APIs">');
-        listedValues.add(GEMINI_MODEL_OPTION);
-        listedValues.add(OPENROUTER_MODEL_OPTION);
-        options.push(`<option value="${GEMINI_MODEL_OPTION}" ${GEMINI_MODEL_OPTION === active ? 'selected' : ''}>✨ Gemini API (${settings.GEMINI_MODEL || 'default'})</option>`);
-        options.push(`<option value="${OPENROUTER_MODEL_OPTION}" ${OPENROUTER_MODEL_OPTION === active ? 'selected' : ''}>🌐 OpenRouter API (${settings.OPENROUTER_MODEL || 'default'})</option>`);
-        options.push('</optgroup>');
-
-        // Include the active selection even if it's not in any list (e.g. custom Groq model from .env)
-        if (active && !listedValues.has(active)) {
-            const label = active.startsWith('groq:') ? `☁️ Groq — ${active.slice(5)}` : active;
-            options.unshift(`<option value="${escHtml(active)}" selected>${escHtml(label)}</option>`);
-        }
-
-        activeModel.innerHTML = options.join('');
-    }
-
-    renderSettingsSummary(data);
-}
-
-async function loadSettings() {
-    try {
-        const res = await fetch('/api/settings');
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to load settings');
-        populateSettings(data);
-    } catch (e) {
-        showToast(e.message || 'Failed to load settings', 'error');
-    }
-}
-
-async function saveSettings() {
-    const btn = document.getElementById('btnSaveSettings');
-    if (btn) {
-        btn.disabled = true;
-        btn.textContent = 'Saving...';
-    }
-
-    const settings = { BACKEND_MODE: currentBackendMode() };
-    document.querySelectorAll('[data-setting]').forEach(el => {
-        settings[el.dataset.setting] = settingsFieldValue(el);
     });
 
-    const activeModel = document.getElementById('settingsActiveModel')?.value || '';
-    if (activeModel) settings.ACTIVE_MODEL = activeModel;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = '🚀 Initializing Pipeline...';
+    }
 
     try {
-        const res = await fetch('/api/settings', {
-            method: 'PUT',
+        const res = await fetch('/api/project/create', {
+            method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ settings }),
+            body: JSON.stringify({
+                name: title,
+                title: title,
+                genre: genre,
+                premise: premise,
+                setting: setting,
+                themes: themes,
+                characters: charsDict,
+            }),
         });
+
         const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save settings');
-        populateSettings(data);
-        loadModels();  // refresh header model selector with new backend
-        showToast('Settings saved. New generations will use them.', 'success');
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to create project');
+
+        showToast(`Created story "${title}" successfully!`, 'success');
+        characters = [];
+        titleInput.value = '';
+        premiseInput.value = '';
+        settingInput.value = '';
+        themesInput.value = '';
+        renderCharacterList();
+
+        selectProject(data.project || data.name || title, 'premise');
+
     } catch (e) {
-        showToast(e.message || 'Failed to save settings', 'error');
+        showToast(e.message || 'Creation failed', 'error');
     } finally {
         if (btn) {
             btn.disabled = false;
-            btn.textContent = '💾 Save Settings';
+            btn.textContent = '🚀 Initialize Story Studio';
         }
     }
 }
 
-async function loadModels() {
-    const select = document.getElementById('modelSelect');
-    if (!select) return;
+// ─── Edit Story Details ───────────────────────────────────────────
+async function loadProjectForEdit() {
+    if (!currentProject) return;
     try {
-        const res = await fetch('/api/models');
+        const res = await fetch(`/api/project/${currentProject}`);
         const data = await res.json();
-        if (!data.models.length) {
-            select.innerHTML = '<option value="">No models available</option>';
-            return;
-        }
-        select.innerHTML = data.models.map(m =>
-            `<option value="${escHtml(m)}" ${m === data.active ? 'selected' : ''}>${escHtml(modelOptionLabel(m, data.groq_model, data.gemini_model, data.openrouter_model))}</option>`
-        ).join('');
-    } catch (e) {
-        select.innerHTML = '<option>Error loading models</option>';
-    }
-}
+        const state = data.state || {};
+        const meta = state.metadata || {};
 
-async function switchModel(model) {
-    try {
-        const res = await fetch('/api/models/switch', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({model}),
+        document.getElementById('editTitle').value = meta.title || currentProject;
+        document.getElementById('editGenre').value = meta.genre || '';
+        document.getElementById('editPremise').value = meta.premise || '';
+        document.getElementById('editSetting').value = meta.setting || '';
+        document.getElementById('editThemes').value = (meta.themes || []).join(', ');
+
+        editCharacters = [];
+        const charsObj = state.characters || {};
+        Object.keys(charsObj).forEach(k => {
+            editCharacters.push({
+                name: k,
+                description: charsObj[k].description || '',
+                traits: charsObj[k].traits || [],
+            });
         });
-        const data = await res.json();
-        if (data.status === 'ok') {
-            const active = data.active || model;
-            if (active === GROQ_MODEL_OPTION || (typeof active === 'string' && active.startsWith('groq:'))) {
-                showToast(`Switched to Groq API (${data.groq_model || 'default'})`, 'success');
-            } else if (active === GEMINI_MODEL_OPTION) {
-                showToast(`Switched to Gemini API (${data.gemini_model || 'default'})`, 'success');
-            } else if (active === OPENROUTER_MODEL_OPTION) {
-                showToast(`Switched to OpenRouter API (${data.openrouter_model || 'default'})`, 'success');
-            } else {
-                showToast(`Switched to ${active}`, 'success');
-            }
-        } else {
-            showToast(data.error || 'Switch failed', 'error');
-            loadModels();
-        }
+        renderEditCharacterList();
+
     } catch (e) {
-        showToast('Failed to switch model', 'error');
+        showToast('Failed to load story for editing', 'error');
     }
 }
 
-// ─── Polished Story Reader Toolbar ───────────────────────────────
-let readerFontSize = 17;
-const readerThemes = ['obsidian', 'parchment', 'midnight'];
-let readerThemeIndex = 0;
-let readerIsSerif = false;
-let readerIsFullscreen = false;
+function renderEditCharacterList() {
+    const list = document.getElementById('editCharacterList');
+    if (!list) return;
 
-function adjustReaderFontSize(delta) {
-    const el = readerIsFullscreen
-        ? document.getElementById('fullscreenReaderContent')
-        : document.getElementById('combinePolished');
-    if (!el) return;
-    readerFontSize = Math.max(12, Math.min(28, readerFontSize + delta));
-    el.style.fontSize = readerFontSize + 'px';
-    showToast(`Font size: ${readerFontSize}px`, 'info');
-}
-
-function toggleReaderTheme() {
-    const el = readerIsFullscreen
-        ? document.getElementById('fullscreenReaderContent')
-        : document.getElementById('combinePolished');
-    if (!el) return;
-    readerThemes.forEach(t => el.classList.remove('theme-' + t));
-    readerThemeIndex = (readerThemeIndex + 1) % readerThemes.length;
-    el.classList.add('theme-' + readerThemes[readerThemeIndex]);
-    const themeNames = { obsidian: '🌑 Obsidian', parchment: '📜 Parchment', midnight: '🌌 Midnight' };
-    showToast(`Theme: ${themeNames[readerThemes[readerThemeIndex]]}`, 'info');
-}
-
-function toggleReaderFont() {
-    const el = readerIsFullscreen
-        ? document.getElementById('fullscreenReaderContent')
-        : document.getElementById('combinePolished');
-    if (!el) return;
-    readerIsSerif = !readerIsSerif;
-    el.classList.toggle('font-serif', readerIsSerif);
-    el.classList.toggle('font-sans', !readerIsSerif);
-    showToast(readerIsSerif ? 'Font: Serif (Lora)' : 'Font: Sans-Serif (Inter)', 'info');
-}
-
-function toggleReaderFullscreen() {
-    if (readerIsFullscreen) {
-        exitReaderFullscreen();
+    if (editCharacters.length === 0) {
+        list.innerHTML = '<span class="text-dim text-xs">No characters registered.</span>';
         return;
     }
 
-    const source = document.getElementById('combinePolished');
-    if (!source) return;
-
-    // Build fullscreen overlay appended to <body> (bypasses parent backdrop-filter/transform)
-    const overlay = document.createElement('div');
-    overlay.id = 'readerFullscreenOverlay';
-    overlay.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;z-index:9999;display:flex;flex-direction:column;animation:readerFadeIn 0.3s ease;';
-
-    // Toolbar at top
-    const toolbar = document.createElement('div');
-    toolbar.style.cssText = 'display:flex;align-items:center;justify-content:flex-end;gap:6px;padding:10px 20px;background:rgba(10,10,15,0.95);border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0;backdrop-filter:blur(12px);';
-    toolbar.innerHTML = `
-        <button class="btn btn-sm" onclick="adjustReaderFontSize(-1)" style="padding:4px 10px;font-size:12px;">A-</button>
-        <button class="btn btn-sm" onclick="adjustReaderFontSize(1)" style="padding:4px 10px;font-size:12px;">A+</button>
-        <button class="btn btn-sm" onclick="toggleReaderTheme()" style="padding:4px 10px;font-size:12px;">🎨 Theme</button>
-        <button class="btn btn-sm" onclick="toggleReaderFont()" style="padding:4px 10px;font-size:12px;">🔤 Font</button>
-        <div style="flex:1"></div>
-        <span style="color:#888;font-size:12px;font-family:Inter,sans-serif;">↑↓ Scroll · Esc to exit</span>
-        <button class="btn btn-sm" onclick="exitReaderFullscreen()" style="padding:4px 14px;font-size:12px;border-color:rgba(239,68,68,0.3);color:#ef4444;">✕ Exit</button>
-    `;
-    overlay.appendChild(toolbar);
-
-    // Content area — clone the reader content
-    const content = document.createElement('div');
-    content.id = 'fullscreenReaderContent';
-    content.className = source.className; // copy all theme/font classes
-    content.innerHTML = source.innerHTML;
-    content.style.cssText = 'flex:1;overflow-y:auto;max-height:none;padding:60px 80px;font-size:' + readerFontSize + 'px;';
-    content.tabIndex = 0; // make focusable for keyboard
-    overlay.appendChild(content);
-
-    document.body.appendChild(overlay);
-    document.body.style.overflow = 'hidden'; // prevent page scroll behind overlay
-    content.focus(); // focus for keyboard scrolling
-
-    readerIsFullscreen = true;
-    document.addEventListener('keydown', readerFullscreenKeyHandler);
+    list.innerHTML = editCharacters.map((c, idx) => `
+        <div class="character-builder-item">
+            <div class="char-info-col">
+                <span class="char-info-name">${escHtml(c.name)}</span>
+                <span class="char-info-desc">${escHtml(c.description || '')} • <em>${escHtml(c.traits?.join(', ') || '')}</em></span>
+            </div>
+            <button class="btn btn-sm btn-danger btn-icon" onclick="removeEditCharacter(${idx})" style="width:28px;height:28px;font-size:11px;">✕</button>
+        </div>
+    `).join('');
 }
 
-function exitReaderFullscreen() {
-    const overlay = document.getElementById('readerFullscreenOverlay');
-    if (overlay) overlay.remove();
-    document.body.style.overflow = '';
-    readerIsFullscreen = false;
-    document.removeEventListener('keydown', readerFullscreenKeyHandler);
+function addEditCharacter() {
+    const name = (document.getElementById('editCharName')?.value || '').trim();
+    if (!name) return;
+    const desc = (document.getElementById('editCharDesc')?.value || '').trim();
+    const traits = (document.getElementById('editCharTraits')?.value || '').split(',').map(t => t.trim()).filter(Boolean);
+
+    editCharacters.push({ name, description: desc, traits });
+    document.getElementById('editCharName').value = '';
+    document.getElementById('editCharDesc').value = '';
+    document.getElementById('editCharTraits').value = '';
+    renderEditCharacterList();
 }
 
-function readerFullscreenKeyHandler(e) {
-    if (e.key === 'Escape') {
-        exitReaderFullscreen();
-        return;
-    }
-    const content = document.getElementById('fullscreenReaderContent');
-    if (!content) return;
-    const scrollAmount = 80;
-    const pageScrollAmount = content.clientHeight * 0.85;
-
-    if (e.key === 'ArrowDown') { e.preventDefault(); content.scrollBy({ top: scrollAmount, behavior: 'smooth' }); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); content.scrollBy({ top: -scrollAmount, behavior: 'smooth' }); }
-    else if (e.key === 'PageDown' || e.key === ' ') { e.preventDefault(); content.scrollBy({ top: pageScrollAmount, behavior: 'smooth' }); }
-    else if (e.key === 'PageUp') { e.preventDefault(); content.scrollBy({ top: -pageScrollAmount, behavior: 'smooth' }); }
-    else if (e.key === 'Home') { e.preventDefault(); content.scrollTo({ top: 0, behavior: 'smooth' }); }
-    else if (e.key === 'End') { e.preventDefault(); content.scrollTo({ top: content.scrollHeight, behavior: 'smooth' }); }
+function removeEditCharacter(idx) {
+    editCharacters.splice(idx, 1);
+    renderEditCharacterList();
 }
 
-// ─── Arrow Key Scrolling for Inline Reader ───────────────────────
-// When the Combine view is active and polished story is visible,
-// arrow keys scroll the story reader instead of the page.
-document.addEventListener('keydown', function(e) {
-    // Only intercept when not in fullscreen (fullscreen has its own handler)
-    if (readerIsFullscreen) return;
-    // Only when Combine view is active
-    const combineView = document.getElementById('viewCombine');
-    if (!combineView || !combineView.classList.contains('active')) return;
-    // Only when polished story is visible
-    const polished = document.getElementById('combinePolished');
-    const polishedCard = document.getElementById('combinePolishedCard');
-    if (!polished || !polishedCard || polishedCard.classList.contains('hidden')) return;
-    // Don't intercept if user is in an input/textarea
-    const tag = document.activeElement?.tagName?.toLowerCase();
-    if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+async function saveProjectEdits() {
+    if (!currentProject) return;
+    const btn = document.getElementById('btnSaveEdits');
 
-    const scrollAmount = 80;
-    const pageScrollAmount = polished.clientHeight * 0.85;
+    const title = (document.getElementById('editTitle')?.value || '').trim();
+    const genre = (document.getElementById('editGenre')?.value || '').trim();
+    const premise = (document.getElementById('editPremise')?.value || '').trim();
+    const setting = (document.getElementById('editSetting')?.value || '').trim();
+    const themes = (document.getElementById('editThemes')?.value || '').split(',').map(t => t.trim()).filter(Boolean);
 
-    if (e.key === 'ArrowDown') { e.preventDefault(); polished.scrollBy({ top: scrollAmount, behavior: 'smooth' }); }
-    else if (e.key === 'ArrowUp') { e.preventDefault(); polished.scrollBy({ top: -scrollAmount, behavior: 'smooth' }); }
-    else if (e.key === 'PageDown') { e.preventDefault(); polished.scrollBy({ top: pageScrollAmount, behavior: 'smooth' }); }
-    else if (e.key === 'PageUp') { e.preventDefault(); polished.scrollBy({ top: -pageScrollAmount, behavior: 'smooth' }); }
-});
-
-function switchToEntireStoryGeneration() {
-    // 1. Switch view to generate
-    switchView('generate');
-    
-    // 2. Set chapter count option to -1
-    const chapterCountSelect = document.getElementById('genChapterCount');
-    if (chapterCountSelect) {
-        chapterCountSelect.value = '-1';
-    }
-    
-    // 3. Set the active model to Gemini API if available
-    const modelSelect = document.getElementById('modelSelect');
-    if (modelSelect) {
-        // Try to find the __gemini_api__ option
-        const geminiOption = Array.from(modelSelect.options).find(opt => opt.value === '__gemini_api__');
-        if (geminiOption) {
-            modelSelect.value = '__gemini_api__';
-            switchModel('__gemini_api__');
-        }
-    }
-    showToast('Switched to Auto-Generation. Select "Entire Story" and click Generate!', 'info');
-}
-
-// ─── Init ────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-    loadProjects();
-    loadModels();
-    loadSettings();
-    document.getElementById('settingsActiveModel')?.addEventListener('change', (e) => {
-        const pathInput = document.getElementById('setting_LLAMA_MODEL_PATH');
-        // Only local GGUF selections update the local model path.
-        if (pathInput && e.target.value && !e.target.value.startsWith('groq:')
-            && e.target.value !== GEMINI_MODEL_OPTION && e.target.value !== OPENROUTER_MODEL_OPTION) {
-            pathInput.value = e.target.value;
-        }
+    const charsDict = {};
+    editCharacters.forEach(c => {
+        charsDict[c.name] = {
+            description: c.description,
+            traits: c.traits,
+        };
     });
-    setStatus('online', 'Ready');
-});
 
-// ─── Premise Generator View Logic ────────────────────────────────
+    if (btn) { btn.disabled = true; btn.textContent = '💾 Saving...'; }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/state`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                metadata: { title, genre, premise, setting, themes },
+                characters: charsDict,
+            }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save edits');
+
+        showToast('Saved story changes!', 'success');
+        loadProjects();
+    } catch (e) {
+        showToast(e.message || 'Save error', 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '💾 Save Story Changes'; }
+    }
+}
+
+function deleteCurrentProject() {
+    if (!currentProject) return;
+    showConfirmModal(
+        'Delete Story Project',
+        `Are you sure you want to permanently delete "${currentProject}" and all its chapters? This action cannot be undone.`,
+        async () => {
+            try {
+                const res = await fetch(`/api/project/${currentProject}/delete`, { method: 'POST' });
+                const data = await res.json();
+                if (!res.ok || data.error) throw new Error(data.error || 'Failed to delete');
+
+                showToast(`Deleted story "${currentProject}"`, 'success');
+                currentProject = null;
+                document.getElementById('headerProjectPill')?.classList.add('hidden');
+                ['tabPremise', 'tabGenerate', 'tabManual', 'tabReader', 'tabCombine', 'tabState', 'tabLogs', 'tabEdit'].forEach(id => {
+                    document.getElementById(id)?.classList.add('hidden');
+                });
+                switchView('dashboard');
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+    );
+}
+
+// ─── Premise Studio Logic ─────────────────────────────────────────
 async function loadProjectPremise() {
     if (!currentProject) return;
     try {
         const res = await fetch(`/api/project/${currentProject}`);
         const data = await res.json();
-        
-        const metadata = data.state.metadata || {};
-        document.getElementById('premiseSetting').value = metadata.setting || '';
-        document.getElementById('premiseThemes').value = (metadata.themes || []).join(', ');
-        
-        // Load characters
-        const charsObj = data.state.characters || {};
-        premiseCharacters = charsObj;
-        renderPremiseCharacters(charsObj);
+        const meta = data.state?.metadata || {};
 
-        // Load premise steps
-        const rawPremise = metadata.premise || '';
+        document.getElementById('premiseSetting').value = meta.setting || '';
+        document.getElementById('premiseThemes').value = (meta.themes || []).join(', ');
+
+        const charsObj = data.state?.characters || {};
+        premiseCharacters = charsObj;
+        renderPremiseCharactersChips(charsObj);
+
+        const rawPremise = meta.premise || '';
         premiseSteps = parsePremiseSteps(rawPremise);
         renderPremiseTimeline();
+
     } catch (e) {
-        showToast('Failed to load project premise data', 'error');
+        showToast('Failed to load story premise', 'error');
     }
 }
 
@@ -2729,469 +875,1393 @@ function parsePremiseSteps(rawText) {
     return steps;
 }
 
-function renderPremiseCharacters(charsObj) {
+function renderPremiseCharactersChips(charsObj) {
     const container = document.getElementById('premiseCharactersList');
+    if (!container) return;
     const keys = Object.keys(charsObj);
     if (keys.length === 0) {
-        container.innerHTML = '<span class="text-dim text-sm">No characters defined.</span>';
+        container.innerHTML = '<span class="text-dim text-xs">No characters defined.</span>';
         return;
     }
-    container.innerHTML = keys.map(name => {
-        const traits = (charsObj[name].traits || []).join(', ');
-        return `
-            <div style="background:rgba(255,255,255,0.03); border:1px solid var(--border); padding:6px 10px; border-radius:4px; font-size:12px; display:flex; justify-content:space-between;">
-                <span style="font-weight:600; color:var(--accent-primary);">${escHtml(name)}</span>
-                <span class="text-dim" style="max-width:200px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escHtml(traits)}</span>
-            </div>
-        `;
-    }).join('');
+    container.innerHTML = keys.map(name => `
+        <span class="char-trait-chip" style="background:rgba(139,92,246,0.15);color:#c4b5fd;border:1px solid rgba(139,92,246,0.3);">
+            <strong>${escHtml(name)}</strong>: ${escHtml((charsObj[name].traits || []).join(', '))}
+        </span>
+    `).join('');
 }
 
 function renderPremiseTimeline() {
     const container = document.getElementById('premiseTimelineContainer');
+    if (!container) return;
+
     if (premiseSteps.length === 0) {
         container.innerHTML = `
             <div class="empty-state">
                 <span class="icon">📋</span>
                 <h3>No beats defined</h3>
-                <p>Dump a rough outline on the left and click "Generate Structured beats" or add steps manually.</p>
+                <p>Enter an outline on the left and click "Generate Structured Beats" or add beats manually.</p>
             </div>
         `;
         return;
     }
 
-    container.innerHTML = premiseSteps.map((step, idx) => {
-        return `
-            <div class="premise-step-card" data-index="${idx}">
-                <span class="premise-step-badge">Step ${idx + 1}</span>
-                <textarea class="premise-step-input" rows="2" oninput="syncStepText(${idx}, this.value)" placeholder="Describe this beat...">${escHtml(step)}</textarea>
-                <div class="premise-step-actions">
-                    <button class="premise-step-btn" onclick="reorderPremiseStep(${idx}, -1)" ${idx === 0 ? 'disabled' : ''} title="Move Up">▲</button>
-                    <button class="premise-step-btn" onclick="reorderPremiseStep(${idx}, 1)" ${idx === premiseSteps.length - 1 ? 'disabled' : ''} title="Move Down">▼</button>
-                    <button class="premise-step-btn btn-delete" onclick="deletePremiseStep(${idx})" title="Delete Beat">🗑️</button>
-                </div>
+    container.innerHTML = premiseSteps.map((step, idx) => `
+        <div class="premise-beat-card">
+            <div class="beat-number-badge">${idx + 1}</div>
+            <div class="beat-content-text" contenteditable="true" onblur="updatePremiseStep(${idx}, this.innerText)">${escHtml(step)}</div>
+            <div class="beat-actions-col">
+                <button class="beat-action-btn" onclick="movePremiseStep(${idx}, -1)" title="Move Up" ${idx === 0 ? 'disabled' : ''}>▲</button>
+                <button class="beat-action-btn" onclick="movePremiseStep(${idx}, 1)" title="Move Down" ${idx === premiseSteps.length - 1 ? 'disabled' : ''}>▼</button>
+                <button class="beat-action-btn" onclick="deletePremiseStep(${idx})" title="Delete Beat" style="color:#ef4444;">✕</button>
             </div>
-        `;
-    }).join('');
-}
-
-function syncStepText(index, val) {
-    if (premiseSteps[index] !== undefined) {
-        premiseSteps[index] = val;
-    }
+        </div>
+    `).join('');
 }
 
 function addBlankPremiseStep() {
-    syncAllStepsFromUI();
-    premiseSteps.push("");
-    renderPremiseTimeline();
-    
-    setTimeout(() => {
-        const textareas = document.querySelectorAll('.premise-step-input');
-        if (textareas.length > 0) {
-            textareas[textareas.length - 1].focus();
-        }
-    }, 50);
-}
-
-function syncAllStepsFromUI() {
-    const textareas = document.querySelectorAll('.premise-step-input');
-    textareas.forEach((ta, idx) => {
-        if (premiseSteps[idx] !== undefined) {
-            premiseSteps[idx] = ta.value;
-        }
-    });
-}
-
-function reorderPremiseStep(index, direction) {
-    syncAllStepsFromUI();
-    const targetIdx = index + direction;
-    if (targetIdx < 0 || targetIdx >= premiseSteps.length) return;
-    
-    const temp = premiseSteps[index];
-    premiseSteps[index] = premiseSteps[targetIdx];
-    premiseSteps[targetIdx] = temp;
-    
+    premiseSteps.push('New plot beat description...');
     renderPremiseTimeline();
 }
 
-function deletePremiseStep(index) {
-    syncAllStepsFromUI();
-    premiseSteps.splice(index, 1);
+function deletePremiseStep(idx) {
+    premiseSteps.splice(idx, 1);
     renderPremiseTimeline();
+}
+
+function movePremiseStep(idx, dir) {
+    const target = idx + dir;
+    if (target < 0 || target >= premiseSteps.length) return;
+    const temp = premiseSteps[idx];
+    premiseSteps[idx] = premiseSteps[target];
+    premiseSteps[target] = temp;
+    renderPremiseTimeline();
+}
+
+function updatePremiseStep(idx, text) {
+    premiseSteps[idx] = text.trim();
 }
 
 async function aiGeneratePremise() {
-    const idea = document.getElementById('premiseIdeaText').value.trim();
-    if (!idea) {
-        showToast('Please enter a rough story idea or timeline dump first.', 'error');
+    if (!currentProject) return;
+    const text = (document.getElementById('premiseIdeaText')?.value || '').trim();
+    if (!text) {
+        showToast('Please enter an outline or notes in the text box first', 'error');
         return;
     }
 
     const btn = document.getElementById('btnPremiseGenerate');
-    const oldText = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '<span class="stage-spinner"></span> Generating beats...';
-
-    const selectedModel = document.getElementById('modelSelect')?.value || '';
+    if (btn) { btn.disabled = true; btn.textContent = '✨ Architecting Beats...'; }
 
     try {
         const res = await fetch(`/api/project/${currentProject}/premise/generate`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                characters: premiseCharacters,
-                setting: document.getElementById('premiseSetting').value.trim(),
-                themes: document.getElementById('premiseThemes').value.trim(),
-                idea: idea,
-                model: selectedModel
-            })
+            body: JSON.stringify({ idea_text: text }),
         });
+
         const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate premise');
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate beats');
 
         premiseSteps = data.steps || [];
         renderPremiseTimeline();
-        showToast(`Successfully generated ${premiseSteps.length} story beats!`, 'success');
+        showToast(`Generated ${premiseSteps.length} narrative timeline beats!`, 'success');
+
     } catch (e) {
-        showToast(e.message, 'error');
+        showToast(e.message || 'Generation failed', 'error');
     } finally {
-        btn.disabled = false;
-        btn.innerHTML = oldText;
+        if (btn) { btn.disabled = false; btn.textContent = '✨ Generate Structured Beats from Outline'; }
     }
 }
 
 async function aiRefinePremiseFlow() {
-    syncAllStepsFromUI();
-    if (premiseSteps.length === 0) {
-        showToast('Please add or generate some beats first.', 'error');
-        return;
-    }
-
+    if (!currentProject || premiseSteps.length === 0) return;
     const btn = document.getElementById('btnPremiseRefine');
-    const oldText = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '<span class="stage-spinner"></span> Refining pacing...';
-
-    const selectedModel = document.getElementById('modelSelect')?.value || '';
+    if (btn) { btn.disabled = true; btn.textContent = '⚖️ Refining Flow...'; }
 
     try {
         const res = await fetch(`/api/project/${currentProject}/premise/refine`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                steps: premiseSteps,
-                characters: premiseCharacters,
-                setting: document.getElementById('premiseSetting').value.trim(),
-                themes: document.getElementById('premiseThemes').value.trim(),
-                model: selectedModel
-            })
+            body: JSON.stringify({ steps: premiseSteps }),
         });
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to refine premise');
 
-        premiseSteps = data.steps || [];
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to refine');
+
+        premiseSteps = data.steps || premiseSteps;
         renderPremiseTimeline();
-        showToast(`Successfully refined story flow!`, 'success');
+        showToast('Timeline beats refined for pacing and dramatic structure!', 'success');
+
     } catch (e) {
-        showToast(e.message, 'error');
+        showToast(e.message || 'Refinement failed', 'error');
     } finally {
-        btn.disabled = false;
-        btn.innerHTML = oldText;
+        if (btn) { btn.disabled = false; btn.textContent = '⚖️ Refine Flow & Pacing'; }
     }
 }
 
 async function aiExpandPremiseBeats() {
-    syncAllStepsFromUI();
-    if (premiseSteps.length === 0) {
-        showToast('Please add or generate some beats first.', 'error');
-        return;
-    }
-
+    if (!currentProject || premiseSteps.length === 0) return;
     const btn = document.getElementById('btnPremiseExpand');
-    const oldText = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '<span class="stage-spinner"></span> Expanding scenes...';
-
-    const selectedModel = document.getElementById('modelSelect')?.value || '';
+    if (btn) { btn.disabled = true; btn.textContent = '🚀 Expanding...'; }
 
     try {
         const res = await fetch(`/api/project/${currentProject}/premise/expand`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                steps: premiseSteps,
-                characters: premiseCharacters,
-                setting: document.getElementById('premiseSetting').value.trim(),
-                themes: document.getElementById('premiseThemes').value.trim(),
-                model: selectedModel
-            })
+            body: JSON.stringify({ steps: premiseSteps }),
         });
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to expand premise');
 
-        premiseSteps = data.steps || [];
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to expand');
+
+        premiseSteps = data.steps || premiseSteps;
         renderPremiseTimeline();
-        showToast(`Successfully expanded timeline to ${premiseSteps.length} beats!`, 'success');
+        showToast(`Expanded timeline to ${premiseSteps.length} scene beats!`, 'success');
+
     } catch (e) {
-        showToast(e.message, 'error');
+        showToast(e.message || 'Expansion failed', 'error');
     } finally {
-        btn.disabled = false;
-        btn.innerHTML = oldText;
+        if (btn) { btn.disabled = false; btn.textContent = '🚀 Expand (Add Beats)'; }
     }
 }
 
 async function savePremiseToProject() {
-    syncAllStepsFromUI();
     if (!currentProject) return;
-
     const btn = document.getElementById('btnPremiseSave');
-    const oldText = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '⏳ Saving...';
+    if (btn) { btn.disabled = true; btn.textContent = '💾 Saving...'; }
 
-    const formatted = premiseSteps.map((step, idx) => `${idx + 1}. ${step}`).join('\n');
-    const themesStr = document.getElementById('premiseThemes').value.trim();
+    const formattedPremise = premiseSteps.map((s, i) => `${i + 1}. ${s}`).join('\n\n');
 
     try {
         const res = await fetch(`/api/project/${currentProject}/state`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                metadata: {
-                    premise: formatted,
-                    setting: document.getElementById('premiseSetting').value.trim(),
-                    themes: themesStr ? themesStr.split(',').map(t => t.trim()).filter(Boolean) : []
-                }
-            })
+                metadata: { premise: formattedPremise },
+            }),
         });
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save premise');
 
-        showToast('Story premise saved to project successfully!', 'success');
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save');
+
+        showToast('Saved premise timeline to Story Bible!', 'success');
+
     } catch (e) {
-        showToast(e.message, 'error');
+        showToast(e.message || 'Save failed', 'error');
     } finally {
-        btn.disabled = false;
-        btn.innerHTML = oldText;
+        if (btn) { btn.disabled = false; btn.textContent = '💾 Save Timeline to Story Bible'; }
     }
 }
 
-// ─── Vision Lab Module ────────────────────────────────────────────────
-let selectedVisionFile = null;
+// ─── Autonomous Generation Studio (Pipeline View) ─────────────────
+async function startGeneration() {
+    if (!currentProject || isGenerating) return;
 
-async function checkVisionStatus() {
-    const badge = document.getElementById('visionStatusBadge');
-    if (!badge) return;
+    const pacing = document.getElementById('genPacing')?.value || 'moderate';
+    const chapterCount = document.getElementById('genChapterCount')?.value || '1';
+
+    const btnGen = document.getElementById('btnGenerate');
+    const btnCancel = document.getElementById('btnCancel');
+    const output = document.getElementById('genOutput');
+
+    isGenerating = true;
+    if (btnGen) btnGen.classList.add('hidden');
+    if (btnCancel) btnCancel.classList.remove('hidden');
+
+    output.innerHTML = '<div class="text-dim text-sm">Initializing pipeline agents...</div>';
+    resetPipelineNodes();
+    setStatus('generating', 'Pipeline Active');
+
     try {
-        const res = await fetch('/api/vision/status');
-        const json = await res.json();
-        if (json.success) {
-            const data = json.data;
-            let statusText = `Active: ${data.active_mode}`;
-            if (data.local && data.local.available) {
-                statusText += ' | Local (Ollama) Ready';
-            } else {
-                statusText += ' | Local Offline';
+        const res = await fetch(`/api/project/${currentProject}/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                pacing: pacing,
+                chapter_count: parseInt(chapterCount, 10),
+            }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to start generation');
+
+        connectSSEStream();
+
+    } catch (e) {
+        isGenerating = false;
+        if (btnGen) btnGen.classList.remove('hidden');
+        if (btnCancel) btnCancel.classList.add('hidden');
+        setStatus('error', 'Generation Error');
+        showToast(e.message || 'Generation failed', 'error');
+    }
+}
+
+async function cancelGeneration() {
+    if (!currentProject) return;
+    try {
+        await fetch(`/api/project/${currentProject}/generate/cancel`, { method: 'POST' });
+        showToast('Cancelling generation pipeline...', 'info');
+    } catch (e) {
+        showToast('Failed to cancel', 'error');
+    }
+}
+
+function connectSSEStream() {
+    if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+    }
+
+    eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
+
+    eventSource.onmessage = (e) => {
+        try {
+            const data = JSON.parse(e.data);
+            handleSSEEvent(data);
+        } catch (err) {
+            console.error('SSE JSON error:', err, e.data);
+        }
+    };
+
+    eventSource.onerror = (e) => {
+        console.warn('SSE stream closed or disconnected');
+        if (eventSource) {
+            eventSource.close();
+            eventSource = null;
+        }
+        // Reset UI if we were generating when the stream died
+        if (isGenerating) {
+            isGenerating = false;
+            document.getElementById('btnGenerate')?.classList.remove('hidden');
+            document.getElementById('btnCancel')?.classList.add('hidden');
+            setStatus('error', 'Stream Disconnected');
+            showToast('Generation stream disconnected — check Pipeline Logs for details.', 'error');
+        }
+    };
+}
+
+function handleSSEEvent(payload) {
+    const eventType = payload.type || payload.event;
+    const data = payload.payload || payload.data || payload;
+
+    // Log terminal
+    appendLogEntry(payload);
+
+    // Agent highlight
+    if (eventType === 'agent_active') {
+        const agentName = String(data.agent || '').toLowerCase();
+        activatePipelineNode(agentName);
+    }
+
+    // Status message
+    if (eventType === 'status') {
+        const msg = typeof data === 'string' ? data : (data.content || '');
+        document.getElementById('statStatus').textContent = msg;
+    }
+
+    // Scene start
+    if (eventType === 'scene_start') {
+        const output = document.getElementById('genOutput');
+        const sceneNum = data.scene || 1;
+        // Prevent duplicates on reconnect
+        if (document.getElementById(`sceneCard_${sceneNum}`)) return;
+        const cardHtml = `
+            <div class="scene-output-card" id="sceneCard_${sceneNum}">
+                <div class="scene-output-card-header">
+                    <span class="scene-output-title">Scene ${sceneNum}</span>
+                    <span class="scene-meta" id="sceneMeta_${sceneNum}">Writing...</span>
+                </div>
+                <div class="scene-prose" id="sceneProse_${sceneNum}"></div>
+            </div>
+        `;
+        output.insertAdjacentHTML('beforeend', cardHtml);
+        output.scrollTop = output.scrollHeight;
+    }
+
+    // Stream token
+    if (eventType === 'stream_token') {
+        const token = typeof data === 'string' ? data : (data.token || data.content || '');
+        const cards = document.querySelectorAll('.scene-output-card');
+        const lastCard = cards[cards.length - 1];
+        if (lastCard) {
+            const proseEl = lastCard.querySelector('.scene-prose');
+            if (proseEl) {
+                proseEl.textContent += token;
+                const output = document.getElementById('genOutput');
+                if (output) output.scrollTop = output.scrollHeight;
             }
-            if (data.cloud && data.cloud.available) {
-                statusText += ' | Gemini Cloud Ready';
+        }
+    }
+
+    // Scene complete
+    if (eventType === 'scene_complete') {
+        const sceneNum = data.scene || 1;
+        const words = data.word_count || (data.text || '').split(/\s+/).filter(Boolean).length;
+        const metaEl = document.getElementById(`sceneMeta_${sceneNum}`);
+        if (metaEl) metaEl.textContent = `${words} words • Score: ${(data.score || 0.85).toFixed(2)}`;
+
+        const proseEl = document.getElementById(`sceneProse_${sceneNum}`);
+        if (proseEl && data.text) proseEl.textContent = data.text;
+
+        totalWords += words;
+        document.getElementById('statWords').textContent = totalWords;
+    }
+
+    // Chapter complete / Done
+    if (eventType === 'chapter_complete' || eventType === 'done') {
+        isGenerating = false;
+        document.getElementById('btnGenerate')?.classList.remove('hidden');
+        document.getElementById('btnCancel')?.classList.add('hidden');
+        setStatus('online', 'Chapter Complete');
+        markAllPipelineNodesDone();
+        showToast('Chapter generation complete!', 'success');
+        loadProjects();
+    }
+
+    // Error
+    if (eventType === 'error') {
+        isGenerating = false;
+        document.getElementById('btnGenerate')?.classList.remove('hidden');
+        document.getElementById('btnCancel')?.classList.add('hidden');
+        setStatus('error', 'Error');
+        showToast(data.error || 'Generation encountered an error', 'error');
+    }
+}
+
+function resetPipelineNodes() {
+    document.querySelectorAll('.pipeline-node').forEach(node => {
+        node.className = 'pipeline-node';
+    });
+}
+
+function activatePipelineNode(agentName) {
+    document.querySelectorAll('.pipeline-node').forEach(node => {
+        const stage = node.getAttribute('data-stage');
+        if (agentName.includes(stage) || (stage === 'writer' && agentName.includes('scene writer')) || (stage === 'architect' && agentName.includes('architect'))) {
+            node.className = 'pipeline-node active';
+        } else if (node.classList.contains('active')) {
+            node.className = 'pipeline-node done';
+        }
+    });
+}
+
+function markAllPipelineNodesDone() {
+    document.querySelectorAll('.pipeline-node').forEach(node => {
+        node.className = 'pipeline-node done';
+    });
+}
+
+// ─── Branch Options & Continuity Report ───────────────────────────
+async function loadBranchOptions() {
+    if (!currentProject) return;
+    const card = document.getElementById('branchOptionsCard');
+    const list = document.getElementById('branchOptionsList');
+    const hint = document.getElementById('branchDirectionHint')?.value || '';
+
+    card?.classList.remove('hidden');
+    list.innerHTML = '<div class="text-dim text-sm">Consulting Story Architect for next chapter paths...</div>';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/branch-options`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ direction_hint: hint }),
+        });
+
+        const data = await res.json();
+        const options = data.options || [];
+
+        if (options.length === 0) {
+            list.innerHTML = '<div class="text-dim text-sm">No branch paths generated. Try adding a steering hint.</div>';
+            return;
+        }
+
+        list.innerHTML = options.map((opt, i) => `
+            <div class="card mb-2" style="background:rgba(255,255,255,0.03);padding:14px;">
+                <div class="flex justify-between items-center mb-1">
+                    <strong style="color:var(--accent-purple);font-size:0.92rem;">Path ${i + 1}: ${escHtml(opt.title || 'Option')}</strong>
+                    <button class="btn btn-sm btn-primary" onclick="applyBranchOption('${escHtml(opt.summary || '')}')">Apply Path</button>
+                </div>
+                <p class="text-xs text-secondary" style="line-height:1.5;margin-bottom:0;">${escHtml(opt.summary || '')}</p>
+            </div>
+        `).join('');
+
+    } catch (e) {
+        list.innerHTML = `<div class="text-danger text-sm">Failed to generate branch paths: ${escHtml(e.message)}</div>`;
+    }
+}
+
+function hideBranchOptions() {
+    document.getElementById('branchOptionsCard')?.classList.add('hidden');
+}
+
+function applyBranchOption(summary) {
+    showToast('Applied branch path to next chapter plan!', 'success');
+    hideBranchOptions();
+}
+
+async function loadContinuityReport() {
+    if (!currentProject) return;
+    const card = document.getElementById('continuityCard');
+    const body = document.getElementById('continuityReportBody');
+
+    card?.classList.remove('hidden');
+    body.innerHTML = '<div class="text-dim text-sm">Analyzing continuity memory...</div>';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/continuity`);
+        const data = await res.json();
+
+        body.innerHTML = `
+            <div class="grid-cols-2" style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+                <div>
+                    <strong style="color:var(--accent-purple);font-size:0.85rem;display:block;margin-bottom:6px;">🧵 Open Narrative Threads</strong>
+                    <div style="font-size:0.8rem;line-height:1.6;color:var(--text-secondary);">${escHtml(data.threads || 'All core threads active.')}</div>
+                </div>
+                <div>
+                    <strong style="color:var(--accent-emerald);font-size:0.85rem;display:block;margin-bottom:6px;">🌱 Foreshadowing Seeds</strong>
+                    <div style="font-size:0.8rem;line-height:1.6;color:var(--text-secondary);">${escHtml(data.seeds || 'Seeds planted and tracking properly.')}</div>
+                </div>
+            </div>
+        `;
+    } catch (e) {
+        body.innerHTML = `<div class="text-danger text-sm">Failed to load continuity: ${escHtml(e.message)}</div>`;
+    }
+}
+
+function hideContinuityReport() {
+    document.getElementById('continuityCard')?.classList.add('hidden');
+}
+
+// ─── Interactive Manual Studio ────────────────────────────────────
+async function syncManualStatus() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/status`);
+        const data = await res.json();
+
+        if (data.active) {
+            manualSessionActive = true;
+            manualScenesCompleted = data.scenes_completed || 0;
+            manualIsGeneratingScene = Boolean(data.is_generating);
+
+            document.getElementById('manualStartCard')?.classList.add('hidden');
+            document.getElementById('manualSceneCard')?.classList.remove('hidden');
+
+            document.getElementById('manualSessionTitle').innerHTML = `<span class="icon">✍️</span> Chapter ${data.chapter_num}: ${escHtml(data.chapter_title)}`;
+            document.getElementById('manualSceneCounter').textContent = `${manualScenesCompleted} scene${manualScenesCompleted !== 1 ? 's' : ''} completed`;
+            document.getElementById('manualSceneLabel').textContent = `Scene ${manualScenesCompleted + 1} — What happens next?`;
+
+            renderManualScenes(data.completed_scenes || []);
+
+            if (manualScenesCompleted > 0 && !manualIsGeneratingScene) {
+                document.getElementById('btnManualFinish')?.classList.remove('hidden');
             }
-            badge.innerText = statusText;
-            badge.className = 'badge badge-info';
+        } else {
+            manualSessionActive = false;
+            document.getElementById('manualStartCard')?.classList.remove('hidden');
+            document.getElementById('manualSceneCard')?.classList.add('hidden');
         }
     } catch (e) {
-        badge.innerText = 'Vision API Unreachable';
-        badge.className = 'badge badge-warning';
+        console.warn('Could not sync manual status', e);
     }
+}
+
+async function startManualChapter() {
+    if (!currentProject) return;
+    const title = (document.getElementById('manualChapterTitle')?.value || '').trim();
+    const pacing = document.getElementById('manualPacing')?.value || 'moderate';
+
+    if (!title) {
+        showToast('Please enter a chapter title', 'error');
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/start`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chapter_title: title,
+                pacing: pacing,
+            }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to start chapter');
+
+        manualSessionActive = true;
+        manualScenesCompleted = 0;
+        document.getElementById('manualStartCard')?.classList.add('hidden');
+        document.getElementById('manualSceneCard')?.classList.remove('hidden');
+        document.getElementById('manualSessionTitle').innerHTML = `<span class="icon">✍️</span> ${escHtml(title)}`;
+        document.getElementById('manualSceneCounter').textContent = '0 scenes completed';
+        document.getElementById('manualSceneLabel').textContent = 'Scene 1 — What happens next?';
+        document.getElementById('manualCompletedScenes').innerHTML = '';
+
+        showToast('Manual Chapter Session Started!', 'success');
+
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+function renderManualScenes(scenes) {
+    const container = document.getElementById('manualCompletedScenes');
+    if (!container) return;
+    container.innerHTML = '';
+    manualSceneTexts.clear();
+
+    scenes.forEach((scene, idx) => {
+        const sceneText = typeof scene === 'string' ? scene : scene.text;
+        const wordCount = (sceneText || '').split(/\s+/).filter(Boolean).length;
+        const isLast = idx === scenes.length - 1;
+
+        manualSceneTexts.set(idx, sceneText || '');
+
+        const cardHtml = `
+            <div class="manual-scene-result">
+                <div style="position:absolute;top:14px;right:14px;display:flex;gap:6px;">
+                    ${isLast ? `<button class="btn btn-sm btn-secondary" onclick="regenerateManualScene(${idx})" title="Regenerate scene">🔄 Regenerate</button>` : ''}
+                    <button class="btn btn-sm btn-secondary" onclick="editManualScene(${idx})" title="Edit prose">✏️ Edit</button>
+                    <button class="btn btn-sm btn-danger" onclick="deleteManualScene(${idx})" title="Delete scene">🗑️</button>
+                </div>
+                <div style="font-weight:700;color:var(--accent-purple);margin-bottom:8px;font-size:0.95rem;">Scene ${idx + 1}</div>
+                <div style="font-family:var(--font-serif);line-height:1.8;white-space:pre-wrap;font-size:0.92rem;max-height:280px;overflow-y:auto;padding-right:8px;">${escHtml(sceneText)}</div>
+                <div class="text-xs text-dim mt-2">${wordCount} words</div>
+            </div>
+        `;
+        container.insertAdjacentHTML('beforeend', cardHtml);
+    });
+
+    container.scrollTop = container.scrollHeight;
+}
+
+async function generateNextScene() {
+    if (!currentProject || manualIsGeneratingScene) return;
+    const brief = (document.getElementById('manualSceneBrief')?.value || '').trim();
+
+    manualIsGeneratingScene = true;
+    document.getElementById('btnManualScene').disabled = true;
+    document.getElementById('btnManualStopScene')?.classList.remove('hidden');
+
+    document.getElementById('manualStreamArea')?.classList.remove('hidden');
+    document.getElementById('manualStreamOutput').textContent = '';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scene_brief: brief }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate scene');
+
+        connectSSEStream();
+        showToast('Generating scene...', 'info');
+
+    } catch (e) {
+        manualIsGeneratingScene = false;
+        document.getElementById('btnManualScene').disabled = false;
+        document.getElementById('btnManualStopScene')?.classList.add('hidden');
+        showToast(e.message, 'error');
+    }
+}
+
+function toggleTypedScenePanel() {
+    const panel = document.getElementById('manualTypedScenePanel');
+    if (panel) {
+        panel.classList.toggle('hidden');
+        if (!panel.classList.contains('hidden')) {
+            document.getElementById('manualTypedSceneText')?.focus();
+        }
+    }
+}
+
+async function addTypedScene() {
+    if (!currentProject) return;
+    const text = (document.getElementById('manualTypedSceneText')?.value || '').trim();
+    if (!text) {
+        showToast('Please type your scene prose first', 'error');
+        return;
+    }
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/typed`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to add scene');
+
+        document.getElementById('manualTypedSceneText').value = '';
+        toggleTypedScenePanel();
+        syncManualStatus();
+        showToast('Committed custom scene to chapter!', 'success');
+
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+async function deleteManualScene(idx) {
+    showConfirmModal('Delete Scene', `Are you sure you want to delete Scene ${idx + 1}?`, async () => {
+        try {
+            const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${idx}`, { method: 'DELETE' });
+            const data = await res.json();
+            if (!res.ok || data.error) throw new Error(data.error || 'Failed to delete');
+            syncManualStatus();
+            showToast('Scene deleted', 'success');
+        } catch (e) {
+            showToast(e.message, 'error');
+        }
+    });
+}
+
+async function regenerateManualScene(idx) {
+    showConfirmModal('Regenerate Scene', `Discard Scene ${idx + 1} and write a fresh version with AI?`, async () => {
+        try {
+            const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${idx}/regenerate`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({}),
+            });
+            const data = await res.json();
+            if (!res.ok || data.error) throw new Error(data.error || 'Failed to regenerate');
+            connectSSEStream();
+            showToast('Regenerating scene...', 'info');
+        } catch (e) {
+            showToast(e.message, 'error');
+        }
+    });
+}
+
+async function finishManualChapter() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/finish`, { method: 'POST' });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to finish chapter');
+
+        showToast('Chapter finished and stored successfully!', 'success');
+        manualSessionActive = false;
+        document.getElementById('manualStartCard')?.classList.remove('hidden');
+        document.getElementById('manualSceneCard')?.classList.add('hidden');
+        loadProjects();
+        switchView('reader');
+
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+function cancelManualSession() {
+    showConfirmModal('Reset Session', 'Discard active uncommitted manual chapter session?', () => {
+        manualSessionActive = false;
+        document.getElementById('manualStartCard')?.classList.remove('hidden');
+        document.getElementById('manualSceneCard')?.classList.add('hidden');
+        showToast('Session reset', 'info');
+    });
+}
+
+// ─── Story Reader Studio ──────────────────────────────────────────
+async function loadChapters() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/chapters`);
+        const data = await res.json();
+        const chapters = data.chapters || [];
+
+        const listEl = document.getElementById('chapterList');
+        if (!listEl) return;
+
+        if (chapters.length === 0) {
+            listEl.innerHTML = '<span class="text-dim text-xs">No chapters generated yet.</span>';
+            document.getElementById('readerContent').innerHTML = `
+                <div class="empty-state">
+                    <span class="icon">📖</span>
+                    <h3>No chapters written</h3>
+                    <p>Start generation in the Auto Generator or Interactive Manual tab.</p>
+                </div>
+            `;
+            return;
+        }
+
+        listEl.innerHTML = chapters.map(ch => {
+            const chNum = ch.number || ch.num;
+            return `
+            <div class="chapter-nav-item ${chNum === currentChapterNumber ? 'active' : ''}" data-chapter="${chNum}" onclick="loadChapter(${chNum})">
+                <span>Ch ${chNum}: ${escHtml(ch.title || `Chapter ${chNum}`)}</span>
+                <span class="text-xs text-dim">${ch.words || 0}w</span>
+            </div>
+        `}).join('');
+
+        if (chapters.length > 0) {
+            loadChapter(chapters[0].number || chapters[0].num);
+        }
+
+    } catch (e) {
+        showToast('Failed to load chapters', 'error');
+    }
+}
+
+async function loadChapter(num) {
+    if (!currentProject) return;
+    currentChapterNumber = num;
+
+    // Highlight active chapter in sidebar
+    document.querySelectorAll('.chapter-nav-item').forEach(item => {
+        item.classList.toggle('active', item.getAttribute('data-chapter') === String(num));
+    });
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/chapter/${num}`);
+        const data = await res.json();
+        currentChapterRaw = data.content || '';
+
+        document.getElementById('readerChapterTitle').innerHTML = `<span class="icon">📖</span> Chapter ${num}: ${escHtml(data.title || `Chapter ${num}`)}`;
+        document.getElementById('readerContent').innerHTML = formatProseMarkdown(currentChapterRaw);
+        document.getElementById('readerEditor').value = currentChapterRaw;
+
+    } catch (e) {
+        showToast('Failed to read chapter', 'error');
+    }
+}
+
+function formatProseMarkdown(raw) {
+    if (!raw) return '<p class="text-dim">Empty chapter content.</p>';
+    const paras = raw.split(/\n\n+/);
+    return paras.map(p => `<p style="margin-bottom:1.5em;text-indent:1.5em;">${escHtml(p.trim())}</p>`).join('');
+}
+
+function adjustReaderFontSize(delta) {
+    readerFontSize = Math.max(12, Math.min(30, readerFontSize + delta));
+    const content = document.getElementById('readerContent');
+    if (content) content.style.fontSize = `${readerFontSize}px`;
+    showToast(`Font size: ${readerFontSize}px`, 'info', 1200);
+}
+
+function toggleReaderTheme() {
+    const content = document.getElementById('readerContent');
+    if (!content) return;
+    readerThemes.forEach(t => content.classList.remove('theme-' + t));
+    readerThemeIndex = (readerThemeIndex + 1) % readerThemes.length;
+    content.classList.add('theme-' + readerThemes[readerThemeIndex]);
+    showToast(`Reader Theme: ${readerThemes[readerThemeIndex].toUpperCase()}`, 'info', 1500);
+}
+
+function toggleReaderFont() {
+    const content = document.getElementById('readerContent');
+    if (!content) return;
+    readerFonts.forEach(f => content.classList.remove(f));
+    readerFontIndex = (readerFontIndex + 1) % readerFonts.length;
+    content.classList.add(readerFonts[readerFontIndex]);
+    showToast(`Reader Font Switched`, 'info', 1500);
+}
+
+function toggleReaderFullscreen() {
+    readerIsFullscreen = !readerIsFullscreen;
+    const canvas = document.querySelector('.reader-canvas-card');
+    if (canvas) {
+        if (readerIsFullscreen) {
+            canvas.style.position = 'fixed';
+            canvas.style.top = '0';
+            canvas.style.left = '0';
+            canvas.style.right = '0';
+            canvas.style.bottom = '0';
+            canvas.style.zIndex = '99999';
+            canvas.style.borderRadius = '0';
+        } else {
+            canvas.style.position = '';
+            canvas.style.top = '';
+            canvas.style.left = '';
+            canvas.style.right = '';
+            canvas.style.bottom = '';
+            canvas.style.zIndex = '';
+            canvas.style.borderRadius = 'var(--radius-lg)';
+        }
+    }
+}
+
+function toggleReaderEdit() {
+    isReaderEditMode = !isReaderEditMode;
+    const content = document.getElementById('readerContent');
+    const editor = document.getElementById('readerEditor');
+    const editBtn = document.getElementById('btnReaderEdit');
+    const saveBtn = document.getElementById('btnReaderSave');
+    const cancelBtn = document.getElementById('btnReaderCancel');
+
+    if (isReaderEditMode) {
+        content.classList.add('hidden');
+        editor.classList.remove('hidden');
+        editBtn.classList.add('hidden');
+        saveBtn.classList.remove('hidden');
+        cancelBtn.classList.remove('hidden');
+    } else {
+        content.classList.remove('hidden');
+        editor.classList.add('hidden');
+        editBtn.classList.remove('hidden');
+        saveBtn.classList.add('hidden');
+        cancelBtn.classList.add('hidden');
+    }
+}
+
+async function saveReaderEdit() {
+    if (!currentProject) return;
+    const newContent = document.getElementById('readerEditor')?.value || '';
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/chapter/${currentChapterNumber}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ content: newContent }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save');
+
+        currentChapterRaw = newContent;
+        document.getElementById('readerContent').innerHTML = formatProseMarkdown(newContent);
+        toggleReaderEdit();
+        showToast('Saved chapter edits!', 'success');
+        loadChapters();
+
+    } catch (e) {
+        showToast(e.message, 'error');
+    }
+}
+
+function cancelReaderEdit() {
+    document.getElementById('readerEditor').value = currentChapterRaw;
+    toggleReaderEdit();
+}
+
+async function deleteChaptersFromUi() {
+    const numInput = document.getElementById('deleteFromChapter');
+    const fromNum = parseInt(numInput?.value || '0', 10);
+    if (!fromNum || fromNum < 1) {
+        showToast('Enter a valid chapter number', 'error');
+        return;
+    }
+
+    showConfirmModal(
+        'Delete Chapters',
+        `Are you sure you want to delete Chapter ${fromNum} and all subsequent chapters?`,
+        async () => {
+            try {
+                const res = await fetch(`/api/project/${currentProject}/chapters/delete`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ from_chapter: fromNum }),
+                });
+                const data = await res.json();
+                if (!res.ok || data.error) throw new Error(data.error || 'Failed to delete');
+                showToast(`Deleted chapters from #${fromNum}`, 'success');
+                loadChapters();
+            } catch (e) {
+                showToast(e.message, 'error');
+            }
+        }
+    );
+}
+
+// ─── Combine & Polish Studio (Gemini Powered) ─────────────────────
+async function loadCombineVersions() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/versions`);
+        const data = await res.json();
+        const versions = data.versions || [];
+
+        const select = document.getElementById('combineVersionSelect');
+        if (!select) return;
+
+        if (versions.length === 0) {
+            select.innerHTML = '<option value="">No polished versions available</option>';
+            return;
+        }
+
+        select.innerHTML = versions.map(v => `
+            <option value="${escHtml(v.suffix)}">${escHtml(v.name || v.suffix)} (${v.date || ''})</option>
+        `).join('');
+
+        if (versions.length > 0) {
+            loadCombineVersion(versions[0].suffix);
+        }
+
+    } catch (e) {
+        console.warn('Error loading combine versions:', e);
+    }
+}
+
+async function changeCombineVersion() {
+    const suffix = document.getElementById('combineVersionSelect')?.value;
+    if (suffix) loadCombineVersion(suffix);
+}
+
+async function loadCombineVersion(suffix) {
+    if (!currentProject || !suffix) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine/version/${suffix}`);
+        const data = await res.json();
+
+        if (data.analysis) {
+            document.getElementById('combineAnalysisCard')?.classList.remove('hidden');
+            document.getElementById('combineAnalysis').textContent = data.analysis;
+        }
+
+        if (data.polished) {
+            document.getElementById('combinePolishedCard')?.classList.remove('hidden');
+            document.getElementById('combinePolished').innerHTML = formatProseMarkdown(data.polished);
+        }
+
+        document.getElementById('combineDownloadCard')?.classList.remove('hidden');
+        document.getElementById('combineStats').textContent = `${(data.polished || '').split(/\s+/).length} words`;
+
+    } catch (e) {
+        console.warn('Error loading version:', e);
+    }
+}
+
+async function startCombine() {
+    if (!currentProject) return;
+    const model = document.getElementById('combineModelSelect')?.value || 'gemini-3.6-flash';
+
+    document.getElementById('combineProgress')?.classList.remove('hidden');
+    document.getElementById('combineStatusText').textContent = `Polishing chapters with ${model}...`;
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Combine failed');
+
+        showToast('Combine and Polish completed!', 'success');
+        document.getElementById('combineProgress')?.classList.add('hidden');
+        loadCombineVersions();
+
+    } catch (e) {
+        document.getElementById('combineProgress')?.classList.add('hidden');
+        showToast(e.message, 'error');
+    }
+}
+
+async function startWholeStory() {
+    if (!currentProject) return;
+    const model = document.getElementById('combineModelSelect')?.value || 'gemini-3.6-flash';
+
+    document.getElementById('combineProgress')?.classList.remove('hidden');
+    document.getElementById('combineStatusText').textContent = `Generating whole story with ${model}...`;
+
+    try {
+        const res = await fetch(`/api/project/${currentProject}/combine`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model, whole_story: true }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Generation failed');
+
+        showToast('Generated whole story successfully!', 'success');
+        document.getElementById('combineProgress')?.classList.add('hidden');
+        loadCombineVersions();
+
+    } catch (e) {
+        document.getElementById('combineProgress')?.classList.add('hidden');
+        showToast(e.message, 'error');
+    }
+}
+
+function cancelCombine() {
+    if (!currentProject) return;
+    fetch(`/api/project/${currentProject}/combine/cancel`, { method: 'POST' })
+        .catch(e => console.error('Cancel combine error:', e));
+    document.getElementById('combineProgress')?.classList.add('hidden');
+    showToast('Combiner cancelled', 'info');
+}
+
+function toggleCombineSection(contentId, btnId) {
+    const el = document.getElementById(contentId);
+    const btn = document.getElementById(btnId);
+    if (el) {
+        el.classList.toggle('hidden');
+        if (btn) btn.textContent = el.classList.contains('hidden') ? '▲ Expand' : '▼ Collapse';
+    }
+}
+
+function downloadCombined(type) {
+    if (!currentProject) return;
+    window.open(`/api/project/${currentProject}/combine/download/${type}`, '_blank');
+}
+
+function renameSelectedVersion() {
+    const select = document.getElementById('combineVersionSelect');
+    const suffix = select?.value;
+    if (!suffix) return;
+    const newName = prompt('Enter new label for this polished version:');
+    if (!newName) return;
+
+    fetch(`/api/project/${currentProject}/combine/rename`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ suffix, new_name: newName }),
+    }).then(() => {
+        showToast('Version renamed', 'success');
+        loadCombineVersions();
+    }).catch(e => console.error('Rename error:', e));
+}
+
+function deleteSelectedVersion() {
+    const select = document.getElementById('combineVersionSelect');
+    const suffix = select?.value;
+    if (!suffix) return;
+
+    showConfirmModal('Delete Version', 'Are you sure you want to delete this polished story version?', () => {
+        fetch(`/api/project/${currentProject}/combine/delete_version`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ suffix }),
+        }).then(() => {
+            showToast('Version deleted', 'success');
+            loadCombineVersions();
+        }).catch(e => console.error('Delete version error:', e));
+    });
+}
+
+// ─── Story Bible & State Inspector ────────────────────────────────
+async function refreshState() {
+    if (!currentProject) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/state`);
+        const data = await res.json();
+        const state = data.state || data;
+
+        document.getElementById('stateJson').textContent = JSON.stringify(state, null, 2);
+
+        // Render Characters Cards
+        const charsGrid = document.getElementById('bibleCharactersGrid');
+        const chars = state.characters || {};
+        if (Object.keys(chars).length === 0) {
+            charsGrid.innerHTML = '<span class="text-dim text-sm">No characters registered in Story Bible.</span>';
+        } else {
+            charsGrid.innerHTML = Object.keys(chars).map(name => `
+                <div class="char-bible-card">
+                    <div class="char-bible-header">
+                        <span class="char-bible-name">${escHtml(name)}</span>
+                    </div>
+                    <p class="text-xs text-secondary">${escHtml(chars[name].description || 'No description.')}</p>
+                    <div class="char-traits-wrap">
+                        ${(chars[name].traits || []).map(t => `<span class="char-trait-chip">${escHtml(t)}</span>`).join('')}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Render World Details
+        const meta = state.metadata || {};
+        document.getElementById('bibleWorldDetails').innerHTML = `
+            <div><strong>Setting:</strong> ${escHtml(meta.setting || 'Unspecified')}</div>
+            <div><strong>Genre:</strong> ${escHtml(meta.genre || 'Unspecified')}</div>
+            <div><strong>Themes:</strong> ${escHtml((meta.themes || []).join(', ') || 'None')}</div>
+        `;
+
+        // Render Threads
+        const threads = state.continuity?.threads || [];
+        const threadsList = document.getElementById('bibleThreadsList');
+        if (threads.length === 0) {
+            threadsList.innerHTML = '<span class="text-dim text-sm">All narrative threads resolved or in initial state.</span>';
+        } else {
+            threadsList.innerHTML = threads.map(t => `<div class="card p-2 text-xs">${escHtml(typeof t === 'string' ? t : JSON.stringify(t))}</div>`).join('');
+        }
+
+    } catch (e) {
+        showToast('Failed to inspect state', 'error');
+    }
+}
+
+function switchBibleTab(tabName) {
+    const stateView = document.getElementById('viewState');
+    if (!stateView) return;
+    
+    stateView.querySelectorAll('.bible-tab-btn').forEach(btn => {
+        btn.classList.remove('active');
+        if (btn.textContent.toLowerCase().includes(tabName)) btn.classList.add('active');
+    });
+
+    ['Characters', 'World', 'Threads', 'Json'].forEach(t => {
+        const el = document.getElementById('bibleTab' + t);
+        if (el) el.classList.add('hidden');
+    });
+
+    const activeEl = document.getElementById('bibleTab' + tabName.charAt(0).toUpperCase() + tabName.slice(1));
+    if (activeEl) activeEl.classList.remove('hidden');
+}
+
+// ─── Live Terminal Logs ───────────────────────────────────────────
+function appendLogEntry(payload) {
+    const terminal = document.getElementById('logTerminal');
+    if (!terminal) return;
+
+    const time = new Date().toLocaleTimeString();
+    const eventType = payload.type || payload.event || 'LOG';
+    const content = payload.content || (typeof payload.payload === 'string' ? payload.payload : JSON.stringify(payload.payload || ''));
+
+    let tagClass = 'tag-sys';
+    if (eventType === 'agent_active') tagClass = 'tag-arc';
+    if (eventType === 'error') tagClass = 'tag-err';
+    if (eventType === 'scene_written') tagClass = 'tag-wrt';
+    if (eventType === 'status') tagClass = 'tag-ret';
+
+    const row = document.createElement('div');
+    row.className = 'log-row';
+    row.innerHTML = `
+        <span class="log-time">${time}</span>
+        <span class="log-tag ${tagClass}">${eventType.slice(0, 3).toUpperCase()}</span>
+        <span>${escHtml(content)}</span>
+    `;
+
+    terminal.appendChild(row);
+
+    const autoScroll = document.getElementById('logAutoScroll')?.checked;
+    if (autoScroll) {
+        terminal.scrollTop = terminal.scrollHeight;
+    }
+}
+
+function clearLogs() {
+    const terminal = document.getElementById('logTerminal');
+    if (terminal) {
+        terminal.innerHTML = '<div class="log-row"><span class="log-time">--:--:--</span><span class="log-tag tag-sys">SYS</span><span>Logs cleared.</span></div>';
+    }
+}
+
+function filterLogs() {
+    const filter = (document.getElementById('logFilterInput')?.value || '').toLowerCase();
+    document.querySelectorAll('.log-row').forEach(row => {
+        const text = row.textContent.toLowerCase();
+        row.style.display = (!filter || text.includes(filter)) ? 'flex' : 'none';
+    });
+}
+
+// ─── Vision Lab ───────────────────────────────────────────────────
+let visionSelectedFile = null;
+
+function checkVisionStatus() {
+    fetch('/vision/status')
+        .then(res => res.json())
+        .then(data => {
+            const badge = document.getElementById('visionStatusBadge');
+            if (badge) {
+                badge.textContent = data.backend === 'local' ? 'OLLAMA READY' : 'CLOUD VISION READY';
+            }
+        })
+        .catch(() => {
+            const badge = document.getElementById('visionStatusBadge');
+            if (badge) badge.textContent = 'STANDALONE';
+        });
 }
 
 function handleVisionFileSelect(files) {
-    if (!files || !files.length) return;
+    if (!files || !files[0]) return;
     const file = files[0];
-    if (!file.type.startsWith('image/')) {
-        showToast('Please select a valid image file (PNG, JPG, WEBP).', 'error');
-        return;
-    }
-    selectedVisionFile = file;
+    visionSelectedFile = file;
+
+    const preview = document.getElementById('visionPreviewImg');
+    const previewWrap = document.getElementById('visionImagePreview');
+    const contentWrap = document.getElementById('visionDropzoneContent');
+    const btn = document.getElementById('btnAnalyzeVision');
+
     const reader = new FileReader();
-    reader.onload = function(e) {
-        document.getElementById('visionPreviewImg').src = e.target.result;
-        document.getElementById('visionDropzoneContent').style.display = 'none';
-        document.getElementById('visionImagePreview').style.display = 'block';
-        document.getElementById('btnAnalyzeVision').disabled = false;
+    reader.onload = (e) => {
+        if (preview) preview.src = e.target.result;
+        if (previewWrap) previewWrap.style.display = 'block';
+        if (contentWrap) contentWrap.style.display = 'none';
+        if (btn) btn.disabled = false;
     };
     reader.readAsDataURL(file);
 }
 
 function clearVisionFile() {
-    selectedVisionFile = null;
-    document.getElementById('visionFileInput').value = '';
+    visionSelectedFile = null;
     document.getElementById('visionPreviewImg').src = '';
-    document.getElementById('visionDropzoneContent').style.display = 'block';
     document.getElementById('visionImagePreview').style.display = 'none';
+    document.getElementById('visionDropzoneContent').style.display = 'block';
     document.getElementById('btnAnalyzeVision').disabled = true;
-    document.getElementById('visionResults').style.display = 'none';
 }
 
-let currentVisionSessionId = null;
-
 async function runVisionAnalysis() {
-    if (!selectedVisionFile) {
-        showToast('Please select or drag an image first.', 'warning');
-        return;
-    }
-
+    if (!visionSelectedFile) return;
     const btn = document.getElementById('btnAnalyzeVision');
-    const oldText = btn.innerHTML;
-    btn.disabled = true;
-    btn.innerHTML = '⏳ Scanning Image (LLaVA)...';
+    const mode = document.getElementById('visionModeSelect')?.value || 'auto';
+    const promptExtra = document.getElementById('visionPromptExtra')?.value || '';
+
+    if (btn) { btn.disabled = true; btn.textContent = '⚡ Analyzing Persona...'; }
 
     const formData = new FormData();
-    formData.append('image', selectedVisionFile);
+    formData.append('image', visionSelectedFile);
+    formData.append('mode', mode);
+    formData.append('extra_prompt', promptExtra);
 
     try {
-        const res = await fetch('/api/vision/chat/start', {
+        const res = await fetch('/vision/analyze', {
             method: 'POST',
-            body: formData
+            body: formData,
         });
-        const json = await res.json();
-        if (!res.ok || !json.success) {
-            throw new Error(json.error || 'Vision scan failed');
-        }
-        
-        currentVisionSessionId = json.data.session_id;
-        
-        // Hide dropzone, show chat interface
-        document.getElementById('visionDropzone').style.display = 'none';
-        document.getElementById('visionChatInterface').style.display = 'block';
-        
-        // Clear chat history
-        const history = document.getElementById('visionChatHistory');
-        history.innerHTML = '';
-        
-        // Add initial system message with observation summary
-        addChatMessage('system', `System: ${json.data.observations_summary}`);
-        
-        // Add initial Grok message
-        addChatMessage('assistant', json.data.initial_message);
-        
-        showToast('Chat started!', 'success');
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Vision analysis failed');
+
+        document.getElementById('visionChatInterface')?.classList.remove('hidden');
+        appendVisionChatMessage('assistant', data.analysis || 'Analysis complete.');
+        showToast('Character visual breakdown completed!', 'success');
+
     } catch (e) {
         showToast(e.message, 'error');
     } finally {
-        btn.disabled = false;
-        btn.innerHTML = '⚡ Chat Started';
+        if (btn) { btn.disabled = false; btn.textContent = '⚡ Analyze Visual Breakdown'; }
     }
 }
 
-function addChatMessage(role, content) {
+function appendVisionChatMessage(sender, text) {
     const history = document.getElementById('visionChatHistory');
-    const messageDiv = document.createElement('div');
-    messageDiv.className = `chat-message ${role}`;
-    
-    const label = role === 'assistant' ? 'Grok' : (role === 'user' ? 'You' : 'System');
-    
-    messageDiv.innerHTML = `
-        <div class="chat-label">${label}</div>
-        <div class="chat-bubble">${content}</div>
+    if (!history) return;
+
+    const bubble = document.createElement('div');
+    bubble.style.cssText = `
+        padding: 12px 16px;
+        border-radius: var(--radius-md);
+        max-width: 80%;
+        line-height: 1.6;
+        font-size: 0.88rem;
+        ${sender === 'user' ? 'margin-left:auto;background:var(--grad-primary);color:#fff;' : 'background:rgba(255,255,255,0.06);color:var(--text-primary);border:1px solid var(--border-subtle);'}
     `;
-    
-    history.appendChild(messageDiv);
+    bubble.innerHTML = formatProseMarkdown(text);
+    history.appendChild(bubble);
     history.scrollTop = history.scrollHeight;
 }
 
 function handleVisionChatKeyPress(e) {
-    if (e.key === 'Enter') {
-        sendVisionChatMessage();
-    }
+    if (e.key === 'Enter') sendVisionChatMessage();
 }
 
 async function sendVisionChatMessage() {
-    if (!currentVisionSessionId) return;
-    
     const input = document.getElementById('visionChatMessage');
-    const message = input.value.trim();
-    if (!message) return;
-    
-    // Add user message to UI
-    addChatMessage('user', message);
+    const text = (input?.value || '').trim();
+    if (!text) return;
+
     input.value = '';
-    
-    const btn = document.getElementById('btnVisionChatSend');
-    btn.disabled = true;
-    
-    // Add typing indicator
-    const history = document.getElementById('visionChatHistory');
-    const typingDiv = document.createElement('div');
-    typingDiv.className = `chat-message assistant`;
-    typingDiv.id = 'visionChatTyping';
-    typingDiv.innerHTML = `
-        <div class="chat-label">Grok</div>
-        <div class="chat-bubble">Typing...</div>
-    `;
-    history.appendChild(typingDiv);
-    history.scrollTop = history.scrollHeight;
-    
+    appendVisionChatMessage('user', text);
+
     try {
-        const res = await fetch('/api/vision/chat/message', {
+        const res = await fetch('/vision/chat', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                session_id: currentVisionSessionId,
-                message: message
-            })
+            body: JSON.stringify({ message: text }),
         });
-        
-        const json = await res.json();
-        
-        // Remove typing indicator
-        const typingEl = document.getElementById('visionChatTyping');
-        if (typingEl) typingEl.remove();
-        
-        if (!res.ok || !json.success) {
-            throw new Error(json.error || 'Message failed');
-        }
-        
-        // Add response to UI
-        addChatMessage('assistant', json.data.response);
-        
+        const data = await res.json();
+        appendVisionChatMessage('assistant', data.reply || 'No response.');
     } catch (e) {
-        // Remove typing indicator on error
-        const typingEl = document.getElementById('visionChatTyping');
-        if (typingEl) typingEl.remove();
-        
-        showToast(e.message, 'error');
-    } finally {
-        btn.disabled = false;
-        input.focus();
+        appendVisionChatMessage('assistant', `Error: ${e.message}`);
     }
 }
 
-function setupVisionDropzone() {
-    const dropzone = document.getElementById('visionDropzone');
-    if (!dropzone || dropzone.dataset.initialized) return;
-    dropzone.dataset.initialized = 'true';
+// ─── Settings & Backends Configuration ────────────────────────────
+async function loadSettings() {
+    try {
+        const res = await fetch('/api/settings');
+        runtimeSettings = await res.json();
+        const s = runtimeSettings.settings || {};
 
-    ['dragenter', 'dragover'].forEach(eventName => {
-        dropzone.addEventListener(eventName, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            dropzone.classList.add('dragover');
-        }, false);
-    });
+        // Highlight selected backend provider card
+        const mode = s.BACKEND_MODE || 'groq';
+        document.querySelectorAll('.provider-card-select').forEach(card => {
+            const input = card.querySelector('input');
+            const cardMode = card.getAttribute('data-mode');
+            if (cardMode === mode) {
+                card.classList.add('selected');
+                if (input) input.checked = true;
+            } else {
+                card.classList.remove('selected');
+                if (input) input.checked = false;
+            }
+        });
 
-    ['dragleave', 'drop'].forEach(eventName => {
-        dropzone.addEventListener(eventName, (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            dropzone.classList.remove('dragover');
-        }, false);
-    });
+        // Set inputs
+        document.querySelectorAll('[data-setting]').forEach(el => {
+            const key = el.getAttribute('data-setting');
+            if (s[key] !== undefined) {
+                if (el.type === 'checkbox') el.checked = Boolean(s[key]);
+                else el.value = s[key];
+            }
+        });
 
-    dropzone.addEventListener('drop', (e) => {
-        const dt = e.dataTransfer;
-        const files = dt.files;
-        handleVisionFileSelect(files);
-    }, false);
+        document.getElementById('settingsSummary').textContent = `Active: ${mode.toUpperCase()} (${formatModelDisplayName(s.ACTIVE_MODEL)})`;
+
+    } catch (e) {
+        showToast('Error loading settings', 'error');
+    }
 }
+
+async function saveSettings() {
+    const btn = document.getElementById('btnSaveSettings');
+    if (btn) { btn.disabled = true; btn.textContent = '💾 Saving...'; }
+
+    const settings = {};
+    document.querySelectorAll('[data-setting]').forEach(el => {
+        const key = el.getAttribute('data-setting');
+        if (el.type === 'checkbox') settings[key] = el.checked;
+        else if (el.type === 'number') settings[key] = parseFloat(el.value) || 0;
+        else settings[key] = el.value;
+    });
+
+    const selectedModeCard = document.querySelector('.provider-card-select.selected');
+    if (selectedModeCard) {
+        settings['BACKEND_MODE'] = selectedModeCard.getAttribute('data-mode');
+    }
+
+    try {
+        const res = await fetch('/api/settings', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ settings }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to save settings');
+
+        showToast('Settings saved successfully!', 'success');
+        await loadModels();
+        await loadSettings();
+
+    } catch (e) {
+        showToast(e.message || 'Save failed', 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '💾 Save Settings'; }
+    }
+}
+
+// ─── App Initialization ───────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', () => {
+    // Setup Backend Provider Cards click listener
+    document.querySelectorAll('.provider-card-select').forEach(card => {
+        card.addEventListener('click', () => {
+            document.querySelectorAll('.provider-card-select').forEach(c => c.classList.remove('selected'));
+            card.classList.add('selected');
+            const input = card.querySelector('input');
+            if (input) input.checked = true;
+        });
+    });
+
+    // Initialize Core Modules
+    loadProjects();
+    loadModels();
+    setStatus('online', 'Engine Ready');
+});

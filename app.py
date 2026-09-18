@@ -211,7 +211,7 @@ def _queue_event(eq: queue.Queue, message: dict, force: bool = False) -> bool:
 
 
 def _is_groq_selection(selected: str) -> bool:
-    """Return True if the model selection string refers to Groq (generic or specific)."""
+    """Return True if the model selection string refers to Groq."""
     return selected == _GROQ_MODEL_OPTION or selected.startswith("groq:")
 
 
@@ -222,12 +222,40 @@ def _groq_model_from_selection(selected: str) -> str:
     return config.GROQ_MODEL
 
 
+def _is_gemini_selection(selected: str) -> bool:
+    """Return True if the model selection string refers to Gemini."""
+    return selected == _GEMINI_MODEL_OPTION or selected.startswith("gemini:")
+
+
+def _gemini_model_from_selection(selected: str) -> str:
+    """Extract the Gemini model ID from a selection string."""
+    if selected.startswith("gemini:"):
+        return selected.split(":", 1)[1]
+    return config.GEMINI_MODEL
+
+
+def _is_openrouter_selection(selected: str) -> bool:
+    """Return True if the model selection string refers to OpenRouter."""
+    return selected == _OPENROUTER_MODEL_OPTION or selected.startswith("openrouter:")
+
+
+def _openrouter_model_from_selection(selected: str) -> str:
+    """Extract the OpenRouter model ID from a selection string."""
+    if selected.startswith("openrouter:"):
+        return selected.split(":", 1)[1]
+    return config.OPENROUTER_MODEL
+
+
 def _active_model_selection() -> str:
     if _selected_backend == "gemini":
-        return _GEMINI_MODEL_OPTION
+        return f"gemini:{config.GEMINI_MODEL}"
     if _selected_backend == "openrouter":
-        return _OPENROUTER_MODEL_OPTION
-    return f"groq:{config.GROQ_MODEL}" if _selected_backend == "groq" else to_model_id(_selected_local_model_path)
+        return f"openrouter:{config.OPENROUTER_MODEL}"
+    if _selected_backend == "groq":
+        return f"groq:{config.GROQ_MODEL}"
+    if config.USE_CLOUD_MODEL:
+        return "hybrid"
+    return to_model_id(_selected_local_model_path)
 
 
 def _get_llm_for_premise(requested_model=None):
@@ -236,15 +264,18 @@ def _get_llm_for_premise(requested_model=None):
         if not config.GROQ_API_KEY:
             raise RuntimeError("GROQ_API_KEY not set. Add it to .env before using Groq.")
         return GroqModel(model=_groq_model_from_selection(selected))
-    if selected == _GEMINI_MODEL_OPTION:
+    if _is_gemini_selection(selected):
         if not config.GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY not set. Add it to .env before using Gemini.")
         from models.gemini_model import GeminiModel
-        return GeminiModel(model=config.GEMINI_MODEL)
-    if selected == _OPENROUTER_MODEL_OPTION:
+        return GeminiModel(model=_gemini_model_from_selection(selected))
+    if _is_openrouter_selection(selected):
         if not config.OPENROUTER_API_KEY:
             raise RuntimeError("OPENROUTER_API_KEY not set. Add it to .env before using OpenRouter.")
-        return OpenRouterModel(model=config.OPENROUTER_MODEL)
+        return OpenRouterModel(model=_openrouter_model_from_selection(selected))
+    if selected == "hybrid":
+        if config.GROQ_API_KEY:
+            return GroqModel(model=config.GROQ_MODEL)
     
     requested_model_path = resolve_model_path(selected)
     if not os.path.isfile(requested_model_path):
@@ -273,6 +304,8 @@ def _current_pipeline_kwargs() -> dict:
     elif _selected_backend == "openrouter":
         kwargs["backend"] = "openrouter"
         kwargs["openrouter_model"] = config.OPENROUTER_MODEL
+    elif config.USE_CLOUD_MODEL:
+        kwargs["groq_model"] = config.GROQ_MODEL
     return kwargs
 
 
@@ -478,22 +511,36 @@ def create_app():
         if _is_groq_selection(selected):
             if not config.GROQ_API_KEY:
                 return None, jsonify({"error": "GROQ_API_KEY not set. Add it to .env before using Groq."}), 400
-            pipeline_kwargs.update({"backend": "groq", "groq_model": _groq_model_from_selection(selected)})
+            groq_m = _groq_model_from_selection(selected)
+            config.GROQ_MODEL = groq_m
+            pipeline_kwargs.update({"backend": "groq", "groq_model": groq_m})
             _selected_backend = "groq"
             return pipeline_kwargs, None, None
 
-        if selected == _GEMINI_MODEL_OPTION:
+        if _is_gemini_selection(selected):
             if not config.GEMINI_API_KEY:
                 return None, jsonify({"error": "GEMINI_API_KEY not set. Add it to .env before using Gemini."}), 400
-            pipeline_kwargs.update({"backend": "gemini", "gemini_model": config.GEMINI_MODEL})
+            gemini_m = _gemini_model_from_selection(selected)
+            config.GEMINI_MODEL = gemini_m
+            pipeline_kwargs.update({"backend": "gemini", "gemini_model": gemini_m})
             _selected_backend = "gemini"
             return pipeline_kwargs, None, None
 
-        if selected == _OPENROUTER_MODEL_OPTION:
+        if _is_openrouter_selection(selected):
             if not config.OPENROUTER_API_KEY:
                 return None, jsonify({"error": "OPENROUTER_API_KEY not set. Add it to .env before using OpenRouter."}), 400
-            pipeline_kwargs.update({"backend": "openrouter", "openrouter_model": config.OPENROUTER_MODEL})
+            openrouter_m = _openrouter_model_from_selection(selected)
+            config.OPENROUTER_MODEL = openrouter_m
+            pipeline_kwargs.update({"backend": "openrouter", "openrouter_model": openrouter_m})
             _selected_backend = "openrouter"
+            return pipeline_kwargs, None, None
+
+        if selected == "hybrid":
+            if not config.GROQ_API_KEY:
+                return None, jsonify({"error": "GROQ_API_KEY not set. Add it to .env for Hybrid mode."}), 400
+            config.USE_CLOUD_MODEL = True
+            _selected_backend = "local"
+            pipeline_kwargs.update({"local_model": _selected_local_model_path, "groq_model": config.GROQ_MODEL})
             return pipeline_kwargs, None, None
 
         requested_model_path = resolve_model_path(selected)
@@ -566,13 +613,11 @@ def create_app():
                 return jsonify({"error": f"Model file not found: {resolved}"}), 400
             updates["LLAMA_MODEL_PATH"] = resolved
         elif selected_model and selected_model.startswith("groq:"):
-            # A specific Groq model was picked via the model dropdown — apply and
-            # persist it (overrides the plain GROQ_MODEL form field, if present).
             updates["GROQ_MODEL"] = _groq_model_from_selection(selected_model)
         elif selected_model and selected_model.startswith("gemini:"):
-            updates["GEMINI_MODEL"] = selected_model.split(":", 1)[1]
+            updates["GEMINI_MODEL"] = _gemini_model_from_selection(selected_model)
         elif selected_model and selected_model.startswith("openrouter:"):
-            updates["OPENROUTER_MODEL"] = selected_model.split(":", 1)[1]
+            updates["OPENROUTER_MODEL"] = _openrouter_model_from_selection(selected_model)
         elif mode not in {"groq", "gemini", "openrouter"} and "LLAMA_MODEL_PATH" in updates and updates["LLAMA_MODEL_PATH"]:
             resolved = resolve_model_path(updates["LLAMA_MODEL_PATH"])
             if not resolved.lower().endswith(".gguf"):
@@ -586,6 +631,10 @@ def create_app():
         has_groq_key = bool(primary_key or raw_keys.strip())
         if mode in {"hybrid", "groq"} and not has_groq_key:
             return jsonify({"error": "Groq API key is required for hybrid or full Groq mode"}), 400
+
+        gemini_key = updates.get("GEMINI_API_KEY", config.GEMINI_API_KEY)
+        if mode == "gemini" and not gemini_key:
+            return jsonify({"error": "Gemini API key is required for Gemini mode"}), 400
 
         openrouter_key = updates.get("OPENROUTER_API_KEY", config.OPENROUTER_API_KEY)
         if mode == "openrouter" and not openrouter_key:
@@ -615,21 +664,18 @@ def create_app():
         elif _selected_backend not in {"groq", "gemini", "openrouter"}:
             _selected_backend = "local"
 
-        available_models = [*models, _GROQ_MODEL_OPTION, _GEMINI_MODEL_OPTION, _OPENROUTER_MODEL_OPTION]
-        # Also expose individual Groq models in the list so the UI can show a dropdown
         groq_model_ids = [f"groq:{m['id']}" for m in config.GROQ_MODELS]
-        available_models.extend(groq_model_ids)
+        gemini_model_ids = [f"gemini:{m['id']}" for m in getattr(config, "GEMINI_MODELS", [])]
+        openrouter_model_ids = [f"openrouter:{m['id']}" for m in getattr(config, "OPENROUTER_MODELS", [])]
+
+        available_models = [
+            *models,
+            *groq_model_ids,
+            *gemini_model_ids,
+            *openrouter_model_ids,
+        ]
 
         active = _active_model_selection()
-        if active not in available_models:
-            if models:
-                _selected_backend = "local"
-                _selected_local_model_path = resolve_model_path(models[0])
-                active = to_model_id(_selected_local_model_path)
-            elif _selected_backend == "groq":
-                active = f"groq:{config.GROQ_MODEL}"
-            else:
-                active = _GROQ_MODEL_OPTION
 
         return jsonify({
             "models": available_models,
@@ -637,7 +683,11 @@ def create_app():
             "groq_model": config.GROQ_MODEL,
             "groq_models": config.GROQ_MODELS,
             "gemini_model": config.GEMINI_MODEL,
+            "gemini_models": getattr(config, "GEMINI_MODELS", []),
             "openrouter_model": config.OPENROUTER_MODEL,
+            "openrouter_models": getattr(config, "OPENROUTER_MODELS", []),
+            "local_models": models,
+            "local_model": to_model_id(_selected_local_model_path) if _selected_local_model_path else "",
             "backend_mode": _active_generation_mode(),
         })
 
@@ -650,19 +700,32 @@ def create_app():
         if not model:
             return jsonify({"error": "No model specified"}), 400
 
+        if model == "hybrid" or model.startswith("hybrid:"):
+            if not config.GROQ_API_KEY:
+                return jsonify({
+                    "error": "GROQ_API_KEY not set. Hybrid mode requires a Groq key for the Writer agent.",
+                }), 400
+            _selected_backend = "local"
+            config.USE_CLOUD_MODEL = True
+            if model.startswith("hybrid:groq:"):
+                config.GROQ_MODEL = model.split("hybrid:groq:", 1)[1]
+            return jsonify({
+                "status": "ok",
+                "active": "hybrid",
+                "provider": "hybrid",
+                "groq_model": config.GROQ_MODEL,
+                "local_model": to_model_id(_selected_local_model_path),
+            })
+
         if model == _GROQ_MODEL_OPTION or model.startswith("groq:"):
             if not config.GROQ_API_KEY:
                 return jsonify({
                     "error": "GROQ_API_KEY not set. Add it to .env before selecting Groq.",
                 }), 400
             groq_model = _groq_model_from_selection(model)
-            groq = GroqModel(model=groq_model)
-            if not groq.is_available():
-                return jsonify({
-                    "error": f"Groq API model '{groq_model}' is unavailable right now. Check internet and API key.",
-                }), 400
             _selected_backend = "groq"
             config.GROQ_MODEL = groq_model
+            config.USE_CLOUD_MODEL = False
             logger.info("Switched backend to Groq API (%s)", groq_model)
             return jsonify({
                 "status": "ok",
@@ -671,43 +734,38 @@ def create_app():
                 "groq_model": groq_model,
             })
 
-        if model == _GEMINI_MODEL_OPTION:
+        if model == _GEMINI_MODEL_OPTION or model.startswith("gemini:"):
             if not config.GEMINI_API_KEY:
                 return jsonify({
                     "error": "GEMINI_API_KEY not set. Add it to .env before selecting Gemini.",
                 }), 400
-            from models.gemini_model import GeminiModel as _GeminiModel
-            gem = _GeminiModel(model=config.GEMINI_MODEL)
-            if not gem.is_available():
-                return jsonify({
-                    "error": "Gemini API is unavailable right now. Check internet and API key.",
-                }), 400
+            gemini_model = _gemini_model_from_selection(model)
             _selected_backend = "gemini"
-            logger.info("Switched backend to Gemini API (%s)", config.GEMINI_MODEL)
+            config.GEMINI_MODEL = gemini_model
+            config.USE_CLOUD_MODEL = False
+            logger.info("Switched backend to Gemini API (%s)", gemini_model)
             return jsonify({
                 "status": "ok",
-                "active": _GEMINI_MODEL_OPTION,
+                "active": f"gemini:{gemini_model}",
                 "provider": "gemini",
-                "gemini_model": config.GEMINI_MODEL,
+                "gemini_model": gemini_model,
             })
 
-        if model == _OPENROUTER_MODEL_OPTION:
+        if model == _OPENROUTER_MODEL_OPTION or model.startswith("openrouter:"):
             if not config.OPENROUTER_API_KEY:
                 return jsonify({
                     "error": "OPENROUTER_API_KEY not set. Add it to .env before selecting OpenRouter.",
                 }), 400
-            orouter = OpenRouterModel(model=config.OPENROUTER_MODEL)
-            if not orouter.is_available():
-                return jsonify({
-                    "error": "OpenRouter API is unavailable right now. Check internet and API key.",
-                }), 400
+            openrouter_model = _openrouter_model_from_selection(model)
             _selected_backend = "openrouter"
-            logger.info("Switched backend to OpenRouter API (%s)", config.OPENROUTER_MODEL)
+            config.OPENROUTER_MODEL = openrouter_model
+            config.USE_CLOUD_MODEL = False
+            logger.info("Switched backend to OpenRouter API (%s)", openrouter_model)
             return jsonify({
                 "status": "ok",
-                "active": _OPENROUTER_MODEL_OPTION,
+                "active": f"openrouter:{openrouter_model}",
                 "provider": "openrouter",
-                "openrouter_model": config.OPENROUTER_MODEL,
+                "openrouter_model": openrouter_model,
             })
 
         resolved = resolve_model_path(model)
@@ -721,11 +779,12 @@ def create_app():
             return jsonify({"error": probe_error}), 400
 
         _selected_backend = "local"
+        config.USE_CLOUD_MODEL = False
         _selected_local_model_path = resolved
         config.LLAMA_MODEL_PATH = resolved
         active = to_model_id(resolved)
         logger.info(f"Switched local model to: {active}")
-        return jsonify({"status": "ok", "active": active})
+        return jsonify({"status": "ok", "active": active, "provider": "local"})
 
     # ─── API: Projects ────────────────────────────────────────────
     @app.route("/api/projects", methods=["GET"])
@@ -742,15 +801,37 @@ def create_app():
                         logger.warning("Skipping unreadable project state: %s", state_path)
                         continue
                     meta = state.get("metadata", {})
+                    # Calculate total chapters and word count from disk and state
+                    chap_dir = os.path.join(config.PROJECTS_DIR, name, "chapters")
+                    chap_files = []
+                    if os.path.exists(chap_dir):
+                        chap_files = [f for f in os.listdir(chap_dir) if f.startswith("chapter_") and (f.endswith(".md") or f.endswith(".txt"))]
+
+                    total_chapters = len(chap_files) or meta.get("current_chapter", 0)
+                    word_cnt = meta.get("word_count", 0)
+                    if not word_cnt and os.path.exists(chap_dir):
+                        for f in chap_files:
+                            try:
+                                with open(os.path.join(chap_dir, f), encoding="utf-8") as cf:
+                                    word_cnt += len(cf.read().split())
+                            except Exception:
+                                pass
+
                     projects.append({
                         "name": name,
-                        "title": meta.get("title", ""),
-                        "genre": meta.get("genre", ""),
-                        "current_chapter": meta.get("current_chapter", 0),
+                        "title": meta.get("title") or name.replace("_", " ").title(),
+                        "genre": meta.get("genre", "Fiction"),
+                        "premise": meta.get("premise", ""),
+                        "setting": meta.get("setting", ""),
+                        "themes": meta.get("themes", []),
+                        "current_chapter": meta.get("current_chapter", total_chapters),
+                        "total_chapters": total_chapters,
                         "total_scenes": meta.get("total_scenes_written", 0),
                         "characters": list(state.get("characters", {}).keys()),
+                        "word_count": word_cnt,
+                        "created_at": meta.get("created_at", ""),
                     })
-        return jsonify({"projects": projects})
+        return jsonify({"projects": projects, "total": len(projects)})
 
     @app.route("/api/project/create", methods=["POST"])
     def create_project():
@@ -776,49 +857,64 @@ def create_app():
     @app.route("/api/project/<name>", methods=["GET"])
     def get_project(name):
         name = normalize_project_name(name)
-        try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
-            pipeline.load_project()
-            info = pipeline.get_project_info()
-            state = pipeline.get_state()
-            
-            combine_data = None
-            project_dir = os.path.join(config.PROJECTS_DIR, name)
-            polished_path = os.path.join(project_dir, "combined_polished.md")
-            analysis_path = os.path.join(project_dir, "story_analysis.md")
-            original_path = os.path.join(project_dir, "combined_original.md")
-            
-            if os.path.exists(polished_path) and os.path.exists(analysis_path):
-                try:
-                    with open(polished_path, "r", encoding="utf-8") as f:
-                        polished_text = f.read()
-                    with open(analysis_path, "r", encoding="utf-8") as f:
-                        analysis_text = f.read()
-                    original_chars = os.path.getsize(original_path) if os.path.exists(original_path) else 0
-                    
-                    combine_data = {
-                        "analysis": analysis_text,
-                        "revised": polished_text,
-                        "original_chars": original_chars,
-                        "revised_chars": len(polished_text),
-                        "model": "Previously Combined"
-                    }
-                except Exception as e:
-                    logger.warning("Could not read combine data for %s: %s", name, e)
+        project_dir = os.path.join(config.PROJECTS_DIR, name)
+        state_path = os.path.join(project_dir, "state.json")
 
-            return jsonify({"info": info, "state": state, "combine_data": combine_data})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 404
+        if not os.path.exists(state_path):
+            return jsonify({"error": f"Project '{name}' not found"}), 404
+
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            return jsonify({"error": f"Cannot read project state: {e}"}), 500
+
+        meta = state.get("metadata", {})
+        info = {
+            "name": name,
+            "title": meta.get("title", name),
+            "genre": meta.get("genre", ""),
+            "current_chapter": meta.get("current_chapter", 0),
+            "total_scenes": meta.get("total_scenes_written", 0),
+        }
+
+        combine_data = None
+        polished_path = os.path.join(project_dir, "combined_polished.md")
+        analysis_path = os.path.join(project_dir, "story_analysis.md")
+        original_path = os.path.join(project_dir, "combined_original.md")
+
+        if os.path.exists(polished_path) and os.path.exists(analysis_path):
+            try:
+                with open(polished_path, "r", encoding="utf-8") as f:
+                    polished_text = f.read()
+                with open(analysis_path, "r", encoding="utf-8") as f:
+                    analysis_text = f.read()
+                original_chars = os.path.getsize(original_path) if os.path.exists(original_path) else 0
+
+                combine_data = {
+                    "analysis": analysis_text,
+                    "revised": polished_text,
+                    "original_chars": original_chars,
+                    "revised_chars": len(polished_text),
+                    "model": "Previously Combined"
+                }
+            except Exception as e:
+                logger.warning("Could not read combine data for %s: %s", name, e)
+
+        return jsonify({"info": info, "state": state, "combine_data": combine_data})
 
     @app.route("/api/project/<name>/state", methods=["GET"])
     def get_project_state(name):
         name = normalize_project_name(name)
+        state_path = os.path.join(config.PROJECTS_DIR, name, "state.json")
+        if not os.path.exists(state_path):
+            return jsonify({"error": f"Project '{name}' not found"}), 404
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
-            pipeline.load_project()
-            return jsonify({"state": pipeline.get_state()})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 404
+            with open(state_path, encoding="utf-8") as f:
+                state = json.load(f)
+            return jsonify({"state": state})
+        except (OSError, json.JSONDecodeError) as e:
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/project/<name>/state", methods=["PUT"])
     def update_project_state(name):
@@ -1002,7 +1098,10 @@ def create_app():
                     content = fh.read()
                 words = len(content.split())
                 chapters.append({
-                    "number": num, "filename": f,
+                    "number": num,
+                    "num": num,
+                    "title": f"Chapter {num}",
+                    "filename": f,
                     "words": words,
                     "status": "completed"
                 })
@@ -1025,6 +1124,8 @@ def create_app():
                     words = sum(len(s.get("text", "").split()) for s in scenes)
                     chapters.append({
                         "number": num,
+                        "num": num,
+                        "title": f"Chapter {num} (In Progress)",
                         "filename": f,
                         "words": words,
                         "status": "writing",
@@ -1041,14 +1142,18 @@ def create_app():
     @app.route("/api/project/<name>/chapter/<int:num>", methods=["GET"])
     def read_chapter(name, num):
         name = normalize_project_name(name)
-        try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
-            text = pipeline.read_chapter(num)
-            if text:
-                return jsonify({"chapter": num, "content": text})
+        chapters_dir = os.path.join(config.PROJECTS_DIR, name, "chapters")
+        chapter_path = os.path.join(chapters_dir, f"chapter_{num:03d}.md")
+        if not os.path.exists(chapter_path):
+            chapter_path = os.path.join(chapters_dir, f"chapter_{num:03d}.txt")
+        if not os.path.exists(chapter_path):
             return jsonify({"error": "Chapter not found"}), 404
+        try:
+            with open(chapter_path, encoding="utf-8") as f:
+                text = f.read()
+            return jsonify({"chapter": num, "content": text, "title": f"Chapter {num}"})
         except Exception as e:
-            return jsonify({"error": str(e)}), 404
+            return jsonify({"error": str(e)}), 500
 
     @app.route("/api/project/<name>/chapter/<int:num>", methods=["PUT"])
     def update_chapter(name, num):
