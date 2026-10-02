@@ -364,3 +364,57 @@ def test_premise_standalone_api_route(tmp_path, monkeypatch):
     assert data["characters"]["Vael"]["traits"] == ["relentless", "guilt-ridden"]
     assert data["story_analysis"]["mode_applied"] == "continue"
 
+
+def test_premise_architect_large_draft_beat_scaling():
+    # Simulate a 25,000-character draft with dialogue and prose
+    paragraphs = [
+        f"Paragraph {i}: The wind howled across the crags as Kael tracked the scouts through the gorge. 'Hold fast,' he whispered to his companion."
+        for i in range(250)
+    ]
+    large_draft = "\n\n".join(paragraphs)
+
+    dummy = DummyLLM(json.dumps({
+        "title": "The Northern Divide",
+        "genre": "Epic Fantasy",
+        "summary": "An epic journey across the frozen peaks.",
+        "steps": [f"Beat {i+1}: Action event across the passes" for i in range(45)],
+    }))
+
+    result = PremiseArchitect.generate(
+        idea_text=large_draft,
+        mode="auto",
+        target_beats=None,  # Auto-mode
+        llm=dummy,
+    )
+
+    assert result["status"] == "ok"
+    # Target beats should have auto-scaled to >= 45 in the prompt to prevent scene starvation
+    assert "approximately 45" in dummy.last_prompt or "approximately 60" in dummy.last_prompt
+
+
+def test_premise_architect_chapter_markers_scaling():
+    # Draft with 15 explicit chapter headings
+    chapters = [
+        f"Chapter {i}: The Citadel Gates\nElena approached the iron gates with her sword drawn."
+        for i in range(1, 16)
+    ]
+    chapter_draft = "\n\n".join(chapters)
+
+    dummy = DummyLLM(json.dumps({
+        "title": "Citadel of Shadows",
+        "genre": "Fantasy",
+        "summary": "Elena's siege on the iron citadel.",
+        "steps": [f"Beat {i+1}: Detailed scene at the gate" for i in range(34)],
+    }))
+
+    result = PremiseArchitect.generate(
+        idea_text=chapter_draft,
+        mode="continue",
+        target_beats=10,  # User passed a small number, but 15 chapters exist!
+        llm=dummy,
+    )
+
+    assert result["status"] == "ok"
+    # Target beats should have been elevated because 15 chapters cannot fit into 10 beats
+    assert "approximately 34" in dummy.last_prompt or "approximately 30" in dummy.last_prompt
+

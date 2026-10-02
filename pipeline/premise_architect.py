@@ -273,8 +273,60 @@ class PremiseArchitect:
         if resolved_mode == "auto":
             resolved_mode = "continue" if detected_draft else "rearchitect"
 
-        num_beats = target_beats or cls.DEFAULT_BEATS
-        num_beats = max(6, min(60, num_beats))
+        text_len = len(text)
+        num_beats = None
+        if target_beats and str(target_beats).lower() not in ("auto", "0", "none", "null"):
+            try:
+                num_beats = int(target_beats)
+            except (ValueError, TypeError):
+                num_beats = None
+
+        if not num_beats:
+            if text_len > 120000:
+                num_beats = 90
+            elif text_len > 80000:
+                num_beats = 75
+            elif text_len > 40000:
+                num_beats = 60
+            elif text_len > 20000:
+                num_beats = 45
+            elif text_len > 10000:
+                num_beats = 36
+            else:
+                num_beats = cls.DEFAULT_BEATS
+
+        # Detect explicit chapter/scene markers in the input text to ensure beat count matches or exceeds them
+        detected_scene_markers = len(re.findall(r'(?im)^\s*(?:chapter|scene|part|act)\s+\d+', text))
+        if detected_scene_markers > 0:
+            min_from_markers = max(detected_scene_markers * 2, detected_scene_markers + 4)
+            if min_from_markers > num_beats:
+                logger.info(
+                    "[PremiseArchitect] Detected %d chapter/scene markers in draft; elevating target beats from %d to %d",
+                    detected_scene_markers, num_beats, min_from_markers
+                )
+                num_beats = min_from_markers
+
+        # Enforce minimum scene-density beat floors for large drafts so scenes are never dropped or summarized away
+        if detected_draft or resolved_mode == "continue":
+            min_floor = 0
+            if text_len > 120000:
+                min_floor = 75
+            elif text_len > 80000:
+                min_floor = 60
+            elif text_len > 45000:
+                min_floor = 45
+            elif text_len > 20000:
+                min_floor = 30
+            elif text_len > 10000:
+                min_floor = 24
+            if min_floor > num_beats:
+                logger.info(
+                    "[PremiseArchitect] Elevating target beats from %d to %d to preserve all scenes in %d-char draft",
+                    num_beats, min_floor, text_len
+                )
+                num_beats = min_floor
+
+        num_beats = max(6, min(150, num_beats))
 
         # Format existing context
         chars_txt = cls._format_characters_context(characters)
@@ -472,26 +524,28 @@ class PremiseArchitect:
                 "Your objective:\n"
                 "1. COMPREHEND WHAT HAPPENED SO FAR: Deeply read the draft. Identify all established characters, "
                 "world rules, relationships, secrets, and events that already occurred up to the cutoff point.\n"
-                "2. FORM INITIAL BEATS (Phase 1): Map the scenes and events from the provided draft into the opening "
-                "sequential story beats. Do not skip or alter what the author already wrote!\n"
-                "3. PINPOINT THE CUTOFF: Identify the exact cliffhanger or scene where the author's writing paused.\n"
+                "2. GRANULAR SCENE-BY-SCENE DRAFT MAPPING (Phase 1):\n"
+                "   - Map EVERY single scene, encounter, conversation, confrontation, and event from the provided draft into sequential story beats.\n"
+                "   - ABSOLUTE ZERO-SCENE-DROPPING MANDATE: Do NOT summarize away, gloss over, skip, or merge scenes! "
+                "Every major conversation, discovery, decision, and location change in the author's draft MUST have its own dedicated beat "
+                "so that ZERO written scenes are omitted or lost.\n"
+                "3. PINPOINT THE EXACT CUTOFF: Identify the exact scene or cliffhanger where the author's writing paused.\n"
                 "4. ARCHITECT THE CONTINUATION & CONCLUSION (Phase 2): From the cutoff point forward, invent and plot "
                 "the subsequent beats. Escalate the core conflict, introduce necessary complications/midpoint twists, "
                 "bring the storyline through a gripping climax, and provide a satisfying emotional resolution.\n"
-                f"5. TOTAL BEATS: The full combined sequence (established beats + continuation beats) must total approximately {target_beats} beats."
+                f"5. TOTAL BEAT COUNT: Output approximately {target_beats} granular beats covering all draft scenes and continuation without dropping scenes."
             )
         else:
             mode_instructions = (
-                "MODE: RE-ARCHITECT FULL STORY FROM BEGINNING (Fresh Master Arc)\n"
+                "MODE: RE-ARCHITECT FULL STORY FROM BEGINNING (Comprehensive High-Density Master Arc)\n"
                 "The author has provided story text, draft scenes, or conceptual ideas.\n"
                 "Your objective:\n"
-                "1. GRASP CORE PREMISE & DNA: Extract the central dramatic premise, protagonist's core goal/wound, "
-                "antagonist forces, setting lore, and thematic conflicts from the input.\n"
-                "2. BUILD A COMPLETE MASTER TIMELINE FROM SCRATCH: Architect a fresh, tightly structured story timeline "
-                "starting from Chapter 1 (the beginning / ordinary world) all the way to the final resolution.\n"
-                "3. DRAMATIC STRUCTURE: Ensure proper dramatic pacing (Act I: Hook & Inciting Incident; "
-                "Act II: Rising Complications, Midpoint Shift, Dark Night of the Soul; Act III: Climax & Resolution).\n"
-                f"4. TOTAL BEATS: Exactly or approximately {target_beats} chronological scene beats."
+                "1. EXTRACT ALL DRAMATIC ASSETS: Extract all characters, relationships, locations, lore, subplots, and conflicts from the input.\n"
+                "2. HIGH SCENE DENSITY MASTER TIMELINE:\n"
+                "   - Architect a rich, comprehensive story timeline spanning from the opening hook to the final resolution.\n"
+                "   - ABSOLUTE ZERO-SCENE-DROPPING MANDATE: Do NOT skim or jump over intermediate steps. Include all pivotal dialogue scenes, character vulnerabilities, "
+                "secondary character interactions, investigations, and escalating obstacles.\n"
+                f"3. TOTAL BEAT COUNT: Output approximately {target_beats} chronological scene beats with high scene coverage."
             )
 
         json_schema_example = (
@@ -516,7 +570,7 @@ class PremiseArchitect:
             "  },\n"
             '  "steps": [\n'
             f'    "Beat 1: Clear, concrete scene description (who does what, where, and consequence)...",\n'
-            f'    "...up to {target_beats} beats..."\n'
+            f'    "...sequential beats up to ~{target_beats} total..."\n'
             "  ]\n"
             "}"
         )
@@ -531,12 +585,14 @@ class PremiseArchitect:
             f"INPUT STORY TEXT / DRAFT:\n\"\"\"\n{idea_text}\n\"\"\"\n\n"
             f"=== ARCHITECTURE DIRECTIVE ===\n"
             f"{mode_instructions}\n\n"
-            "=== BEAT QUALITY REQUIREMENTS ===\n"
+            "=== BEAT QUALITY & GRANULARITY REQUIREMENTS ===\n"
             "1. Each beat must describe a concrete, observable scene event with character agency, obstacle, and consequence.\n"
-            "2. Avoid vague generalities like 'Tension rises' or 'They talk about plans'. Instead write: 'Kael confronts Vane at the sunken docks, demanding the deciphered ledger, but Vane reveals the seal belongs to Kael’s father.'\n"
-            "3. The beats must flow in strict chronological sequence.\n"
-            "4. Do NOT output act headers (like 'Act 1:'), chapter labels, or markdown formatting inside the steps array.\n"
-            "5. Automatically extract ALL significant characters present in the text into the characters object.\n\n"
+            "2. HIGH SCENE FIDELITY: Never compress multiple scenes into a single vague beat. If the story has multiple encounters, dialogue exchanges, or investigations, give EACH distinct scene its own beat so that no scenes are missed.\n"
+            "3. Avoid vague generalities like 'Tension rises' or 'They talk about plans'. Instead write: 'Kael confronts Vane at the sunken docks, demanding the deciphered ledger, but Vane reveals the seal belongs to Kael’s father.'\n"
+            f"4. BEAT TARGET: Aim to output approximately {target_beats} complete sequential beats to ensure full scene coverage.\n"
+            "5. The beats must flow in strict chronological sequence.\n"
+            "6. Do NOT output act headers (like 'Act 1:'), chapter labels, or markdown formatting inside the steps array.\n"
+            "7. Automatically extract ALL significant characters present in the text into the characters object.\n\n"
             "=== OUTPUT FORMAT ===\n"
             "You MUST respond ONLY with a valid JSON object matching this exact schema:\n"
             f"{json_schema_example}\n"

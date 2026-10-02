@@ -655,6 +655,12 @@ function setCreateArchMode(mode) {
     });
 }
 
+function onCreateArchScopeChange() {
+    const sel = document.getElementById('createArchScope')?.value;
+    const wrap = document.getElementById('createArchCustomBeatsWrap');
+    if (wrap) wrap.style.display = sel === 'custom' ? 'block' : 'none';
+}
+
 async function generateFromDraftInCreateView() {
     const input = document.getElementById('createDraftInput');
     const text = (input?.value || '').trim();
@@ -664,8 +670,14 @@ async function generateFromDraftInCreateView() {
         return;
     }
 
-    const scopeSel = document.getElementById('createArchScope')?.value || '8';
-    const targetChapters = parseInt(scopeSel, 10);
+    const scopeSel = document.getElementById('createArchScope')?.value || 'auto';
+    let targetChapters = null;
+    let targetBeats = null;
+    if (scopeSel === 'custom') {
+        targetBeats = parseInt(document.getElementById('createArchCustomBeats')?.value || '48', 10);
+    } else if (scopeSel !== 'auto') {
+        targetChapters = parseInt(scopeSel, 10);
+    }
     const btn = document.getElementById('btnCreateArchGenerate');
     const banner = document.getElementById('createDraftGraspBanner');
 
@@ -676,17 +688,20 @@ async function generateFromDraftInCreateView() {
     if (banner) banner.style.display = 'none';
 
     try {
+        const reqBody = {
+            idea_text: text,
+            mode: createArchMode,
+            model: typeof activeModel !== 'undefined' ? activeModel : null,
+            setting: document.getElementById('createSetting')?.value || '',
+            themes: (document.getElementById('createThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean),
+        };
+        if (targetBeats) reqBody.target_beats = targetBeats;
+        if (targetChapters) reqBody.target_chapters = targetChapters;
+
         const res = await fetch('/api/premise/generate', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                idea_text: text,
-                mode: createArchMode,
-                target_chapters: targetChapters,
-                model: typeof activeModel !== 'undefined' ? activeModel : null,
-                setting: document.getElementById('createSetting')?.value || '',
-                themes: (document.getElementById('createThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean),
-            }),
+            body: JSON.stringify(reqBody),
         });
 
         const data = await res.json();
@@ -1156,12 +1171,12 @@ async function aiGeneratePremise() {
         return;
     }
 
-    const scopeSel = document.getElementById('premiseTargetScope')?.value || '8';
+    const scopeSel = document.getElementById('premiseTargetScope')?.value || 'auto';
     let targetBeats = null;
     let targetChapters = null;
     if (scopeSel === 'custom') {
-        targetBeats = parseInt(document.getElementById('premiseCustomBeats')?.value || '18', 10);
-    } else {
+        targetBeats = parseInt(document.getElementById('premiseCustomBeats')?.value || '48', 10);
+    } else if (scopeSel !== 'auto') {
         targetChapters = parseInt(scopeSel, 10);
     }
 
@@ -1174,20 +1189,22 @@ async function aiGeneratePremise() {
     }
 
     try {
+        const reqBody = {
+            idea_text: text,
+            mode: premiseMode,
+            model: activeModel,
+            apply_to_bible: autoSync,
+            characters: premiseCharacters,
+            setting: document.getElementById('premiseSetting')?.value || '',
+            themes: (document.getElementById('premiseThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean)
+        };
+        if (targetBeats) reqBody.target_beats = targetBeats;
+        if (targetChapters) reqBody.target_chapters = targetChapters;
+
         const res = await fetch(`/api/project/${currentProject}/premise/generate`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                idea_text: text,
-                mode: premiseMode,
-                target_chapters: targetChapters,
-                target_beats: targetBeats,
-                model: activeModel,
-                apply_to_bible: autoSync,
-                characters: premiseCharacters,
-                setting: document.getElementById('premiseSetting')?.value || '',
-                themes: (document.getElementById('premiseThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean)
-            }),
+            body: JSON.stringify(reqBody),
         });
 
         const data = await res.json();

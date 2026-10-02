@@ -40,7 +40,8 @@ export function Premise({
   const [setting, setSetting] = useState("");
   const [themes, setThemes] = useState("");
   const [mode, setMode] = useState<"continue" | "rearchitect" | "auto">("continue");
-  const [targetChapters, setTargetChapters] = useState(8);
+  const [targetScope, setTargetScope] = useState<string>("auto");
+  const [customBeats, setCustomBeats] = useState<number>(48);
   const [storyGrasp, setStoryGrasp] = useState<{
     mode_applied?: string;
     cutoff_point?: string;
@@ -86,17 +87,23 @@ export function Premise({
           central_conflict?: string;
         };
       }
+      const payload: Record<string, any> = {
+        idea_text: idea,
+        mode,
+        apply_to_bible: true,
+        setting,
+        themes: splitList(themes),
+      };
+      if (targetScope === "custom") {
+        payload.target_beats = customBeats;
+      } else if (targetScope !== "auto") {
+        payload.target_chapters = Number(targetScope);
+      }
+
       const result = await send<GenResult>(
         projectUrl(project, `/premise/${actionType}`),
         actionType === "generate"
-          ? {
-              idea_text: idea,
-              mode,
-              target_chapters: targetChapters,
-              apply_to_bible: true,
-              setting,
-              themes: splitList(themes),
-            }
+          ? payload
           : { steps, setting, themes: splitList(themes) },
       );
 
@@ -158,13 +165,34 @@ export function Premise({
 
           <Field label="Story Scope">
             <select
-              value={targetChapters}
-              onChange={(e) => setTargetChapters(Number(e.target.value))}
+              value={targetScope}
+              onChange={(e) => setTargetScope(e.target.value)}
             >
-              <option value={5}>Short Story (5 Ch / ~15 Beats)</option>
-              <option value={8}>Standard Story (8 Ch / ~24 Beats)</option>
-              <option value={12}>Novella / Epic (12 Ch / ~36 Beats)</option>
+              <option value="auto">⚡ Auto (Match Draft Density & Length)</option>
+              <option value="5">Short Story (5 Ch / ~15 Beats)</option>
+              <option value="8">Standard Story (8 Ch / ~24 Beats)</option>
+              <option value="12">Novella (12 Ch / ~36 Beats)</option>
+              <option value="16">Full Novel (16 Ch / ~48 Beats)</option>
+              <option value="20">Extended Novel (20 Ch / ~60 Beats)</option>
+              <option value="25">Epic Saga (25 Ch / ~75 Beats)</option>
+              <option value="30">Dense Chronicle (30 Ch / ~90 Beats)</option>
+              <option value="40">Massive Manuscript (40 Ch / ~120 Beats)</option>
+              <option value="50">Mega Narrative (50 Ch / ~150 Beats)</option>
+              <option value="custom">Custom Beat Count...</option>
             </select>
+            {targetScope === "custom" && (
+              <div style={{ marginTop: "6px" }}>
+                <input
+                  type="number"
+                  min={6}
+                  max={150}
+                  value={customBeats}
+                  onChange={(e) => setCustomBeats(Math.max(6, Math.min(150, Number(e.target.value) || 6)))}
+                  placeholder="Beat count (6-150)"
+                  style={{ width: "100%", padding: "6px 10px", fontSize: "0.85rem" }}
+                />
+              </div>
+            )}
           </Field>
 
           <Field label="Story draft or rough notes">

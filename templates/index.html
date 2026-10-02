@@ -249,11 +249,22 @@
                             </div>
                             <div>
                                 <label class="form-label" style="font-size: 0.8rem; margin-bottom: 4px;">Story Scope</label>
-                                <select class="form-select form-select-sm" id="createArchScope">
+                                <select class="form-select form-select-sm" id="createArchScope" onchange="onCreateArchScopeChange()">
+                                    <option value="auto" selected>⚡ Auto (Match Draft Density & Length)</option>
                                     <option value="5">Short Story (5 Ch / ~15 Beats)</option>
-                                    <option value="8" selected>Standard Story (8 Ch / ~24 Beats)</option>
-                                    <option value="12">Novella / Epic (12 Ch / ~36 Beats)</option>
+                                    <option value="8">Standard Story (8 Ch / ~24 Beats)</option>
+                                    <option value="12">Novella (12 Ch / ~36 Beats)</option>
+                                    <option value="16">Full Novel (16 Ch / ~48 Beats)</option>
+                                    <option value="20">Extended Novel (20 Ch / ~60 Beats)</option>
+                                    <option value="25">Epic Saga (25 Ch / ~75 Beats)</option>
+                                    <option value="30">Dense Chronicle (30 Ch / ~90 Beats)</option>
+                                    <option value="40">Massive Manuscript (40 Ch / ~120 Beats)</option>
+                                    <option value="50">Mega Narrative (50 Ch / ~150 Beats)</option>
+                                    <option value="custom">Custom Beat Count...</option>
                                 </select>
+                                <div id="createArchCustomBeatsWrap" style="display:none; margin-top:4px;">
+                                    <input type="number" class="form-input form-input-sm" id="createArchCustomBeats" min="6" max="150" value="48" placeholder="Beat count (6-150)">
+                                </div>
                             </div>
                         </div>
 
@@ -428,15 +439,22 @@
                         <div class="form-group">
                             <label class="form-label text-xs">Story Scope</label>
                             <select class="form-select text-xs" id="premiseTargetScope" onchange="onPremiseScopeChange()">
+                                <option value="auto" selected>⚡ Auto (Match Draft Density & Length)</option>
                                 <option value="5">Short Story (5 Ch / ~15 Beats)</option>
-                                <option value="8" selected>Standard Story (8 Ch / ~24 Beats)</option>
-                                <option value="12">Novella / Epic (12 Ch / ~36 Beats)</option>
+                                <option value="8">Standard Story (8 Ch / ~24 Beats)</option>
+                                <option value="12">Novella (12 Ch / ~36 Beats)</option>
+                                <option value="16">Full Novel (16 Ch / ~48 Beats)</option>
+                                <option value="20">Extended Novel (20 Ch / ~60 Beats)</option>
+                                <option value="25">Epic Saga (25 Ch / ~75 Beats)</option>
+                                <option value="30">Dense Chronicle (30 Ch / ~90 Beats)</option>
+                                <option value="40">Massive Manuscript (40 Ch / ~120 Beats)</option>
+                                <option value="50">Mega Narrative (50 Ch / ~150 Beats)</option>
                                 <option value="custom">Custom Beat Count...</option>
                             </select>
                         </div>
                         <div class="form-group" id="premiseCustomBeatsWrap" style="display:none;">
                             <label class="form-label text-xs">Beats</label>
-                            <input type="number" class="form-input text-xs" id="premiseCustomBeats" min="6" max="60" value="18">
+                            <input type="number" class="form-input text-xs" id="premiseCustomBeats" min="6" max="150" value="48">
                         </div>
                         <div class="form-group flex items-center" style="padding-top:16px;">
                             <label class="flex items-center gap-2 cursor-pointer text-xs" title="Automatically extract discovered characters, setting & themes into Story Bible">

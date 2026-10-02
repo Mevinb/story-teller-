@@ -1282,11 +1282,20 @@ def create_app():
             setting = data.get("setting", "")
             themes = data.get("themes", [])
 
-            if target_chapters and not target_beats:
+            if target_beats and str(target_beats).lower() not in ("auto", "0", "none", "null", ""):
                 try:
-                    target_beats = int(target_chapters) * config.PREMISE_STEPS_PER_CHAPTER
+                    target_beats = int(target_beats)
                 except (ValueError, TypeError):
-                    pass
+                    target_beats = None
+            else:
+                target_beats = None
+
+            if not target_beats and target_chapters:
+                try:
+                    if str(target_chapters).lower() not in ("auto", "0", "none", "null", ""):
+                        target_beats = int(target_chapters) * config.PREMISE_STEPS_PER_CHAPTER
+                except (ValueError, TypeError):
+                    target_beats = None
 
             logger.info(
                 "Standalone premise request: model=%s, idea_chars=%d, mode=%s, chapters=%s, beats=%s",
@@ -1326,11 +1335,20 @@ def create_app():
             mode = data.get("mode", "auto")
             target_chapters = data.get("target_chapters")
             target_beats = data.get("target_beats")
-            if target_chapters and not target_beats:
+            if target_beats and str(target_beats).lower() not in ("auto", "0", "none", "null", ""):
                 try:
-                    target_beats = int(target_chapters) * config.PREMISE_STEPS_PER_CHAPTER
+                    target_beats = int(target_beats)
                 except (ValueError, TypeError):
-                    pass
+                    target_beats = None
+            else:
+                target_beats = None
+
+            if not target_beats and target_chapters:
+                try:
+                    if str(target_chapters).lower() not in ("auto", "0", "none", "null", ""):
+                        target_beats = int(target_chapters) * config.PREMISE_STEPS_PER_CHAPTER
+                except (ValueError, TypeError):
+                    target_beats = None
 
             logger.info(
                 "Project premise request [%s]: model=%s, idea_chars=%d, mode=%s",
