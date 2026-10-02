@@ -36,7 +36,13 @@
                     <button class="bible-tab-btn" onclick="filterModalModels('hybrid')">🔀 Hybrid</button>
                 </div>
                 <div id="modalModelCardsContainer" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px;">
-                    <!-- Dynamic Model Cards Injected Here -->
+                    {% for model in groq_models %}
+                    <button class="card" style="cursor:pointer;padding:16px;text-align:left;" onclick='switchModel({{ ("groq:" ~ model.id)|tojson }})'>
+                        <span class="model-picker-badge badge-groq">GROQ</span>
+                        <strong style="display:block;margin-top:8px;">⚡ {{ model.name }}</strong>
+                        <span class="text-xs text-dim">{{ model.id }} · {{ model.context }}</span>
+                    </button>
+                    {% endfor %}
                 </div>
             </div>
             <div class="modal-footer">
@@ -225,6 +231,43 @@
                         <span class="card-title"><span class="icon">✨</span> Create New Story Project</span>
                     </div>
 
+                    <!-- Story Architect Assistant for New Stories -->
+                    <div style="background: rgba(139, 92, 246, 0.08); border: 1px solid rgba(139, 92, 246, 0.35); border-radius: 8px; padding: 16px; margin-bottom: 20px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom: 10px;">
+                            <span style="font-weight: 600; color: #c4b5fd; font-size: 1.05rem;">✨ Story Architect — Generate from Draft or Notes</span>
+                            <span class="text-xs text-dim">Auto-fills title, genre, premise beats, setting & cast</span>
+                        </div>
+
+                        <div style="display:grid; grid-template-columns: 1.2fr 0.8fr; gap: 12px; margin-bottom: 12px;">
+                            <div>
+                                <label class="form-label" style="font-size: 0.8rem; margin-bottom: 4px;">Generation Strategy</label>
+                                <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 6px;">
+                                    <button type="button" class="btn btn-secondary btn-sm active" id="btnCreateArchContinue" onclick="setCreateArchMode('continue')" title="Grasp written scenes from half-made story and finish the rest of the story">⏩ Continue Draft</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" id="btnCreateArchRearchitect" onclick="setCreateArchMode('rearchitect')" title="Extract premise & characters, rebuild full story from Chapter 1 to finale">🔄 From Start</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" id="btnCreateArchAuto" onclick="setCreateArchMode('auto')" title="Auto-detect draft vs idea">⚡ Auto</button>
+                                </div>
+                            </div>
+                            <div>
+                                <label class="form-label" style="font-size: 0.8rem; margin-bottom: 4px;">Story Scope</label>
+                                <select class="form-select form-select-sm" id="createArchScope">
+                                    <option value="5">Short Story (5 Ch / ~15 Beats)</option>
+                                    <option value="8" selected>Standard Story (8 Ch / ~24 Beats)</option>
+                                    <option value="12">Novella / Epic (12 Ch / ~36 Beats)</option>
+                                </select>
+                            </div>
+                        </div>
+
+                        <div class="form-group mb-2">
+                            <label class="form-label" style="font-size: 0.85rem;">Paste half-made story, written scenes, or raw outline</label>
+                            <textarea class="form-textarea" id="createDraftInput" rows="5" placeholder="Paste your unfinished story draft, scene text, or plot dump here. The Story Architect will grasp the story, extract characters and lore, and populate the entire story blueprint below..."></textarea>
+                        </div>
+
+                        <button type="button" class="btn btn-primary" id="btnCreateArchGenerate" onclick="generateFromDraftInCreateView()">
+                            ✨ Generate & Auto-Fill Story Details
+                        </button>
+                        <div id="createDraftGraspBanner" style="display:none; margin-top: 10px; padding: 10px; background: rgba(139, 92, 246, 0.15); border-radius: 6px; font-size: 0.85rem;"></div>
+                    </div>
+
                     <div class="grid-cols-2" style="display:grid;grid-template-columns:1.2fr 0.8fr;gap:20px;">
                         <div class="form-group">
                             <label class="form-label">Story Title</label>
@@ -358,47 +401,106 @@
                 <!-- Left: Outline Dump & Lore Context -->
                 <div class="card flex flex-col gap-3">
                     <div class="card-header" style="border-bottom:1px solid var(--border-subtle);padding-bottom:14px;">
-                        <span class="card-title"><span class="icon">🎬</span> Story Lore & Rough Outline</span>
+                        <span class="card-title"><span class="icon">🎬</span> Story Lore & Premise Architect</span>
                     </div>
 
+                    <!-- Mode Selector: Continue vs Rearchitect vs Auto -->
                     <div class="form-group">
-                        <label class="form-label">Setting Context</label>
-                        <input class="form-input" id="premiseSetting" placeholder="e.g., Victorian London, 1888">
+                        <label class="form-label">
+                            <span>Architecture Strategy</span>
+                            <span class="text-xs text-dim">How to process your story text</span>
+                        </label>
+                        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;">
+                            <button type="button" class="btn btn-sm premise-mode-btn active" id="btnModeContinue" onclick="setPremiseMode('continue')" title="Preserve written scenes from half-made story, then architect remaining beats to the climax">
+                                ⏩ Continue Draft
+                            </button>
+                            <button type="button" class="btn btn-sm premise-mode-btn" id="btnModeRearchitect" onclick="setPremiseMode('rearchitect')" title="Extract premise & characters, rebuild full story from Chapter 1 to finale">
+                                🔄 Start from Beg.
+                            </button>
+                            <button type="button" class="btn btn-sm premise-mode-btn" id="btnModeAuto" onclick="setPremiseMode('auto')" title="Intelligently auto-detect whether input is a draft or concept">
+                                ⚡ Auto-Detect
+                            </button>
+                        </div>
                     </div>
 
-                    <div class="form-group">
-                        <label class="form-label">Themes</label>
-                        <input class="form-input" id="premiseThemes" placeholder="e.g., betrayal, redemption, power">
-                    </div>
-
-                    <div class="form-group">
-                        <label class="form-label">Cast Characters</label>
-                        <div id="premiseCharactersList" class="flex gap-2" style="flex-wrap:wrap;max-height:110px;overflow-y:auto;padding:8px;background:rgba(0,0,0,0.2);border-radius:var(--radius-sm);border:1px solid var(--border-subtle);">
-                            <span class="text-dim text-xs">No characters loaded.</span>
+                    <!-- Scope and Sync Controls -->
+                    <div style="display:grid;grid-template-columns:1.2fr 0.8fr;gap:12px;">
+                        <div class="form-group">
+                            <label class="form-label text-xs">Story Scope</label>
+                            <select class="form-select text-xs" id="premiseTargetScope" onchange="onPremiseScopeChange()">
+                                <option value="5">Short Story (5 Ch / ~15 Beats)</option>
+                                <option value="8" selected>Standard Story (8 Ch / ~24 Beats)</option>
+                                <option value="12">Novella / Epic (12 Ch / ~36 Beats)</option>
+                                <option value="custom">Custom Beat Count...</option>
+                            </select>
+                        </div>
+                        <div class="form-group" id="premiseCustomBeatsWrap" style="display:none;">
+                            <label class="form-label text-xs">Beats</label>
+                            <input type="number" class="form-input text-xs" id="premiseCustomBeats" min="6" max="60" value="18">
+                        </div>
+                        <div class="form-group flex items-center" style="padding-top:16px;">
+                            <label class="flex items-center gap-2 cursor-pointer text-xs" title="Automatically extract discovered characters, setting & themes into Story Bible">
+                                <input type="checkbox" id="premiseAutoSyncBible" checked style="accent-color:var(--accent-purple);">
+                                <span>Auto-sync Lore</span>
+                            </label>
                         </div>
                     </div>
 
                     <div class="form-group" style="flex:1;display:flex;flex-direction:column;">
                         <label class="form-label">
-                            <span>Rough Story Idea / Timeline Dump</span>
-                            <span class="text-xs text-dim">Unstructured notes, chapter ideas, or bullet beats</span>
+                            <span>Story Input / Manuscript Dump</span>
+                            <span class="text-xs text-dim">Paste half-made story, written scenes, notes, or outline</span>
                         </label>
-                        <textarea class="form-textarea" id="premiseIdeaText" rows="10" style="flex:1;font-family:var(--font-serif);font-size:0.9rem;"
-                            placeholder="Paste or dump your stream-of-consciousness story ideas, plot points, twists, or rough chapter outlines. The AI Story Architect will parse and organize them into chronological narrative beats..."></textarea>
+                        <textarea class="form-textarea" id="premiseIdeaText" rows="8" style="flex:1;font-family:var(--font-serif);font-size:0.9rem;"
+                            placeholder="Paste your half-made story draft, written chapters, scene notes, or premise outline here. The Master Story Architect will grasp characters, lore, and current narrative progress, then architect the complete timeline..."></textarea>
                     </div>
 
                     <button class="btn btn-primary w-full" id="btnPremiseGenerate" onclick="aiGeneratePremise()">
-                        ✨ Generate Structured Beats from Outline
+                        ✨ Architect Complete Story Timeline
                     </button>
+
+                    <!-- Story Lore Context Accordion/Section -->
+                    <div style="border-top:1px solid var(--border-subtle);padding-top:10px;">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="text-xs font-bold uppercase tracking-wider text-dim">Story Bible Lore & Context</span>
+                            <button type="button" class="btn btn-xs btn-secondary" onclick="syncPremiseLoreToBible()" title="Save setting, themes, and characters to project">💾 Sync Bible</button>
+                        </div>
+                        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:8px;">
+                            <div class="form-group">
+                                <label class="form-label text-xs">Setting Context</label>
+                                <input class="form-input text-xs" id="premiseSetting" placeholder="e.g., Victorian London, 1888">
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label text-xs">Themes</label>
+                                <input class="form-input text-xs" id="premiseThemes" placeholder="e.g., betrayal, redemption">
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label text-xs">Cast Characters</label>
+                            <div id="premiseCharactersList" class="flex gap-2" style="flex-wrap:wrap;max-height:85px;overflow-y:auto;padding:6px;background:rgba(0,0,0,0.2);border-radius:var(--radius-sm);border:1px solid var(--border-subtle);">
+                                <span class="text-dim text-xs">No characters loaded.</span>
+                            </div>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- Right: Timeline Beats Editor -->
                 <div class="card flex flex-col gap-3" style="min-height:640px;">
                     <div class="card-header" style="border-bottom:1px solid var(--border-subtle);padding-bottom:14px;">
                         <span class="card-title"><span class="icon">📋</span> Narrative Timeline Beats</span>
-                        <div class="flex gap-2">
+                        <div class="flex gap-2 items-center">
+                            <span id="premiseBeatsCounter" class="text-xs text-dim">0 beats</span>
                             <button class="btn btn-sm btn-secondary" onclick="addBlankPremiseStep()">➕ Add Beat</button>
                         </div>
+                    </div>
+
+                    <!-- Story Grasp Banner (Dynamic) -->
+                    <div id="premiseGraspBanner" class="hidden" style="background:rgba(139,92,246,0.12);border:1px solid rgba(139,92,246,0.3);border-radius:var(--radius-sm);padding:10px 14px;font-size:0.85rem;">
+                        <div class="flex justify-between items-center mb-1">
+                            <strong style="color:var(--accent-purple);" id="premiseGraspTitle">🎯 Story Grasp & Strategy</strong>
+                            <span class="text-xs text-dim" id="premiseGraspType">Draft Continued</span>
+                        </div>
+                        <div id="premiseGraspDetails" class="text-xs text-dim" style="line-height:1.4;"></div>
                     </div>
 
                     <p class="text-xs text-dim" style="margin-bottom:0;">
@@ -406,11 +508,11 @@
                     </p>
 
                     <!-- Timeline beats stream -->
-                    <div id="premiseTimelineContainer" style="flex:1;overflow-y:auto;max-height:480px;display:flex;flex-direction:column;gap:10px;padding-right:4px;">
+                    <div id="premiseTimelineContainer" style="flex:1;overflow-y:auto;max-height:460px;display:flex;flex-direction:column;gap:10px;padding-right:4px;">
                         <div class="empty-state">
                             <span class="icon">📋</span>
                             <h3>No beats generated yet</h3>
-                            <p>Enter your outline on the left and click "Generate Structured Beats" to populate your timeline.</p>
+                            <p>Enter your outline or half-made story on the left and click "Architect Complete Story Timeline".</p>
                         </div>
                     </div>
 
@@ -696,6 +798,7 @@
                             <button class="btn btn-sm btn-secondary" onclick="adjustReaderFontSize(1)" title="Increase Font">A+</button>
                             <button class="btn btn-sm btn-secondary" onclick="toggleReaderTheme()" id="btnReaderTheme" title="Switch Theme">🎨 Theme</button>
                             <button class="btn btn-sm btn-secondary" onclick="toggleReaderFont()" id="btnReaderFont" title="Switch Font">🔤 Font</button>
+                            <button class="btn btn-sm btn-secondary" onclick="document.getElementById('readerContentImagePrompts')?.scrollIntoView({behavior:'smooth',block:'start'})" title="View scene image prompts">🖼️ Image prompts</button>
                             <button class="btn btn-sm btn-secondary" onclick="toggleReaderFullscreen()" title="Fullscreen Mode">📺 Fullscreen</button>
                             <button class="btn btn-sm btn-secondary" id="btnReaderEdit" onclick="toggleReaderEdit()" title="Edit Chapter">✏️ Edit</button>
                             <button class="btn btn-sm btn-success hidden" id="btnReaderSave" onclick="saveReaderEdit()">💾 Save</button>
@@ -1007,26 +1110,53 @@
 
                 <!-- Settings Grid -->
                 <div class="settings-grid-layout">
-                    <!-- Card 1: API Keys -->
+                    <!-- Card 1: API Keys & Multi-Account Rotation -->
                     <div class="card">
-                        <div class="card-header" style="margin-bottom:14px;">
-                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">🔑</span> API Credentials</span>
+                        <div class="card-header" style="margin-bottom:14px; display:flex; justify-content:space-between; align-items:center;">
+                            <span class="card-title" style="font-size:0.95rem;"><span class="icon">🔑</span> API Credentials & Key Rotation</span>
+                            <button type="button" class="btn btn-sm btn-outline" id="btnRefreshKeyStatus" style="font-size:0.75rem; padding:2px 8px;">🔄 Refresh Status</button>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">Key Rotation Strategy</label>
+                            <select class="form-select" id="setting_KEY_ROTATION_STRATEGY" data-setting="KEY_ROTATION_STRATEGY">
+                                <option value="round_robin">Round Robin (Even load balancing across accounts)</option>
+                                <option value="least_recently_used">Least Recently Used (Pick account that rested longest)</option>
+                                <option value="least_loaded">Least Loaded (Pick account with lowest token usage)</option>
+                            </select>
                         </div>
                         <div class="form-group">
                             <label class="form-label">Groq Primary API Key</label>
                             <input class="form-input" type="password" id="setting_GROQ_API_KEY" data-setting="GROQ_API_KEY" placeholder="gsk_...">
                         </div>
                         <div class="form-group">
-                            <label class="form-label">Groq Key Rotation Pool (comma-separated)</label>
-                            <textarea class="form-textarea" id="setting_GROQ_API_KEYS" data-setting="GROQ_API_KEYS" rows="2" placeholder="gsk_key1, gsk_key2, gsk_key3..."></textarea>
+                            <label class="form-label">Groq Multi-Account Key Pool (comma-separated keys from different accounts)</label>
+                            <textarea class="form-textarea" id="setting_GROQ_API_KEYS" data-setting="GROQ_API_KEYS" rows="2" placeholder="gsk_acc1..., gsk_acc2..., gsk_acc3..."></textarea>
                         </div>
                         <div class="form-group">
                             <label class="form-label">Google Gemini API Key</label>
                             <input class="form-input" type="password" id="setting_GEMINI_API_KEY" data-setting="GEMINI_API_KEY" placeholder="AIza...">
                         </div>
                         <div class="form-group">
+                            <label class="form-label">Gemini Multi-Account Key Pool (comma-separated keys from different accounts)</label>
+                            <textarea class="form-textarea" id="setting_GEMINI_API_KEYS" data-setting="GEMINI_API_KEYS" rows="2" placeholder="AIza_acc1..., AIza_acc2..."></textarea>
+                        </div>
+                        <div class="form-group">
                             <label class="form-label">OpenRouter API Key</label>
                             <input class="form-input" type="password" id="setting_OPENROUTER_API_KEY" data-setting="OPENROUTER_API_KEY" placeholder="sk-or-...">
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">OpenRouter Multi-Account Key Pool (comma-separated keys from different accounts)</label>
+                            <textarea class="form-textarea" id="setting_OPENROUTER_API_KEYS" data-setting="OPENROUTER_API_KEYS" rows="2" placeholder="sk-or-acc1..., sk-or-acc2..."></textarea>
+                        </div>
+                        <!-- Live Account Health Dashboard -->
+                        <div id="keyRotationDashboard" style="margin-top:14px; padding:10px; background:rgba(0,0,0,0.2); border-radius:6px; border:1px solid rgba(255,255,255,0.08);">
+                            <div style="font-size:0.8rem; font-weight:600; margin-bottom:6px; display:flex; justify-content:space-between; align-items:center;">
+                                <span>⚡ Multi-Account Health & Rotation Status</span>
+                                <span id="keyStatusSummaryText" style="font-size:0.75rem; color:var(--text-muted, #aaa);"></span>
+                            </div>
+                            <div id="keyStatusCards" style="display:flex; flex-direction:column; gap:6px; font-size:0.78rem;">
+                                <em>Click Refresh to view active accounts...</em>
+                            </div>
                         </div>
                     </div>
 
@@ -1042,13 +1172,9 @@
                         <div class="form-group">
                             <label class="form-label">Groq Model</label>
                             <select class="form-select" id="setting_GROQ_MODEL" data-setting="GROQ_MODEL">
-                                <option value="qwen/qwen3.8-27b">qwen/qwen3.8-27b (Strong & Fast)</option>
-                                <option value="openai/gpt-oss-120b">openai/gpt-oss-120b (Largest OSS)</option>
-                                <option value="llama-3.3-70b-versatile">llama-3.3-70b-versatile (Meta 70B)</option>
-                                <option value="llama-3.1-8b-instant">llama-3.1-8b-instant (Ultra Fast)</option>
-                                <option value="openai/gpt-oss-20b">openai/gpt-oss-20b</option>
-                                <option value="qwen/qwen3.6-27b">qwen/qwen3.6-27b</option>
-                                <option value="allam-2-7b">allam-2-7b</option>
+                                {% for model in groq_models %}
+                                <option value="{{ model.id }}">{{ model.name }} ({{ model.id }})</option>
+                                {% endfor %}
                             </select>
                         </div>
                         <div class="form-group">
@@ -1159,6 +1285,6 @@
         </div>
     </footer>
 
-    <script src="/static/js/app.js?v=12"></script>
+    <script src="/static/js/app.js?v=16"></script>
 </body>
 </html>

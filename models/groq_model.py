@@ -2,7 +2,6 @@
 Groq Cloud wrapper using OpenAI-compatible SDK.
 Primary backend for cloud prose generation.
 """
-import collections
 import json
 import logging
 import threading
@@ -16,552 +15,393 @@ from .base import (
     ContentBlockedError,
     LLMInterface,
     LLMResponse,
-    RateLimitTracker,
     ReasoningStreamFilter,
     parse_retry_after_seconds,
 )
 from pipeline.errors import PipelineCancelledError
+from .key_rotator import KeyRotator
+from .quota_scheduler import QuotaScheduler, QuotaDeferred, reset_seconds
+from logger import get_logger, log_llm_call
 
-logger = logging.getLogger(__name__)
+logger = get_logger("groq")
+
+
+_groq_rotator = KeyRotator(
+    provider="groq",
+    keys=config.GROQ_API_KEYS,
+    strategy=getattr(config, "KEY_ROTATION_STRATEGY", "least_loaded"),
+)
+
+
+def quota_group_for_key(key: str) -> str:
+    """Returns an isolated quota group per account so multiple accounts do not stall each other."""
+    if not key:
+        return config.GROQ_QUOTA_GROUP
+    keys = GroqKeyManager.get_keys()
+    if len(keys) > 1 and key in keys:
+        return f"{config.GROQ_QUOTA_GROUP}:acc_{keys.index(key)}"
+    return config.GROQ_QUOTA_GROUP
 
 
 class GroqKeyManager:
-    """Manages rotation of multiple Groq API keys."""
-    _current_idx = 0
-    _rotate_lock = threading.Lock()
+    """Manages rotation, failover, and health tracking across multiple Groq accounts."""
+    rotator = _groq_rotator
 
     @classmethod
-    def get_keys(cls):
-        return config.GROQ_API_KEYS
+    def sync_keys(cls, keys=None):
+        if keys is None:
+            keys = config.GROQ_API_KEYS
+        else:
+            config.GROQ_API_KEYS = [k.strip() for k in keys if k.strip()]
+            if config.GROQ_API_KEYS:
+                config.GROQ_API_KEY = config.GROQ_API_KEYS[0]
+        cls.rotator.set_keys(keys)
 
     @classmethod
-    def get_key(cls) -> str:
-        keys = cls.get_keys()
-        if not keys:
+    def get_keys(cls) -> list:
+        keys = cls.rotator.get_keys()
+        if not keys and config.GROQ_API_KEY:
+            return [config.GROQ_API_KEY]
+        return keys
+
+    @classmethod
+    def get_key(cls, proactive_rotate: bool = False, model: Optional[str] = None, estimated_tokens: int = 0) -> str:
+        key = cls.rotator.get_key(proactive_rotate=proactive_rotate, model=model, estimated_tokens=estimated_tokens)
+        if not key:
             return config.GROQ_API_KEY
-        return keys[cls._current_idx % len(keys)]
+        return key
 
     @classmethod
-    def rotate(cls):
-        with cls._rotate_lock:
-            keys = cls.get_keys()
-            if not keys or len(keys) < 2:
-                return False
-            cls._current_idx = (cls._current_idx + 1) % len(keys)
-            logger.info(f"Rotating to Groq API key #{cls._current_idx + 1} ({cls.get_key()[:8]}...)")
-            return True
+    def get_active_account(cls, proactive_rotate: bool = False, model: Optional[str] = None, estimated_tokens: int = 0):
+        return cls.rotator.get_active_account(proactive_rotate=proactive_rotate, model=model, estimated_tokens=estimated_tokens)
+
+    @classmethod
+    def rotate(cls) -> bool:
+        return cls.rotator.rotate()
+
+    @classmethod
+    def mark_rate_limited(
+        cls,
+        key: str,
+        retry_after: float,
+        is_daily: bool = False,
+        header_limit: Optional[int] = None,
+        model: Optional[str] = None,
+    ):
+        return cls.rotator.mark_rate_limited(key, retry_after, is_daily, header_limit, model)
+
+    @classmethod
+    def mark_success(cls, key: str, tokens: int = 0):
+        cls.rotator.mark_success(key, tokens)
+
+    @classmethod
+    def mark_error(cls, key: str, error: Exception):
+        cls.rotator.mark_error(key, error)
+
+    @classmethod
+    def are_all_daily_exhausted(cls) -> bool:
+        return cls.rotator.are_all_daily_exhausted()
+
+    @classmethod
+    def status_summary(cls):
+        return cls.rotator.status_summary()
 
 
 class GroqModel(ReasoningStreamFilter, LLMInterface):
-    """Cloud LLM via Groq API. Fast inference on large models."""
+    """One admission/usage path for normal and streaming Groq requests."""
 
-    def __init__(self, model: str = None, api_key: str = None):
+    def __init__(self, model=None, api_key=None, scheduler=None):
         self.model = model or config.GROQ_MODEL
         self._custom_api_key = api_key
         self._client = None
+        self._client_lock = threading.Lock()
         self._content_blocked = False
-
-    # Shared, thread-safe cooldown / min-interval bookkeeping.
-    _rl = RateLimitTracker()
-
-    # ─── Adaptive TPM budget ─────────────────────────────────────────────────
-    # Groq quotas are PER (model, key): llama-3.3-70b and qwen3 each have their
-    # own TPM window on the same key. Every tracker below is keyed by
-    # (model, key) so switching models never inherits another model's budget.
-    _tpm_lock = threading.Lock()
-    _tpm_usage = {}  # (model, key) -> deque[(timestamp, tokens)]
-
-    @classmethod
-    def _tpm_now(cls) -> float:
-        return time.time()
-
-    def _track_id(self, key: Optional[str] = None) -> str:
-        """Composite identity for rate-limit trackers: (model, key)."""
-        return f"{self.model}::{key or self.api_key or 'default'}"
-
-    @classmethod
-    def _prune_tpm(cls, track_id: str, now: float) -> None:
-        cutoff = now - config.GROQ_TPM_WINDOW_SECONDS
-        dq = cls._tpm_usage.get(track_id)
-        if not dq:
-            return
-        while dq and dq[0][0] < cutoff:
-            dq.popleft()
-
-    @classmethod
-    def _record_tpm_tokens(cls, track_id: str, tokens: float) -> None:
-        if not tokens:
-            return
-        now = cls._tpm_now()
-        with cls._tpm_lock:
-            dq = cls._tpm_usage.setdefault(track_id, collections.deque())
-            cls._prune_tpm(track_id, now)
-            dq.append((now, tokens))
-
-    @classmethod
-    def _tpm_usage_in_window(cls, track_id: str) -> float:
-        with cls._tpm_lock:
-            cls._prune_tpm(track_id, cls._tpm_now())
-            return sum(tokens for _, tokens in cls._tpm_usage.get(track_id, ()))
-
-    @staticmethod
-    def _estimate_prompt_tokens(prompt: str, system: str = "") -> int:
-        text = f"{system}\n{prompt}" if system else (prompt or "")
-        return max(1, int(len(text) / 4.0))
-
-    @staticmethod
-    def _estimate_completion_tokens(text: str) -> int:
-        return max(0, int(len(text or "") / 4.0))
-
-    def _wait_for_tpm_budget(self, track_id: str, estimated: int) -> None:
-        """Sleep until the rolling window + this request stays under the TPM limit."""
-        if not config.GROQ_TPM_PACING:
-            return
-        limit = config.GROQ_TPM_LIMIT
-        budget = limit * (1.0 - config.GROQ_TPM_SAFETY_MARGIN)
-        tokens_per_sec = limit / max(1.0, config.GROQ_TPM_WINDOW_SECONDS)
-        start = time.time()
-        while time.time() - start < config.GROQ_TPM_WINDOW_SECONDS:
-            self._raise_if_cancelled()
-            usage = self._tpm_usage_in_window(track_id)
-            if usage + estimated <= budget:
-                break
-            excess = usage + estimated - budget
-            wait = excess / tokens_per_sec
-            logger.info(
-                "[Groq] TPM pacing: waiting %.1fs (usage %.0f + %d > %.0f TPM budget).",
-                wait, usage, estimated, budget,
-            )
-            self._sleep_interruptible(min(max(wait, 0.5), 10.0))
-        # Reserve the estimate for the duration of the in-flight request.
-        self._record_tpm_tokens(track_id, estimated)
-
-    def _settle_tpm(self, track_id: str, reservation: float, actual: float) -> None:
-        """Correct the budget after a request: replace the estimate with real usage."""
-        if not config.GROQ_TPM_PACING:
-            return
-        self._record_tpm_tokens(track_id, (actual or 0.0) - reservation)
-
-    def _rotate_to_most_available_key(self) -> None:
-        """Preemptively pick the key with the most remaining TPM budget for this model."""
-        if not config.GROQ_PROACTIVE_ROTATION:
-            return
-        keys = GroqKeyManager.get_keys()
-        if len(keys) < 2:
-            return
-        now = time.time()
-        candidates = [
-            k for k in keys
-            if self._rl.cooldown_expiry(self._track_id(k)) <= now
-        ]
-        if not candidates:
-            return
-        best = min(candidates, key=lambda k: GroqModel._tpm_usage_in_window(self._track_id(k)))
-        best_idx = keys.index(best)
-        if best_idx != GroqKeyManager._current_idx:
-            GroqKeyManager._current_idx = best_idx
-            logger.info(
-                "[Groq] Proactively rotated to key #%d (most TPM budget available).",
-                best_idx + 1,
-            )
-
-    def _use_strict_json_mode(self) -> bool:
-        """Some Groq-hosted models, notably Qwen, can fail server-side JSON validation."""
-        return not self._is_qwen_model()
-
-    def _is_qwen_model(self) -> bool:
-        return "qwen" in (self.model or "").lower()
-
-    def _qwen_reasoning_params(self) -> dict:
-        if not self._is_qwen_model():
-            return {}
-        return {
-            # Groq-specific Qwen control: prevents spending completion tokens on reasoning.
-            "reasoning_effort": "none",
-            # Backup: if reasoning is ever enabled, do not return it in content.
-            "reasoning_format": "hidden",
-        }
-
-    def _prepare_messages(self, prompt: str, system: str = "") -> list:
-        if self._is_qwen_model():
-            qwen_instruction = (
-                "Reasoning mode is disabled. Do not output hidden reasoning, analysis, "
-                "<think> tags, or planning. Start directly with the final requested content."
-            )
-            system = f"{system.rstrip()}\n\n{qwen_instruction}".strip()
-            prompt = f"{prompt.rstrip()}\n\n/no_think"
-
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        return messages
+        self._scheduler = scheduler
+        self.last_usage = {}
+        self.provider = "groq"
 
     @property
-    def api_key(self) -> str:
+    def scheduler(self):
+        if self._scheduler is None:
+            self._scheduler = QuotaScheduler()
+        return self._scheduler
+
+    @property
+    def api_key(self):
+        # Never switch accounts because a workload budget ran out. Rotation is
+        # a credential operation; the ledger remains shared across all keys.
         return self._custom_api_key or GroqKeyManager.get_key()
 
     @property
-    def client(self) -> OpenAI:
-        # Check if the current manager key differs from what the client was initialized with
-        current_key = self.api_key
-        if self._client is not None:
-            # We must re-initialize the client if the key changed globally
-            if getattr(self, '_client_key', None) != current_key:
-                self._client = None
+    def client(self):
+        return self._client_for(self.api_key)
 
-        if self._client is None:
-            if not current_key:
-                raise RuntimeError(
-                    "GROQ_API_KEY not set. Get a free key at https://console.groq.com "
-                    "and add it to your .env file."
-                )
-            self._client = OpenAI(
-                base_url=config.GROQ_BASE_URL,
-                api_key=current_key,
-                timeout=30.0,
-                max_retries=0,  # Disable internal retries to allow our key rotation to take over
-            )
-            self._client_key = current_key
-        return self._client
+    def _client_for(self, key):
+        with self._client_lock:
+            if self._client is not None and getattr(self, '_client_key', key) == key:
+                return self._client
+            if not key:
+                raise RuntimeError("GROQ_API_KEY not set. Add it to .env.")
+            client = OpenAI(base_url=config.GROQ_BASE_URL, api_key=key,
+                            timeout=60.0, max_retries=0)
+            self._client, self._client_key = client, key
+            return client
 
     @property
-    def was_content_blocked(self) -> bool:
-        """Returns True if the last request was blocked by content moderation."""
+    def was_content_blocked(self):
         return self._content_blocked
 
-    def _retry_after_with_buffer(self, error: RateLimitError) -> float:
-        """Parsed Retry-After hint plus the configured safety buffer."""
-        return parse_retry_after_seconds(error) + config.GROQ_RATE_LIMIT_BUFFER
+    def _is_qwen_model(self):
+        return 'qwen' in self.model.lower()
 
-    def _throttle_before_request(
-        self, prompt: str = "", system: str = "", max_tokens: Optional[int] = None,
-    ) -> float:
-        """Apply RPM/cooldown + adaptive TPM pacing. Returns the reserved estimate."""
-        self._rotate_to_most_available_key()
-        track_id = self._track_id()
-        now = time.time()
-        wait = self._rl.throttle_wait(track_id, now, config.GROQ_MIN_REQUEST_INTERVAL)
-        if wait > 0:
-            logger.info("[Groq] Throttling %.1fs before next request.", wait)
-            self._sleep_interruptible(wait)
-        self._rl.record_request(track_id, time.time())
+    def _use_strict_json_mode(self):
+        return not self._is_qwen_model()
 
-        if config.GROQ_TPM_PACING:
-            estimated = (
-                self._estimate_prompt_tokens(prompt, system)
-                + (max_tokens or config.GROQ_TPM_RESERVE_DEFAULT)
-            )
-            self._wait_for_tpm_budget(track_id, estimated)
-            return float(estimated)
-        return 0.0
+    def _qwen_reasoning_params(self):
+        return {'reasoning_effort': 'none', 'reasoning_format': 'hidden'} if self._is_qwen_model() else {}
 
-    def _mark_rate_limited(self, error: RateLimitError) -> float:
-        retry_after = self._retry_after_with_buffer(error)
-        track_id = self._track_id()
-        self._rl.mark_cooldown(track_id, time.time() + retry_after)
-        logger.warning(
-            "[Groq] Rate limited on %s; cooling it down for %.0fs.",
-            track_id,
-            retry_after,
-        )
-        return retry_after
+    def _prepare_messages(self, prompt, system=''):
+        if self._is_qwen_model():
+            system = (system.rstrip() + "\n\nReasoning mode is disabled. Do not output hidden reasoning, "
+                      "analysis, <think> tags, or planning. Start directly with the final requested content.").strip()
+            prompt = prompt.rstrip() + "\n\n/no_think"
+        messages = [{'role': 'system', 'content': system}] if system else []
+        return messages + [{'role': 'user', 'content': prompt}]
 
-    def _rotate_to_available_key(self) -> bool:
-        if not config.GROQ_ROTATE_ON_RATE_LIMIT:
-            return False
-        keys = GroqKeyManager.get_keys()
-        if len(keys) < 2:
-            return False
-
-        for _ in range(len(keys) - 1):
-            if not GroqKeyManager.rotate():
-                return False
-            if self._rl.cooldown_expiry(self._track_id()) <= time.time():
-                return True
-        return False
-
-    def generate(
-        self,
-        prompt: str,
-        system: str = "",
-        schema: Optional[dict] = None,
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        stream: bool = False,
-        _retry_count: int = 0,
-    ) -> LLMResponse:
-        if stream:
-            content = "".join(
-                self.generate_streaming(
-                    prompt=prompt,
-                    system=system,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    _retry_count=_retry_count,
-                )
-            )
-            return LLMResponse(
-                content=content,
-                model=self.model,
-                provider="groq",
-                usage={},
-                raw=None,
-            )
-
-        self._raise_if_cancelled()
-        self._content_blocked = False
-        messages = self._prepare_messages(prompt=prompt, system=system)
-
-        # If schema requested, instruct the model to output JSON
+    def _kwargs(self, prompt, system, schema, temperature, max_tokens, stream=False):
+        messages = self._prepare_messages(prompt, system)
         if schema:
-            schema_instruction = (
-                "\n\nReturn ONLY minified valid JSON matching this schema. "
-                "No markdown, no prose, no reasoning, no <think> tags.\n"
-                f"Schema: {json.dumps(schema, separators=(',', ':'))}"
-            )
-            if messages and messages[0]["role"] == "system":
-                messages[0]["content"] += schema_instruction
-            else:
-                messages.insert(0, {"role": "system", "content": schema_instruction.strip()})
+            instruction = "\n\nReturn ONLY minified valid JSON matching this schema. No markdown or reasoning.\nSchema: " + json.dumps(schema, separators=(',', ':'))
+            if messages[0]['role'] == 'system': messages[0]['content'] += instruction
+            else: messages.insert(0, {'role': 'system', 'content': instruction})
+        kwargs = dict(model=self.model, messages=messages,
+                      temperature=config.CLOUD_MODEL_PARAMS['temperature'] if temperature is None else temperature,
+                      top_p=config.CLOUD_MODEL_PARAMS['top_p'],
+                      max_tokens=max_tokens or config.CLOUD_MODEL_PARAMS['max_tokens'])
+        if self._is_qwen_model(): kwargs['extra_body'] = self._qwen_reasoning_params()
+        if schema and self._use_strict_json_mode(): kwargs['response_format'] = {'type': 'json_object'}
+        if stream:
+            kwargs.update(stream=True, stream_options={'include_usage': True})
+        return kwargs
 
-        kwargs = {
-            "model": self.model,
-            "messages": messages,
-            "temperature": temperature or config.CLOUD_MODEL_PARAMS["temperature"],
-            "top_p": config.CLOUD_MODEL_PARAMS["top_p"],
-            "max_tokens": max_tokens or config.CLOUD_MODEL_PARAMS["max_tokens"],
-        }
-        qwen_reasoning_params = self._qwen_reasoning_params()
-        if qwen_reasoning_params:
-            kwargs["extra_body"] = qwen_reasoning_params
+    def _progress(self, phase, details):
+        callback = getattr(self, '_quota_callback', None)
+        if callback: callback(phase, details)
 
-        if schema and self._use_strict_json_mode():
-            kwargs["response_format"] = {"type": "json_object"}
+    @staticmethod
+    def _usage(response):
+        usage = getattr(response, 'usage', None)
+        if not usage:
+            extra = getattr(response, 'x_groq', None)
+            usage = extra.get('usage') if isinstance(extra, dict) else getattr(extra, 'usage', None)
+        if not usage: return None
+        if hasattr(usage, 'model_dump'): usage = usage.model_dump()
+        if isinstance(usage, dict):
+            return {'prompt_tokens': usage.get('prompt_tokens'), 'completion_tokens': usage.get('completion_tokens')}
+        return {'prompt_tokens': usage.prompt_tokens, 'completion_tokens': usage.completion_tokens}
 
-        track_id = self._track_id()
-        reservation = self._throttle_before_request(prompt, system, kwargs.get("max_tokens"))
+    def _send(self, kwargs):
+        input_tokens = self.scheduler.estimate_for(config.GROQ_QUOTA_GROUP, self.model, kwargs['messages'])
+        max_output = kwargs.get('max_tokens') or config.CLOUD_MODEL_PARAMS.get('max_tokens', 2048)
+        estimated_tokens = input_tokens + max_output
 
-        try:
-            logger.debug(f"[Groq] Generating with model={self.model}")
-            response = self.client.chat.completions.create(**kwargs)
-
-            choice = response.choices[0]
-
-            # Check for content filter
-            if choice.finish_reason == "content_filter":
-                self._content_blocked = True
-                self._settle_tpm(track_id, reservation, 0.0)
-                raise ContentBlockedError(
-                    "Groq content moderation blocked this request."
-                )
-            if choice.finish_reason == "length":
-                logger.warning(
-                    "[Groq] Response hit max_tokens. Partial content returned."
-                )
-
-            actual = 0.0
-            if response.usage:
-                actual = (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0)
-            self._settle_tpm(track_id, reservation, actual)
-
-            return LLMResponse(
-                content=self._strip_reasoning(choice.message.content or ""),
+        # Select initial key/account
+        if self._custom_api_key:
+            key = self._custom_api_key
+            account = None
+            group = config.GROQ_QUOTA_GROUP
+        else:
+            proactive = getattr(config, "GROQ_PROACTIVE_ROTATION", True)
+            account = GroqKeyManager.get_active_account(
+                proactive_rotate=proactive,
                 model=self.model,
-                provider="groq",
-                usage={
-                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-                },
-                raw=response,
+                estimated_tokens=estimated_tokens,
             )
+            key = account.key if account else GroqKeyManager.get_key()
+            group = quota_group_for_key(key)
 
-        except RateLimitError as e:
-            self._settle_tpm(track_id, reservation, 0.0)
-            error_str = str(e)
+        all_keys = GroqKeyManager.get_keys()
+        max_attempts = max(len(all_keys), 1) * 3 if not self._custom_api_key else 2
+        attempt = 0
 
-            # Check if this is a DAILY token limit (waiting won't help for long)
-            is_daily_limit = 'tokens per day' in error_str.lower() or 'TPD' in error_str
-            if is_daily_limit:
-                logger.error("[Groq] Daily token limit reached. Falling back to local model.")
+        while attempt < max_attempts:
+            self._raise_if_cancelled()
+            client = self._client_for(key)
+            reservation = self.scheduler.acquire(
+                group, self.model, input_tokens, kwargs['max_tokens'],
+                self._raise_if_cancelled, self._sleep_interruptible, self._progress,
+                getattr(self, '_max_quota_wait', None))
+            dispatched = False
+            try:
+                self._raise_if_cancelled()
+                if account:
+                    account.record_request()
+                dispatched = True
+                raw = client.chat.completions.with_raw_response.create(**kwargs)
+                self.scheduler.observe(reservation, raw.headers)
+                response = raw.parse()
+                return response, reservation, key
+            except RateLimitError as error:
+                self.scheduler.settle(reservation, rejected=True)
+                headers = getattr(error.response, 'headers', {})
+                wait = parse_retry_after_seconds(error) + config.GROQ_RATE_LIMIT_BUFFER
+                message = str(error).lower()
+                is_daily = any(term in message for term in ('tokens per day', 'requests per day', 'tpd', 'rpd'))
+                if is_daily:
+                    wait = max(wait, reset_seconds(headers.get('x-ratelimit-reset-requests', '')) or 86400)
+                self.scheduler.observe(reservation, headers, retry_after=wait)
+
+                # Check if we can rotate to an alternate healthy key
+                if not self._custom_api_key and len(all_keys) > 1:
+                    has_alt, min_wait, next_acc = GroqKeyManager.mark_rate_limited(
+                        key=key, retry_after=wait, is_daily=is_daily, model=self.model
+                    )
+                    if has_alt and next_acc:
+                        masked_old = account.masked_key if account else (key[:8] + "...")
+                        logger.warning(
+                            "[Groq] Rate limited on %s. Intelligently swapping to %s (attempt %d/%d).",
+                            masked_old, next_acc.account_id, attempt + 1, max_attempts
+                        )
+                        self._progress('waiting', {
+                            'model': self.model,
+                            'reason': f"swapping to {next_acc.account_id}",
+                            'wait_seconds': 0
+                        })
+                        account = next_acc
+                        key = next_acc.key
+                        group = quota_group_for_key(key)
+                        attempt += 1
+                        continue
+
+                # If no alternate key or single key:
+                self._progress('waiting', {'model': self.model, 'reason': 'provider cooldown', 'wait_seconds': wait})
+                attempt += 1
+                if attempt >= max_attempts or (self._custom_api_key and attempt >= 2):
+                    raise QuotaDeferred('repeated provider rate limit', wait) from error
+                self._sleep_interruptible(wait)
+            except APIError as error:
+                self.scheduler.settle(reservation)
+                if error.status_code in (401, 403):
+                    GroqKeyManager.mark_error(key, error)
+                    if not self._custom_api_key and len(all_keys) > 1:
+                        next_acc = GroqKeyManager.get_active_account(model=self.model)
+                        if next_acc and next_acc.key != key:
+                            logger.error("[Groq] Auth failed on key %s. Swapping to %s.", key[:8], next_acc.account_id)
+                            account = next_acc
+                            key = next_acc.key
+                            group = quota_group_for_key(key)
+                            attempt += 1
+                            continue
+                if error.status_code == 400 and 'response_format' in kwargs and any(
+                        term in str(error).lower() for term in ('json_validate_failed', 'failed to generate json')):
+                    kwargs = dict(kwargs)
+                    kwargs.pop('response_format')
+                    continue  # The repair is a fresh, fully accounted request.
+                raise
+            except BaseException:
+                if dispatched:
+                    self.scheduler.settle(reservation)
+                else:
+                    self.scheduler.release_unsent(reservation)
                 raise
 
-            # Mark this key as cooled down and calculate wait
-            retry_after = self._mark_rate_limited(e)
-
-            # Try rotating to a fresh key first (free, fast)
-            if _retry_count < max(len(GroqKeyManager.get_keys()), 1) * 3 and self._rotate_to_available_key():
-                logger.warning(
-                    "[Groq] Rate limited — rotated to available key (attempt %s).",
-                    _retry_count + 1,
-                )
-                return self.generate(
-                    prompt, system, schema, temperature, max_tokens, stream,
-                    _retry_count=_retry_count + 1,
-                )
-
-            # No fresh key available — wait and retry (up to 5 waits total)
-            if _retry_count < 5:
-                self._raise_if_cancelled()
-                logger.warning(f"[Groq] Rate limited — waiting {retry_after:.2f}s then retrying (attempt {_retry_count + 1}/5)...")
-                self._sleep_interruptible(retry_after)
-                return self.generate(
-                    prompt, system, schema, temperature, max_tokens, stream,
-                    _retry_count=_retry_count + 1,
-                )
-
-            logger.error("[Groq] Rate limit persisted after 5 retries. Raising to trigger local fallback.")
-            raise
-        except APIError as e:
-            # Check if this is a content moderation error
-            if hasattr(e, 'status_code') and e.status_code == 400:
-                error_msg = str(e).lower()
-                if "json_validate_failed" in error_msg or "failed to generate json" in error_msg:
-                    if kwargs.pop("response_format", None):
-                        logger.warning(
-                            "[Groq] Strict JSON mode failed; retrying once with prompt-only JSON instruction."
-                        )
-                        response = self.client.chat.completions.create(**kwargs)
-                        choice = response.choices[0]
-                        if choice.finish_reason == "length":
-                            raise RuntimeError(
-                                "Groq response hit max_tokens before finishing. "
-                                "Treating this as incomplete generation."
-                            )
-                        return LLMResponse(
-                            content=self._strip_reasoning(choice.message.content or ""),
-                            model=self.model,
-                            provider="groq",
-                            usage={
-                                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                                "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-                            },
-                            raw=response,
-                        )
-                if any(kw in error_msg for kw in ["safety", "content", "moderation", "policy"]):
-                    self._content_blocked = True
-                    raise ContentBlockedError(f"Content blocked by Groq: {e}")
-            raise
-
-    def is_available(self) -> bool:
-        """Check if Groq API is reachable with a minimal request."""
-        if not self.api_key:
-            logger.warning("[Groq] No API key configured.")
-            return False
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": "ping"}],
-                max_tokens=5,
-            )
-            return bool(response.choices)
-        except Exception as e:
-            logger.warning(f"[Groq] Availability check failed: {e}")
-            return False
-
-    def get_name(self) -> str:
-        return f"Groq ({self.model})"
-
-    def generate_streaming(
-        self,
-        prompt: str,
-        system: str = "",
-        temperature: Optional[float] = None,
-        max_tokens: Optional[int] = None,
-        _retry_count: int = 0,
-    ):
-        """
-        Streaming generator — yields content chunks.
-        Used by the web UI for real-time output.
-        """
-        self._raise_if_cancelled()
+    def generate(self, prompt, system='', schema=None, temperature=None, max_tokens=None,
+                 stream=False, _retry_count=0):
+        if stream:
+            content = ''.join(self.generate_streaming(prompt, system, temperature, max_tokens))
+            return LLMResponse(content, self.model, 'groq', dict(self.last_usage))
         self._content_blocked = False
+        start_time = time.monotonic()
+        try:
+            response, reservation, key = self._send(self._kwargs(prompt, system, schema, temperature, max_tokens))
+            usage = self._usage(response)
+            self.scheduler.settle(reservation, usage)
+            self.last_usage = usage or {}
+            self._progress('usage', {'model': self.model, 'provider': 'groq', **self.last_usage})
+            GroqKeyManager.mark_success(key, sum(v or 0 for v in self.last_usage.values()))
+            choice = response.choices[0]
+            if choice.finish_reason == 'content_filter':
+                self._content_blocked = True
+                raise ContentBlockedError('Groq content moderation blocked this request.')
+            result_text = self._strip_reasoning(choice.message.content or '')
+            latency = time.monotonic() - start_time
+            log_llm_call(
+                provider="groq",
+                model=self.model,
+                prompt=prompt,
+                system=system,
+                response=result_text,
+                latency=latency,
+                usage=self.last_usage,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            return LLMResponse(result_text, self.model, 'groq', self.last_usage, response)
+        except Exception as e:
+            latency = time.monotonic() - start_time
+            log_llm_call(
+                provider="groq",
+                model=self.model,
+                prompt=prompt,
+                system=system,
+                error=e,
+                latency=latency,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            raise
 
-        stream, track_id, reservation = self._open_stream(
-            prompt, system, temperature, max_tokens, _retry_count,
-        )
+    def generate_with_retry(self, **kwargs):
+        # Admission owns rate retries; agent-level retries must not multiply them.
+        kwargs.pop('max_retries', None)
+        return self.generate(**kwargs)
 
+    def generate_streaming(self, prompt, system='', temperature=None, max_tokens=None, _retry_count=0):
+        self._content_blocked = False
+        stream, reservation, key = self._send(self._kwargs(prompt, system, None, temperature, max_tokens, True))
+        usage = None
         finish_reason = None
-        streamed_text = []
-
-        def content_chunks():
-            nonlocal finish_reason
+        last_touch = time.monotonic()
+        def chunks():
+            nonlocal usage, last_touch, finish_reason
             for chunk in stream:
-                if not chunk.choices:
-                    continue
+                self._raise_if_cancelled()
+                if time.monotonic() - last_touch > 10:
+                    self.scheduler.touch(reservation)
+                    last_touch = time.monotonic()
+                usage = self._usage(chunk) or usage  # Metadata-only terminal chunks count.
+                if not chunk.choices: continue
                 choice = chunk.choices[0]
                 if choice.finish_reason:
                     finish_reason = choice.finish_reason
-                delta = choice.delta
-                if delta and delta.content:
-                    yield delta.content
-
+                if choice.finish_reason == 'content_filter':
+                    self._content_blocked = True
+                    raise ContentBlockedError('Groq content moderation blocked this request.')
+                if choice.delta and choice.delta.content: yield choice.delta.content
+        completed = False
         try:
-            for content in self._filter_reasoning_stream(content_chunks()):
-                self._raise_if_cancelled()
-                if content:
-                    streamed_text.append(content)
-                    yield content
-            if finish_reason == "length":
-                logger.warning(
-                    "[Groq] Streaming response hit max_tokens. Partial content returned."
-                )
-            self._settle_tpm(
-                track_id,
-                reservation,
-                self._estimate_prompt_tokens(prompt, system)
-                + self._estimate_completion_tokens("".join(streamed_text)),
-            )
+            yield from self._filter_reasoning_stream(chunks())
+            if finish_reason is None and usage is None:
+                raise RuntimeError("Groq stream ended before completion metadata; draft saved for continuation")
+            completed = True
+        finally:
+            try:
+                stream.close()
+            finally:
+                self.scheduler.settle(reservation, usage)
+            self.last_usage = usage or {}
+            self._progress('usage', {'model': self.model, 'provider': 'groq', 'complete': completed, **self.last_usage})
+            if completed:
+                GroqKeyManager.mark_success(key, sum(v or 0 for v in self.last_usage.values()))
 
-        except APIError as e:
-            if hasattr(e, 'status_code') and e.status_code == 400:
-                self._content_blocked = True
-            self._settle_tpm(track_id, reservation, 0.0)
-            raise
-
-    def _open_stream(self, prompt, system, temperature, max_tokens, _retry_count):
-        """Throttle once and open a single streaming request (with 429 retry)."""
-        track_id = self._track_id()
-        reservation = self._throttle_before_request(prompt, system, max_tokens)
-
+    def is_available(self):
+        if not self.api_key: return False
         try:
-            stream = self.client.chat.completions.create(
-                model=self.model,
-                messages=self._prepare_messages(prompt=prompt, system=system),
-                temperature=temperature or config.CLOUD_MODEL_PARAMS["temperature"],
-                top_p=config.CLOUD_MODEL_PARAMS["top_p"],
-                max_tokens=max_tokens or config.CLOUD_MODEL_PARAMS["max_tokens"],
-                stream=True,
-                extra_body=self._qwen_reasoning_params() or None,
-            )
-            return stream, track_id, reservation
-        except RateLimitError as e:
-            self._settle_tpm(track_id, reservation, 0.0)
-            error_str = str(e)
-            is_daily_limit = 'tokens per day' in error_str.lower() or 'TPD' in error_str
-            if is_daily_limit:
-                logger.error("[Groq] Daily token limit reached on stream. Raising.")
-                raise
+            return any(m.id == self.model and getattr(m, 'active', True) is not False
+                       for m in self.client.models.list().data)
+        except Exception as error:
+            logger.warning('[Groq] Availability check failed: %s', type(error).__name__)
+            return False
 
-            retry_after = self._mark_rate_limited(e)
-
-            if _retry_count < max(len(GroqKeyManager.get_keys()), 1) * 3 and self._rotate_to_available_key():
-                logger.warning(
-                    "[Groq] Rotated to an available key after stream rate limit (attempt %s).",
-                    _retry_count + 1,
-                )
-                return self._open_stream(
-                    prompt, system, temperature, max_tokens, _retry_count + 1,
-                )
-
-            if _retry_count < 5:
-                self._raise_if_cancelled()
-                logger.warning(f"[Groq] Stream rate limited — waiting {retry_after:.2f}s then retrying (attempt {_retry_count + 1}/5)...")
-                self._sleep_interruptible(retry_after)
-                return self._open_stream(
-                    prompt, system, temperature, max_tokens, _retry_count + 1,
-                )
-
-            logger.error("[Groq] Rate limit persisted after 5 retries on stream. Raising.")
-            raise
-
+    def get_name(self):
+        return f"Groq ({self.model})"

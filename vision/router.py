@@ -4,6 +4,8 @@ Completely isolated under /api/vision/*
 """
 
 import logging
+import base64
+import binascii
 from flask import Blueprint, request, jsonify
 
 from .analyzer import VisionAnalyzer
@@ -15,6 +17,22 @@ logger = logging.getLogger(__name__)
 vision_bp = Blueprint("vision_bp", __name__, url_prefix="/api/vision")
 _analyzer = VisionAnalyzer()
 _chat_provider = VisionChatProvider()
+
+
+def _decode_image(value):
+    if not value:
+        return None, "image/jpeg"
+    mime_type = "image/jpeg"
+    if "," in value:
+        header, value = value.split(",", 1)
+        if "png" in header:
+            mime_type = "image/png"
+        elif "webp" in header:
+            mime_type = "image/webp"
+    try:
+        return base64.b64decode(value, validate=True), mime_type
+    except (ValueError, binascii.Error):
+        raise ValueError("image_base64 is not valid base64 data")
 
 
 @vision_bp.route("/status", methods=["GET"])
@@ -48,14 +66,10 @@ def analyze_person_image():
         prompt_extra = data.get("prompt_extra", "")
         base64_str = data.get("image_base64", "")
         if base64_str:
-            import base64
-            if "," in base64_str:
-                header, base64_str = base64_str.split(",", 1)
-                if "png" in header:
-                    mime_type = "image/png"
-                elif "webp" in header:
-                    mime_type = "image/webp"
-            image_bytes = base64.b64decode(base64_str)
+            try:
+                image_bytes, mime_type = _decode_image(base64_str)
+            except ValueError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
     else:
         mode = request.form.get("mode")
         prompt_extra = request.form.get("prompt_extra", "")
@@ -114,10 +128,10 @@ def start_vision_chat():
         data = request.get_json() or {}
         base64_str = data.get("image_base64", "")
         if base64_str:
-            import base64
-            if "," in base64_str:
-                header, base64_str = base64_str.split(",", 1)
-            image_bytes = base64.b64decode(base64_str)
+            try:
+                image_bytes, mime_type = _decode_image(base64_str)
+            except ValueError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
     else:
         if "image" in request.files:
             file = request.files["image"]
@@ -127,7 +141,7 @@ def start_vision_chat():
         return jsonify({"success": False, "error": "No image provided."}), 400
         
     try:
-        result = _chat_provider.start_session(image_bytes)
+        result = _chat_provider.start_session(image_bytes, mime_type)
         return jsonify({"success": True, "data": result}), 200
     except Exception as e:
         logger.error("Vision chat start error: %s", e)

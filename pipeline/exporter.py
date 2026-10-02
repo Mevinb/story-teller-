@@ -84,10 +84,18 @@ class StoryExporter:
         """Return [(chapter_num, full_path), ...] sorted by chapter number."""
         if not os.path.exists(self.chapters_dir):
             return []
+        committed = None
+        try:
+            with open(self.state_path, encoding="utf-8") as state_file:
+                metadata = json.load(state_file).get("metadata", {})
+                if "current_chapter" in metadata:
+                    committed = int(metadata["current_chapter"])
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
         result = []
         for fname in sorted(os.listdir(self.chapters_dir)):
             m = _CHAPTER_FILE_RE.match(fname)
-            if m:
+            if m and (committed is None or int(m.group(1)) <= committed):
                 result.append((int(m.group(1)), os.path.join(self.chapters_dir, fname)))
         return result
 

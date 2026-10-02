@@ -1,0 +1,196 @@
+{
+  "status": "complete",
+  "words": 385,
+  "elapsed_seconds": 447.9,
+  "quota_events": [
+    {
+      "phase": "usage",
+      "model": "gemini-2.5-flash",
+      "provider": "gemini",
+      "prompt_tokens": 959,
+      "completion_tokens": 105
+    },
+    {
+      "phase": "usage",
+      "model": "qwen/qwen3.8-27b",
+      "provider": "groq",
+      "complete": true,
+      "prompt_tokens": 813,
+      "completion_tokens": 939
+    },
+    {
+      "phase": "usage",
+      "model": "gemini-2.5-flash",
+      "provider": "gemini",
+      "prompt_tokens": 748,
+      "completion_tokens": 232
+    },
+    {
+      "phase": "backup",
+      "model": "gemini-2.5-flash",
+      "provider": "Gemini (gemini-2.5-flash)",
+      "error_type": "QuotaDeferred",
+      "status_code": null
+    },
+    {
+      "phase": "backup unavailable",
+      "model": "gemini-2.5-flash",
+      "provider": "Gemini (gemini-2.5-flash)",
+      "error_type": "ServerError",
+      "status_code": null
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 46.7,
+      "resume_at": 1790879248.759301
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 41.7,
+      "resume_at": 1790879248.759546
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 36.7,
+      "resume_at": 1790879248.7599392
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 31.7,
+      "resume_at": 1790879248.7589574
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 26.7,
+      "resume_at": 1790879248.7600906
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 21.7,
+      "resume_at": 1790879248.7590573
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 16.6,
+      "resume_at": 1790879248.761305
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 11.6,
+      "resume_at": 1790879248.7593832
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 6.6,
+      "resume_at": 1790879248.7612212
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "TPM",
+      "wait_seconds": 1.6,
+      "resume_at": 1790879248.7589285
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "provider cooldown",
+      "wait_seconds": 10.0
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "provider cooldown",
+      "wait_seconds": 10.0,
+      "resume_at": 1790879258.8995018
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "provider cooldown",
+      "wait_seconds": 5.0,
+      "resume_at": 1790879258.9055119
+    },
+    {
+      "phase": "usage",
+      "model": "qwen/qwen3.8-27b",
+      "provider": "groq",
+      "prompt_tokens": 1447,
+      "completion_tokens": 158
+    },
+    {
+      "phase": "waiting",
+      "model": "qwen/qwen3.8-27b",
+      "reason": "provider cooldown",
+      "wait_seconds": 10.0
+    },
+    {
+      "phase": "backup",
+      "model": "gemini-2.5-flash",
+      "provider": "Gemini (gemini-2.5-flash)",
+      "error_type": "QuotaDeferred",
+      "status_code": null
+    },
+    {
+      "phase": "backup unavailable",
+      "model": "gemini-2.5-flash",
+      "provider": "Gemini (gemini-2.5-flash)",
+      "error_type": "ClientError",
+      "status_code": null
+    },
+    {
+      "phase": "usage",
+      "model": "qwen/qwen3.8-27b",
+      "provider": "groq",
+      "prompt_tokens": 788,
+      "completion_tokens": 478
+    },
+    {
+      "phase": "backup",
+      "model": "qwen/qwen3.8-27b",
+      "provider": "Groq (qwen/qwen3.8-27b)",
+      "error_type": "ClientError",
+      "status_code": null
+    },
+    {
+      "phase": "usage",
+      "model": "qwen/qwen3.8-27b",
+      "provider": "groq",
+      "prompt_tokens": 802,
+      "completion_tokens": 120
+    },
+    {
+      "phase": "backup",
+      "model": "qwen/qwen3.8-27b",
+      "provider": "Groq (qwen/qwen3.8-27b)",
+      "error_type": "ClientError",
+      "status_code": null
+    },
+    {
+      "phase": "usage",
+      "model": "qwen/qwen3.8-27b",
+      "provider": "groq",
+      "prompt_tokens": 856,
+      "completion_tokens": 720
+    }
+  ],
+  "review_flags": 1
+}

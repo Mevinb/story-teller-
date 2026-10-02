@@ -73,6 +73,7 @@ class VectorStore:
         self.index_path = os.path.join(self.index_dir, "index.faiss")
         self.meta_path = os.path.join(self.index_dir, "metadata.json")
         self.texts_path = os.path.join(self.index_dir, "texts.json")
+        self.manifest_path = os.path.join(self.index_dir, "manifest.json")
 
         os.makedirs(self.index_dir, exist_ok=True)
 
@@ -167,11 +168,29 @@ class VectorStore:
         """Lazy-load or create the FAISS index."""
         with self._lock:
             if self._index is None:
+                # Resolve the active embedding backend before choosing an
+                # index dimension.  Otherwise custom-dimension models create
+                # vectors that cannot be added to the default 384-d index.
+                _ = self.model
+                fingerprint = self._embedding_fingerprint()
                 if os.path.exists(self.index_path):
                     self._index = faiss.read_index(self.index_path)
-                    self._dimension = self._index.d
                     self._load_metadata()
-                    self._reconcile_mismatch_locked()
+                    old_fingerprint = None
+                    if os.path.exists(self.manifest_path):
+                        try:
+                            with open(self.manifest_path, encoding="utf-8") as handle:
+                                old_fingerprint = json.load(handle).get("embedding_fingerprint")
+                        except (OSError, json.JSONDecodeError):
+                            pass
+                    if self._index.d != self._dimension or old_fingerprint != fingerprint:
+                        logger.warning("Embedding backend changed; rebuilding semantic index.")
+                        self._index = faiss.IndexFlatIP(self._dimension)
+                        if self._texts:
+                            self._index.add(self._encode(self._texts))
+                        self._save()
+                    else:
+                        self._reconcile_mismatch_locked()
                     logger.info(
                         f"Loaded FAISS index: {self._index.ntotal} vectors"
                     )
@@ -179,6 +198,11 @@ class VectorStore:
                     self._index = faiss.IndexFlatIP(self._dimension)
                     logger.info("Created new FAISS index (Inner Product)")
             return self._index
+
+    def _embedding_fingerprint(self) -> str:
+        if self._using_fallback_embeddings or self._model is None:
+            return f"lexical-blake2b-v1:{self._dimension}"
+        return f"sentence-transformer:{config.EMBEDDING_MODEL}:{self._dimension}"
 
     def _reconcile_mismatch_locked(self) -> None:
         """Recover from a crash between index/metadata/texts writes.
@@ -297,9 +321,11 @@ class VectorStore:
         if not chunks:
             return 0
 
-        embeddings = self._encode(chunks)
-
         with self._lock:
+            # Initialize/validate the persisted index before encoding so the
+            # vectors and index always come from the same embedding backend.
+            _ = self.index
+            embeddings = self._encode(chunks)
             # Add to FAISS
             self.index.add(embeddings)
 
@@ -436,6 +462,8 @@ class VectorStore:
         max_chapter = int(max_chapter)
 
         with self._lock:
+            if self._index is None and not os.path.exists(self.index_path):
+                return 0
             # Force-load any persisted index/metadata before pruning
             _ = self.index
 
@@ -476,18 +504,22 @@ class VectorStore:
         faiss_tmp = self.index_path + ".tmp"
         meta_tmp = self.meta_path + ".tmp"
         texts_tmp = self.texts_path + ".tmp"
+        manifest_tmp = self.manifest_path + ".tmp"
 
         faiss.write_index(self._index, faiss_tmp)
         with open(meta_tmp, "w", encoding="utf-8") as f:
             json.dump(self._metadata, f, ensure_ascii=False)
         with open(texts_tmp, "w", encoding="utf-8") as f:
             json.dump(self._texts, f, ensure_ascii=False)
+        with open(manifest_tmp, "w", encoding="utf-8") as f:
+            json.dump({"embedding_fingerprint": self._embedding_fingerprint()}, f)
 
         # os.replace is atomic on POSIX and Windows; writing tmp files first
         # means a crash can never leave a truncated file in place.
         os.replace(faiss_tmp, self.index_path)
         os.replace(meta_tmp, self.meta_path)
         os.replace(texts_tmp, self.texts_path)
+        os.replace(manifest_tmp, self.manifest_path)
 
     def _load_metadata(self) -> None:
         """Load texts and metadata from disk."""

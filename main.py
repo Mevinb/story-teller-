@@ -36,6 +36,22 @@ logging.basicConfig(
 logger = logging.getLogger("storyteller")
 
 
+def pipeline_kwargs(initialize_models=True):
+    """Use the same configured backend selection as the web application."""
+    mode = os.getenv("BACKEND_MODE", "hybrid" if config.USE_CLOUD_MODEL else "local").lower()
+    kwargs = {"initialize_models": initialize_models}
+    if mode == "groq":
+        kwargs.update(backend="groq", groq_model=config.GROQ_MODEL)
+    elif mode == "gemini":
+        kwargs.update(backend="gemini", gemini_model=config.GEMINI_MODEL)
+    elif mode == "openrouter":
+        kwargs.update(backend="openrouter", openrouter_model=config.OPENROUTER_MODEL)
+    elif mode == "hybrid":
+        config.USE_CLOUD_MODEL = True
+        kwargs["groq_model"] = config.GROQ_MODEL
+    return kwargs
+
+
 def print_banner():
     banner = """
 [bold magenta]╔══════════════════════════════════════════════╗
@@ -137,7 +153,7 @@ def cmd_new(args):
     # Create project
     project_name = normalize_project_name(title)
     try:
-        pipeline = PipelineOrchestrator(project_name, progress_handler)
+        pipeline = PipelineOrchestrator(project_name, progress_handler, **pipeline_kwargs(False))
         pipeline.create_project(
             title=title, genre=genre, premise=premise,
             characters=characters, themes=themes_list, setting=setting,
@@ -164,7 +180,7 @@ def cmd_generate(args):
     pacing = args.pacing
 
     try:
-        pipeline = PipelineOrchestrator(project, progress_handler)
+        pipeline = PipelineOrchestrator(project, progress_handler, **pipeline_kwargs())
         pipeline.load_project()
         info = pipeline.get_project_info()
 
@@ -197,7 +213,7 @@ def cmd_status(args):
     """Show project status."""
     print_banner()
     try:
-        pipeline = PipelineOrchestrator(args.project, lambda **kw: None)
+        pipeline = PipelineOrchestrator(args.project, lambda **kw: None, **pipeline_kwargs(False))
         pipeline.load_project()
         info = pipeline.get_project_info()
 
@@ -228,7 +244,7 @@ def cmd_status(args):
 def cmd_read(args):
     """Read a chapter."""
     try:
-        pipeline = PipelineOrchestrator(args.project, lambda **kw: None)
+        pipeline = PipelineOrchestrator(args.project, lambda **kw: None, **pipeline_kwargs(False))
         pipeline.load_project()
 
         chapter_num = args.chapter
@@ -252,7 +268,7 @@ def cmd_delete_chapters(args):
     project = args.project
     from_chapter = args.from_chapter
     try:
-        pipeline = PipelineOrchestrator(project, lambda **kw: None)
+        pipeline = PipelineOrchestrator(project, lambda **kw: None, **pipeline_kwargs(False))
         pipeline.load_project()
         if not args.yes:
             if not Confirm.ask(

@@ -535,6 +535,7 @@ class StoryArchitect(AgentContract):
                 lo = max(0, active_step - n)  # first step index in window
                 hi = min(len(all_steps), active_step)  # last step index (exclusive for slice)
                 window_steps = all_steps[lo:hi]
+                allowed_steps = window_steps
                 prior_steps = all_steps[:lo]
             else:
                 window_steps = []
@@ -656,6 +657,7 @@ class StoryArchitect(AgentContract):
         fallback_text: str,
     ) -> dict:
         """Run pre-return validation on the chapter plan; re-prompt on failure."""
+        plan = self._repair_known_violations(plan, allowed_steps, introduced_chars, used_titles, chapter_num)
         violations = self._collect_plan_violations(
             plan, allowed_steps, introduced_chars, used_titles
         )
@@ -696,6 +698,8 @@ class StoryArchitect(AgentContract):
             character_names=character_names,
             fallback_text=fallback_text,
         )
+        corrected_plan = self._repair_known_violations(
+            corrected_plan, allowed_steps, introduced_chars, used_titles, chapter_num)
         # Final check — log remaining violations but do not loop infinitely
         remaining = self._collect_plan_violations(
             corrected_plan, allowed_steps, introduced_chars, used_titles
@@ -706,6 +710,37 @@ class StoryArchitect(AgentContract):
                 len(remaining),
             )
         return corrected_plan
+
+    def _repair_known_violations(self, plan, steps, introduced, used_titles, chapter_num):
+        """Restore explicit user beats and repair metadata without an LLM rewrite."""
+        import copy
+        from pathlib import Path
+        repaired = copy.deepcopy(plan)
+        known = set(introduced or [])
+        prior_text = ""
+        project_dir = getattr(self.state, "project_dir", None)
+        if project_dir:
+            for chapter in Path(project_dir, "chapters").glob("chapter_*.md"):
+                match = re.search(r"chapter_(\d+)", chapter.name)
+                if match and int(match.group(1)) < chapter_num:
+                    prior_text += chapter.read_text(encoding="utf-8") + "\n"
+        allowed_text = "\n".join(steps or []) + "\n" + prior_text
+        arcs = repaired.get("character_arcs", {})
+        for name in list(arcs):
+            if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", allowed_text, re.I):
+                known.add(name.lower())
+            elif known and name.lower() not in known:
+                del arcs[name]
+        # Exact required premise beats are authoritative; preserve existing
+        # valid events and append only steps that the same validator missed.
+        for step in steps or []:
+            violations = self._collect_plan_violations(repaired, [step], known, [])
+            if any("NOT covered" in issue for issue in violations):
+                repaired.setdefault("key_events", []).append(step)
+        if str(repaired.get("chapter_title", "")).lower() in {str(t).lower() for t in used_titles}:
+            repaired["chapter_title"] = f"{repaired['chapter_title']} — Chapter {chapter_num}"
+        introduced.update(known)
+        return repaired
 
     @staticmethod
     def _collect_plan_violations(

@@ -23,7 +23,7 @@ from memory.tension_tracker import TensionTracker
 from memory.motif_tracker import MotifTracker
 from agents.architect import StoryArchitect
 from agents.planner import ScenePlanner
-from agents.writer import SceneWriter
+from agents.writer import SceneWriter, SceneRepairBudgetExceeded
 from agents.consistency import ConsistencyEngine
 from agents.editor import Editor
 from agents.pacing import PacingAgent
@@ -165,6 +165,7 @@ class PipelineOrchestrator:
         groq_model: Optional[str] = None,
         gemini_model: Optional[str] = None,
         openrouter_model: Optional[str] = None,
+        initialize_models: bool = True,
     ):
         self.project_name, self.project_dir = _safe_project_dir(project_name)
         self.chapters_dir = os.path.join(self.project_dir, "chapters")
@@ -189,10 +190,11 @@ class PipelineOrchestrator:
             os.makedirs(d, exist_ok=True)
 
         # Initialize components
-        self._init_models()
         self._init_memory()
-        self._init_agents()
-        self._install_cancel_hooks()
+        if initialize_models:
+            self._init_models()
+            self._init_agents()
+            self._install_cancel_hooks()
 
     def _cancel_hook(self) -> bool:
         """True when either the whole pipeline or the current scene was cancelled."""
@@ -206,8 +208,19 @@ class PipelineOrchestrator:
         try:
             if hasattr(model, "_should_cancel"):
                 model._should_cancel = self._cancel_hook
+            model._quota_callback = self._quota_progress
         except Exception:
             pass
+
+    def _quota_progress(self, phase, details):
+        self._emit("quota", {"phase": phase, **details})
+        if phase == "waiting":
+            wait = details.get("wait_seconds", 0)
+            self._emit("status", f"Waiting for quota: {details.get('reason', '')} ({wait:.0f}s)")
+        elif phase == "backup":
+            self._log("Using backup model", level="warn", details=details)
+        elif phase == "usage":
+            self._log("Model token usage", details=details)
 
     def _install_cancel_hooks(self) -> None:
         """Attach cancel hooks to every model this orchestrator owns."""
@@ -242,7 +255,7 @@ class PipelineOrchestrator:
         self._active_model_id = self._local_model_id
 
         if self._backend == "groq":
-            if not config.GROQ_API_KEY:
+            if not config.GROQ_API_KEY and not getattr(config, "GROQ_API_KEYS", []):
                 raise RuntimeError(
                     "GROQ_API_KEY not set. Add it to your .env file before using Groq mode."
                 )
@@ -262,7 +275,7 @@ class PipelineOrchestrator:
             return
 
         if self._backend == "gemini":
-            if not config.GEMINI_API_KEY:
+            if not config.GEMINI_API_KEY and not getattr(config, "GEMINI_API_KEYS", []):
                 raise RuntimeError(
                     "GEMINI_API_KEY not set. Add it to your .env file before using Gemini mode."
                 )
@@ -282,7 +295,7 @@ class PipelineOrchestrator:
             return
 
         if self._backend == "openrouter":
-            if not config.OPENROUTER_API_KEY:
+            if not config.OPENROUTER_API_KEY and not getattr(config, "OPENROUTER_API_KEYS", []):
                 raise RuntimeError(
                     "OPENROUTER_API_KEY not set. Add it to your .env file before using OpenRouter mode."
                 )
@@ -302,7 +315,7 @@ class PipelineOrchestrator:
             return
 
         # Local-only by default. Cloud can be enabled explicitly with USE_CLOUD_MODEL=true.
-        if config.USE_CLOUD_MODEL and config.GROQ_API_KEY:
+        if config.USE_CLOUD_MODEL and (config.GROQ_API_KEY or getattr(config, "GROQ_API_KEYS", [])):
             self.cloud_model = GroqModel()
             self._log("Checking internet connectivity...", details={"model": config.GROQ_MODEL})
             if self._has_internet():
@@ -367,20 +380,28 @@ class PipelineOrchestrator:
             # Hybrid routing (Groq): keep the Writer on Groq for prose quality but
             # route Planner/Critic/Editor/Verifier to the local GGUF when it's
             # usable. This cuts Groq token burn ~60-70% so free-tier TPM lasts.
-            local_usable = self._hybrid_local_usable()
+            local_usable = self._backend == "groq" and config.HYBRID_ROUTING and self._hybrid_local_usable()
+            support_model = None
+            if self._backend == "groq":
+                from models.resilient_model import ResilientModel, verified_support
+                support_model = self.local_model if local_usable else verified_support()
+                self.cloud_model = ResilientModel(self.cloud_model, support_model)
+                if support_model and not local_usable:
+                    support_model = ResilientModel(support_model, self.cloud_model)
 
-            if self._backend == "groq" and config.HYBRID_ROUTING and local_usable:
-                self.architect = StoryArchitect(self.local_model, self.state_manager)
-                self.planner = ScenePlanner(self.local_model)
-                self.writer = SceneWriter(self.cloud_model, self.local_model)
-                self.consistency = ConsistencyEngine(self.local_model)
-                self.editor = Editor(self.local_model)
+            if self._backend == "groq" and support_model:
+                self.architect = StoryArchitect(support_model, self.state_manager)
+                self.planner = ScenePlanner(support_model)
+                self.writer = SceneWriter(self.cloud_model, self.cloud_model)
+                self.consistency = ConsistencyEngine(support_model)
+                self.editor = Editor(support_model)
                 self.pacing = PacingAgent()
                 self.voice = VoiceAgent()
-                self.verifier = Verifier(self.local_model)
+                self.verifier = Verifier(support_model)
                 self._enable_compact_local_planning_prompts()
+                self.writer.set_compact_mode(True)
                 self._log(
-                    "Hybrid routing: Groq for Writer, local GGUF for planner/critic/editor/verifier",
+                    f"Routing: Groq for prose; {support_model.get_name()} for planning and review",
                     level="success",
                 )
             else:
@@ -462,6 +483,16 @@ class PipelineOrchestrator:
         self._log("Local compact planning mode enabled", details={"backend": self._backend})
 
     def _emit(self, event: str, data=None, **kwargs):
+        if event == "chapter_complete" and isinstance(data, dict):
+            try:
+                from pipeline.image_prompts import generate
+                self._progress_cb(event="status", data="Writing scene image prompts...")
+                text = self.read_chapter(data["chapter_number"])
+                model = self.cloud_model if self._cloud_available else self.local_model
+                data["image_prompts"] = generate(self.project_dir, text, model)
+            except Exception as exc:
+                logger.warning("Scene prompts failed (story retained): %s", exc)
+                data["image_prompts"] = {"status": "failed"}
         self._progress_cb(event=event, data=data, **kwargs)
 
     def _log(self, message: str, level: str = "info", details: dict = None):
@@ -535,6 +566,8 @@ class PipelineOrchestrator:
             result = call_fn()
         except PipelineCancelledError:
             raise
+        except SceneRepairBudgetExceeded:
+            raise
         except Exception as e:
             error_payload = {"error": str(e), "agent": agent_name}
             self._emit("error", error_payload)
@@ -587,6 +620,11 @@ class PipelineOrchestrator:
             )
         except PipelineCancelledError:
             return {"status": "cancelled", "scene_number": scene.get("scene_number")}
+        except SceneRepairBudgetExceeded as exc:
+            self._log("Scene repair budget exhausted; draft saved for review", level="warn")
+            self._emit("needs_review", {"scene": scene.get("scene_number"), "reason": str(exc)})
+            return {"status": "complete", "scene_text": exc.text, "iterations": 1 + config.SCENE_REPAIR_CALLS,
+                    "needs_review": True, "verifier_report": None, "quality_scores": None}
 
     def _run_scene_graph_impl(
         self,
@@ -599,6 +637,8 @@ class PipelineOrchestrator:
         scenes_total: int = 0,
     ) -> dict:
         scene_num = scene["scene_number"]
+        if hasattr(self.writer, "begin_scene"):
+            self.writer.begin_scene((chapter_num, scene_num))
         graph_node = "start"
         iteration = 0
         state = {
@@ -669,7 +709,14 @@ class PipelineOrchestrator:
                             "suggestion": "Adjust rhythm/density per the pacing feedback",
                         })
                 if writer_issues:
-                    if iteration >= config.MAX_SCENE_ITERATIONS:
+                    if any(issue.get("nearest_paragraph") and issue["nearest_paragraph"] in state["scene_text"]
+                           for issue in writer_issues):
+                        # Start with a precise patch when the critic supplies
+                        # an exact passage; recheck before escalating.
+                        writer_issues.sort(key=lambda issue: not bool(issue.get("nearest_paragraph") and
+                                                                       issue["nearest_paragraph"] in state["scene_text"]))
+                        mode = "patch"
+                    elif iteration >= config.MAX_SCENE_ITERATIONS:
                         mode = "final_patch"
                     elif (state.get("blocking_repeat_count", 0) >= 2
                           or state.get("verifier_repeat_count", 0) >= 2):
@@ -898,6 +945,10 @@ class PipelineOrchestrator:
                 continue
 
             if graph_node == "editor":
+                if hasattr(self.writer, "reserve_edit") and not self.writer.reserve_edit(state["scene_text"]):
+                    self._log("Skipping optional polish: scene repair allowance spent")
+                    graph_node = SCENE_GRAPH["editor"][0]
+                    continue
                 self._emit("agent_active", {"agent": "Editor", "step": f"scene {scene_num}"})
                 pre_edit_text = state["scene_text"]
                 editor_input = {"scene_text": state["scene_text"]}
@@ -1088,7 +1139,7 @@ class PipelineOrchestrator:
             "status": "complete",
             "scene_text": self._sanitize_generated_text(state["scene_text"]),
             "iterations": iteration,
-            "needs_review": bool(state.get("needs_review")),
+            "needs_review": bool(state.get("needs_review") or getattr(self.writer, "needs_review", False) is True),
             "verifier_report": state.get("verifier_report"),
             "quality_scores": state.get("quality_scores"),
         }
@@ -1420,6 +1471,11 @@ class PipelineOrchestrator:
                 )
                 return scene_text  # Passed validation
             except RuntimeError as e:
+                if getattr(self.writer, "_call_budget", None) == 0:
+                    self.writer.needs_review = True
+                    self._log("Validation still needs attention; preserving draft after repair budget", level="warn")
+                    self._emit("needs_review", {"scene": scene_num, "reason": str(e)})
+                    return scene_text
                 remaining = self._MAX_SCENE_RETRIES - attempt
                 if remaining > 0 and not (self._cancelled or self._scene_cancelled):
                     self._log(
@@ -1502,6 +1558,8 @@ class PipelineOrchestrator:
         as future-violation markers.
         """
         text = premise or ""
+        # Strip reasoning blocks if present
+        text = re.sub(r"<(?:think|thought|reasoning|analysis)>.*?</(?:think|thought|reasoning|analysis)>", "", text, flags=re.DOTALL | re.IGNORECASE)
         marker = re.search(r"story steps in order\s*:\s*", text, flags=re.IGNORECASE)
         if marker:
             text = text[marker.end():]
@@ -1517,14 +1575,17 @@ class PipelineOrchestrator:
             line = raw_line.strip()
             if not line:
                 continue
+            # Skip code block fences
+            if line.startswith("```"):
+                continue
             # Skip section headings — they are structure, not story steps
             if _HEADING_RE.match(line):
                 continue
             # Also skip any short line (<=5 words) that ends with a colon
             if line.endswith(":") and len(line.split()) <= 5:
                 continue
-            # Strip bullet/numbering prefix
-            line = re.sub(r"^(?:[-*]|\d+[\).\:-])\s*", "", line).strip()
+            from pipeline.premise_architect import normalize_beat_text
+            line = normalize_beat_text(line)
             if not line:
                 continue
             steps.append(line)
@@ -2592,6 +2653,7 @@ class PipelineOrchestrator:
         events and comparing against the current chapter number.
         """
         state = self.state_manager.load()
+
         characters = state.get("characters", {})
         premise = state.get("metadata", {}).get("premise", "")
 
@@ -2739,6 +2801,8 @@ class PipelineOrchestrator:
         return "build_tension"
 
     def _active_planning_model(self):
+        if self._backend == "groq" and getattr(self, "architect", None) is not None:
+            return self.architect.model
         if self._backend in {"groq", "gemini"} and self.cloud_model:
             return self.cloud_model
         model = self.local_model
@@ -2979,8 +3043,10 @@ class PipelineOrchestrator:
 
         # Set genre on writer/editor
         genre = state.get("metadata", {}).get("genre", "")
-        self.writer.set_genre(genre)
-        self.editor.set_genre(genre)
+        if hasattr(self, "writer"):
+            self.writer.set_genre(genre)
+        if hasattr(self, "editor"):
+            self.editor.set_genre(genre)
 
         session = {
             "chapter_num": chapter_num,
@@ -3017,6 +3083,33 @@ class PipelineOrchestrator:
             raise ValueError("Chapter number must be >= 1")
 
         state = self.state_manager.load()
+
+        # Validate the target before changing state or semantic memory.
+        chapter_path = os.path.join(self.chapters_dir, f"chapter_{chapter_num:03d}.md")
+        if not os.path.exists(chapter_path):
+            raise FileNotFoundError(f"Chapter {chapter_num} file not found.")
+        with open(chapter_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Later chapter files are incompatible with the resumed timeline. Keep
+        # them recoverable instead of leaving them to be exported or overwritten.
+        future_files = []
+        for filename in os.listdir(self.chapters_dir):
+            match = _CHAPTER_FILE_RE.match(filename)
+            if match and int(match.group(1)) > chapter_num:
+                future_files.append(filename)
+        if future_files:
+            archive_dir = os.path.join(
+                self.project_dir,
+                "resume_backups",
+                datetime.now().strftime("%Y%m%d_%H%M%S_%f"),
+            )
+            os.makedirs(archive_dir, exist_ok=True)
+            for filename in future_files:
+                shutil.move(
+                    os.path.join(self.chapters_dir, filename),
+                    os.path.join(archive_dir, filename),
+                )
         
         # Calculate total scenes written up to chapter_num - 1
         total_scenes_written = 0
@@ -3031,14 +3124,6 @@ class PipelineOrchestrator:
         # Roll back the state and vector store
         self.state_manager.prune_after_chapter(chapter_num - 1, total_scenes_written)
         self.vector_store.prune_chapters(chapter_num - 1)
-
-        # Read the chapter to resume
-        chapter_path = os.path.join(self.chapters_dir, f"chapter_{chapter_num:03d}.md")
-        if not os.path.exists(chapter_path):
-            raise FileNotFoundError(f"Chapter {chapter_num} file not found.")
-
-        with open(chapter_path, "r", encoding="utf-8") as f:
-            content = f.read()
 
         # Try to extract the title from the heading
         chapter_title = f"Chapter {chapter_num}"
@@ -3375,29 +3460,9 @@ class PipelineOrchestrator:
         if qc_overall is not None and qc_overall >= (best.get("score") or -1.0):
             session["best_passage"] = {"score": qc_overall, "text": scene_text}
 
-        # Post-scene narrative evolution
-        if self._cancelled or self._scene_cancelled:
-            return {"status": "cancelled", "scene_number": scene_number}
-        try:
-            self._emit("status", "Analyzing narrative evolution...")
-            evolve_after_scene(
-                scene_text=scene_text,
-                scene_plan=scene,
-                chapter_num=chapter_num,
-                scene_num=scene_number,
-                state_manager=self.state_manager,
-                llm=self._active_planning_model(),
-                compact_mode=(self._backend in {"groq", "gemini"}),
-                progress_callback=lambda msg: self._log(msg, level="info"),
-            )
-            self._log("Narrative evolution complete", level="success")
-        except PipelineCancelledError:
-            return {"status": "cancelled", "scene_number": scene_number}
-        except Exception as e:
-            self._log(
-                f"Evolution engine error (non-fatal): {e}",
-                level="warn",
-            )
+        # Narrative evolution is intentionally deferred until chapter finish.
+        # Manual scenes can be edited, deleted, or regenerated; mutating the
+        # canonical state here made those discarded drafts remain in memory.
 
         self._emit("scene_complete", {
             "scene": scene_number,
@@ -3622,6 +3687,29 @@ class PipelineOrchestrator:
         return session
 
     def finish_manual_chapter(self, session: dict) -> dict:
+        """Finalize a manual chapter with rollback if a later persistence step fails."""
+        snapshot = self.state_manager.load()
+        previous_chapter = int(snapshot.get("metadata", {}).get("current_chapter", 0))
+        chapter_num = int(session["chapter_num"])
+        chapter_path = os.path.join(self.chapters_dir, f"chapter_{chapter_num:03d}.md")
+        old_content = None
+        if os.path.exists(chapter_path):
+            with open(chapter_path, "r", encoding="utf-8") as handle:
+                old_content = handle.read()
+        try:
+            return self._finish_manual_chapter_impl(session)
+        except Exception:
+            self.state_manager.replace_state(snapshot, action="rollback_failed_manual_finish")
+            self.vector_store.prune_chapters(previous_chapter)
+            if old_content is None:
+                if os.path.exists(chapter_path):
+                    os.remove(chapter_path)
+            else:
+                with open(chapter_path, "w", encoding="utf-8") as handle:
+                    handle.write(old_content)
+            raise
+
+    def _finish_manual_chapter_impl(self, session: dict) -> dict:
         """
         Finalize an interactive manual chapter: persist state, index vectors, clean up WIP.
         """
@@ -3636,6 +3724,36 @@ class PipelineOrchestrator:
 
         if not chapter_text_parts:
             raise RuntimeError("No scenes generated. Generate at least one scene before finishing.")
+
+        # Apply evolution only to the final, user-approved scene list.  The
+        # outer transaction restores the entire state if any later step fails.
+        self._emit("status", "Analyzing final narrative evolution...")
+        for scene_index, (scene_text, scene_plan) in enumerate(
+            zip(chapter_text_parts, scenes), start=1
+        ):
+            before_evolution = self.state_manager.load()
+            try:
+                evolve_after_scene(
+                    scene_text=scene_text,
+                    scene_plan=scene_plan,
+                    chapter_num=chapter_num,
+                    scene_num=scene_index,
+                    state_manager=self.state_manager,
+                    llm=self._active_planning_model(),
+                    compact_mode=(self._backend in {"groq", "gemini"}),
+                    progress_callback=lambda msg: self._log(msg, level="info"),
+                )
+            except PipelineCancelledError:
+                raise
+            except Exception as evolution_error:
+                self.state_manager.replace_state(
+                    before_evolution, action="rollback_failed_scene_evolution"
+                )
+                self._log(
+                    f"Evolution engine error for final scene {scene_index} "
+                    f"(non-fatal): {evolution_error}",
+                    level="warn",
+                )
 
         # Build the chapter plan from what was actually written
         chapter_plan = self._build_manual_chapter_plan_stub(
@@ -3827,8 +3945,10 @@ class PipelineOrchestrator:
             state = self.state_manager.load()
         # Set genre on writer and editor so they know routing and tone
         genre = state.get("metadata", {}).get("genre", "")
-        self.writer.set_genre(genre)
-        self.editor.set_genre(genre)
+        if hasattr(self, "writer"):
+            self.writer.set_genre(genre)
+        if hasattr(self, "editor"):
+            self.editor.set_genre(genre)
         return state
 
     def get_project_info(self) -> dict:
@@ -3849,12 +3969,46 @@ class PipelineOrchestrator:
     # ─── Chapter Generation ──────────────────────────────────────────
 
     def generate_chapter(self, pacing: str = "moderate", manual_spec: Optional[dict] = None) -> dict:
+        """Generate a chapter and roll back partially committed persistence on failure."""
+        snapshot = self.state_manager.load()
+        previous_chapter = int(snapshot.get("metadata", {}).get("current_chapter", 0))
+        chapter_num = previous_chapter + 1
+        chapter_path = os.path.join(self.chapters_dir, f"chapter_{chapter_num:03d}.md")
+        old_content = None
+        if os.path.exists(chapter_path):
+            with open(chapter_path, "r", encoding="utf-8") as handle:
+                old_content = handle.read()
+        try:
+            return self._generate_chapter_impl(pacing=pacing, manual_spec=manual_spec)
+        except Exception:
+            self.state_manager.replace_state(snapshot, action="rollback_failed_chapter")
+            self.vector_store.prune_chapters(previous_chapter)
+            if old_content is None:
+                if os.path.exists(chapter_path):
+                    os.remove(chapter_path)
+            else:
+                with open(chapter_path, "w", encoding="utf-8") as handle:
+                    handle.write(old_content)
+            raise
+
+    def _generate_chapter_impl(self, pacing: str = "moderate", manual_spec: Optional[dict] = None) -> dict:
         """Generate the next chapter through the full pipeline."""
-        # Rotate API key at the start of each chapter
-        from models.groq_model import GroqKeyManager
-        GroqKeyManager.rotate()
         self.state_manager.normalize_character_traits()
         state = self.state_manager.load()
+        # Exact input plus the state fingerprint scopes crash-recovery caches.
+        import hashlib
+        cache_state = json.loads(json.dumps(state))
+        for volatile in ("updated_at", "state_version"):
+            cache_state.get("metadata", {}).pop(volatile, None)
+        cache_scope = hashlib.sha256(json.dumps(
+            [self.project_name, cache_state, pacing, manual_spec], sort_keys=True,
+            ensure_ascii=False, default=str).encode()).hexdigest()
+        for agent in (self.architect, self.planner, self.consistency, self.editor, self.verifier):
+            if hasattr(agent.model, "_cache_scope"):
+                agent.model._cache_scope = cache_scope
+        for model in (self.writer.primary, self.writer.fallback):
+            if hasattr(model, "_cache_scope"):
+                model._cache_scope = cache_scope
 
         # ── Self-healing state sync ───────────────────────────────────────
         # If chapter files exist on disk but state.current_chapter is behind
@@ -3865,6 +4019,8 @@ class PipelineOrchestrator:
         while True:
             candidate = disk_chapter + 1
             candidate_path = os.path.join(self.chapters_dir, f"chapter_{candidate:03d}.md")
+            if os.path.exists(self._wip_path(candidate)):
+                break  # A progressively saved chapter is still uncommitted.
             if os.path.exists(candidate_path):
                 disk_chapter = candidate
             else:
@@ -3886,6 +4042,15 @@ class PipelineOrchestrator:
         # ─────────────────────────────────────────────────────────────────
 
         chapter_num = state["metadata"]["current_chapter"] + 1
+        resume_wip = self._load_wip(chapter_num)
+        if resume_wip and (self._wip_has_corrupt_scenes(resume_wip) or
+                           resume_wip.get("source_premise", state["metadata"].get("premise", "")) != state["metadata"].get("premise", "")):
+            resume_wip = None
+        if resume_wip and resume_wip.get("cache_scope"):
+            for agent in (self.architect, self.planner, self.consistency, self.editor, self.verifier):
+                if hasattr(agent.model, "_cache_scope"):
+                    agent.model._cache_scope = resume_wip["cache_scope"]
+            self.writer.primary._cache_scope = resume_wip["cache_scope"]
         chapter_start_time = time.time()
 
         # If cancellation was requested (e.g. between chapters in a batch run),
@@ -3958,12 +4123,16 @@ class PipelineOrchestrator:
             # Step 2: Architect plans chapter
             self._emit("agent_active", {"agent": "Story Architect", "step": "planning"})
             self._log(f"Story Architect: planning chapter {chapter_num}...",
-                      details={"model": self._active_model_id, "backend": self._active_backend})
+                      details={"model": self.architect.model.get_name(), "backend": self._active_backend})
             if self._cancelled:
                 return self._cancel_result(chapter_num)
 
             graph_node = PIPELINE_GRAPH[graph_node][0]
-            if manual_mode:
+            if resume_wip and resume_wip.get("chapter_plan") and resume_wip.get("scene_plans"):
+                chapter_plan = resume_wip["chapter_plan"]
+                arch_time = 0.0
+                self._log("Restored checkpointed chapter plan")
+            elif manual_mode:
                 chapter_plan = manual_spec["chapter_plan"]
                 self._log("Manual chapter plan accepted", level="success")
                 arch_time = 0.0
@@ -4047,12 +4216,17 @@ class PipelineOrchestrator:
             # Step 3: Planner decomposes into scenes
             self._emit("agent_active", {"agent": "Scene Planner", "step": "decomposing"})
             self._log("Scene Planner: decomposing chapter into scenes...",
-                      details={"model": self._active_model_id, "backend": self._active_backend})
+                      details={"model": self.planner.model.get_name(), "backend": self._active_backend})
             if self._cancelled:
                 return self._cancel_result(chapter_num)
 
             graph_node = PIPELINE_GRAPH[graph_node][0]
-            if manual_mode:
+            if resume_wip and resume_wip.get("scene_plans"):
+                scenes = resume_wip["scene_plans"]
+                scene_plan = {"scenes": scenes}
+                plan_time = 0.0
+                self._log("Restored checkpointed scene sequence")
+            elif manual_mode:
                 scenes = list(manual_spec.get("scenes", []))
                 scene_plan = {"scenes": scenes}
                 plan_time = 0.0
@@ -4154,6 +4328,9 @@ class PipelineOrchestrator:
                 self._log(f"Resuming from WIP checkpoint: {start_scene_idx}/{len(scenes)} scenes done",
                           level="warn")
                 self._emit("status", f"Resuming from scene {start_scene_idx + 1}")
+                for saved in wip["completed_scenes"]:
+                    if saved.get("needs_review"):
+                        log_entries.append({"step": f"scene_{saved['scene']}", "needs_review": True, "status": "resumed"})
 
             graph_node = PIPELINE_GRAPH[graph_node][0]
             # Best-scored passage of this chapter (style-anchor candidate)
@@ -4360,6 +4537,7 @@ class PipelineOrchestrator:
 
                 log_entries.append({
                     "step": f"scene_{scene_num}", "status": "done",
+                    "needs_review": bool(scene_result.get("needs_review") or getattr(self.writer, "needs_review", False) is True),
                     "words": post_edit_words,
                     "provider": self.writer.last_provider,
                     "consistency_retries": retries,
@@ -4367,7 +4545,11 @@ class PipelineOrchestrator:
                 })
 
                 # Save WIP checkpoint after each scene
-                completed = [{"scene": s + 1, "text": t} for s, t in enumerate(chapter_text_parts)]
+                review_flags = {int(entry["step"].split("_")[-1]): bool(entry.get("needs_review"))
+                                for entry in log_entries if entry.get("step", "").startswith("scene_")}
+                completed = [{"scene": s + 1, "text": t,
+                              "needs_review": review_flags.get(s + 1, False)}
+                             for s, t in enumerate(chapter_text_parts)]
                 self._save_wip(chapter_num, completed, chapter_plan, scenes)
 
                 if estimated_tokens_used > config.MAX_TOKEN_BUDGET:
@@ -4388,9 +4570,7 @@ class PipelineOrchestrator:
                         "WIP checkpoint preserved; retry later to resume."
                     )
 
-                # Brief pause between scenes to avoid Groq rate limits
-                if i < len(scenes) - 1:
-                    time.sleep(5)
+                # Quota admission owns pacing; avoid an unconditional scene delay.
 
                 # Save chapter file progressively so Reader shows it building up
                 chapter_title = chapter_plan.get("chapter_title", f"Chapter {chapter_num}")
@@ -4541,6 +4721,7 @@ class PipelineOrchestrator:
                 "file": chapter_path,
                 "status": "complete",
                 "steps_used": step_counter["steps"],
+                "needs_review": any(entry.get("needs_review") for entry in log_entries),
                 "estimated_tokens_used": estimated_tokens_used,
             }
 
@@ -4618,6 +4799,41 @@ class PipelineOrchestrator:
         return None
 
     def update_chapter_content(self, chapter_num: int, content: str) -> dict:
+        """Edit a chapter transactionally and rewind invalid later memory."""
+        snapshot = self.state_manager.load()
+        original_files = {}
+        for number in self._list_chapter_numbers_on_disk():
+            if number >= int(chapter_num):
+                original_path = os.path.join(self.chapters_dir, f"chapter_{number:03d}.md")
+                with open(original_path, encoding="utf-8") as handle:
+                    original_files[number] = handle.read()
+        try:
+            return self._update_chapter_content_impl(chapter_num, content)
+        except Exception:
+            self.state_manager.replace_state(snapshot, action="rollback_failed_chapter_edit")
+            for number in self._list_chapter_numbers_on_disk():
+                if number >= int(chapter_num):
+                    os.remove(os.path.join(self.chapters_dir, f"chapter_{number:03d}.md"))
+            for number, original in original_files.items():
+                with open(
+                    os.path.join(self.chapters_dir, f"chapter_{number:03d}.md"),
+                    "w", encoding="utf-8",
+                ) as handle:
+                    handle.write(original)
+            try:
+                self.vector_store.prune_chapters(int(chapter_num) - 1)
+                for number, original in sorted(original_files.items()):
+                    self.vector_store.add_text(
+                        original, chapter=number, scene=1, memory_type="plot"
+                    )
+            except Exception as rollback_error:
+                self._log(
+                    f"Vector rollback after chapter edit failed: {rollback_error}",
+                    level="error",
+                )
+            raise
+
+    def _update_chapter_content_impl(self, chapter_num: int, content: str) -> dict:
         """
         Overwrite the text of a completed chapter file on disk.
         Returns a summary with word count.
@@ -4630,15 +4846,53 @@ class PipelineOrchestrator:
         if not os.path.exists(path):
             raise FileNotFoundError(f"Chapter {chapter_num} does not exist.")
 
+        state = self.state_manager.load()
+        current = int(state.get("metadata", {}).get("current_chapter", 0))
+        if chapter_num > current:
+            raise ValueError(f"Chapter {chapter_num} is not committed yet.")
+
+        # Editing history invalidates every derived fact after that point.
+        # Preserve those files in a recoverable backup, then rebuild the
+        # committed boundary around the edited chapter.
+        backup_dir = None
+        later = [n for n in self._list_chapter_numbers_on_disk() if n > chapter_num]
+        if later:
+            backup_dir = os.path.join(
+                self.project_dir, "edit_backups", datetime.now().strftime("%Y%m%d_%H%M%S")
+            )
+            os.makedirs(backup_dir, exist_ok=True)
+            for number in later:
+                shutil.move(
+                    os.path.join(self.chapters_dir, f"chapter_{number:03d}.md"),
+                    os.path.join(backup_dir, f"chapter_{number:03d}.md"),
+                )
+
+        prior_numbers = [n for n in self._list_chapter_numbers_on_disk() if n < chapter_num]
+        prior_scenes = self._count_total_scenes_from_files(prior_numbers)
+        self.state_manager.prune_after_chapter(chapter_num - 1, prior_scenes)
+        self.vector_store.prune_chapters(chapter_num - 1)
+
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
 
         words = len(content.split())
+        title_match = re.search(r"^#\s*(?:Chapter\s+\d+\s*:\s*)?(.+)$", content, re.MULTILINE)
+        title = title_match.group(1).strip() if title_match else f"Chapter {chapter_num}"
+        summary = " ".join(content.split())[:550]
+        scene_count = max(1, len(re.findall(r"^\s*\* \* \*\s*$", content, re.MULTILINE)) + 1)
+        self.state_manager.add_chapter_summary(chapter_num, summary, title)
+        self.state_manager.increment_scene_count(scene_count)
+        self.vector_store.add_text(content, chapter=chapter_num, scene=1, memory_type="plot")
         self._log(
             f"Chapter {chapter_num} updated via editor ({words} words).",
             level="info",
         )
-        return {"chapter": chapter_num, "words": words}
+        return {
+            "chapter": chapter_num,
+            "words": words,
+            "rewound_from": current if current > chapter_num else None,
+            "backup_dir": backup_dir,
+        }
 
     def delete_chapters_from(self, from_chapter: int) -> dict:
         """
@@ -4842,6 +5096,11 @@ class PipelineOrchestrator:
             "completed_scenes": completed_scenes,
             "timestamp": datetime.now().isoformat(),
         }
+        if getattr(self, "state_manager", None) is not None:
+            wip["source_premise"] = self.state_manager.get_metadata().get("premise", "")
+        model = getattr(getattr(self, "writer", None), "primary", None)
+        if isinstance(getattr(model, "_cache_scope", None), str):
+            wip["cache_scope"] = model._cache_scope
         wip_path = self._wip_path(chapter_num)
         tmp_path = wip_path + ".tmp"
         try:
@@ -5360,4 +5619,3 @@ Respond with this exact JSON structure:
             level="success",
         )
         return {"status": "ok", "format": fmt, "files": results}
-

@@ -30,9 +30,11 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_API_KEYS = [k.strip() for k in os.getenv("GROQ_API_KEYS", "").split(",") if k.strip()]
 if GROQ_API_KEY and GROQ_API_KEY not in GROQ_API_KEYS:
     GROQ_API_KEYS.insert(0, GROQ_API_KEY)
+if not GROQ_API_KEY and GROQ_API_KEYS:
+    GROQ_API_KEY = GROQ_API_KEYS[0]
 
 if GROQ_API_KEYS:
-    print(f"✅ Loaded {len(GROQ_API_KEYS)} Groq API keys for rotation.")
+    print(f"✅ Loaded {len(GROQ_API_KEYS)} Groq API key(s).")
 else:
     print("⚠️ No Groq API keys found in .env!")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
@@ -41,36 +43,53 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 # Available text-generation models on Groq (as of 2026).
 # The first entry is the default if GROQ_MODEL is unset.
 GROQ_MODELS = [
-    {"id": "qwen/qwen3.8-27b",        "name": "Qwen 3.8 27B",        "context": "256k", "notes": "Default — strong & fast for narrative prose"},
+    {"id": "qwen/qwen3.8-27b",        "name": "Qwen 3.8 27B",        "context": "128k", "notes": "Default — strong & fast for narrative prose"},
     {"id": "openai/gpt-oss-120b",     "name": "GPT-OSS 120B",        "context": "128k", "notes": "Largest OSS — best coherence & depth"},
-    {"id": "llama-3.3-70b-versatile", "name": "Llama 3.3 70B",      "context": "128k", "notes": "Flagship Meta instruction model"},
-    {"id": "llama-3.1-8b-instant",    "name": "Llama 3.1 8B Instant","context": "128k", "notes": "Ultra fast generation"},
     {"id": "openai/gpt-oss-20b",      "name": "GPT-OSS 20B",         "context": "128k", "notes": "Balanced speed and quality"},
-    {"id": "qwen/qwen3.6-27b",        "name": "Qwen 3.6 27B",        "context": "256k", "notes": "Previous-gen Qwen"},
-    {"id": "allam-2-7b",              "name": "Allam 2 7B",          "context": "4k",   "notes": "Small & fast"},
 ]
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
 USE_CLOUD_MODEL = os.getenv("USE_CLOUD_MODEL", "false").lower() in ("1", "true", "yes", "on")
 
-# Free-tier Groq caps tokens/minute at ~6000. Adaptive TPM pacing keeps a
-# rolling 60s token budget (estimated prompt + max output) under this ceiling
-# so we get throttled by pacing instead of 429 storms.
+# Set this to the selected model's actual organization TPM limit from Groq
+# Console. The fallback is conservative; response headers can lower it.
 GROQ_TPM_LIMIT = int(os.getenv("GROQ_TPM_LIMIT", "6000"))
 GROQ_TPM_WINDOW_SECONDS = float(os.getenv("GROQ_TPM_WINDOW_SECONDS", "60"))
-GROQ_TPM_SAFETY_MARGIN = float(os.getenv("GROQ_TPM_SAFETY_MARGIN", "0.15"))
+GROQ_TPM_SAFETY_MARGIN = float(os.getenv("GROQ_TPM_SAFETY_MARGIN", "0.20"))
 # Reserve for calls that don't pass max_tokens (avoids reserving full 4096).
 GROQ_TPM_RESERVE_DEFAULT = int(os.getenv("GROQ_TPM_RESERVE_DEFAULT", "1200"))
 GROQ_TPM_PACING = os.getenv("GROQ_TPM_PACING", "true").lower() in ("1", "true", "yes", "on")
-# Preemptively pick the key with the most remaining TPM budget per window,
-# instead of only rotating after a 429.
+# Multi-account rotation: balance requests across different accounts proactively.
 GROQ_PROACTIVE_ROTATION = os.getenv("GROQ_PROACTIVE_ROTATION", "true").lower() in (
     "1", "true", "yes", "on",
 )
+KEY_ROTATION_STRATEGY = os.getenv("KEY_ROTATION_STRATEGY", "least_loaded").lower()
+# One workload budget across credentials. Keys are not independent quota pools.
+GROQ_QUOTA_GROUP = os.getenv("GROQ_QUOTA_GROUP", "story-teller")
+GROQ_QUOTA_DB = os.getenv("GROQ_QUOTA_DB", os.path.join(PROJECT_ROOT, "runtime", "quotas.sqlite3"))
+GROQ_RPM_LIMIT = int(os.getenv("GROQ_RPM_LIMIT", "30"))
+GROQ_RPD_LIMIT = int(os.getenv("GROQ_RPD_LIMIT", "1000"))
+GROQ_TPD_LIMIT = int(os.getenv("GROQ_TPD_LIMIT", "200000"))
+GROQ_ITPM_LIMIT = int(os.getenv("GROQ_ITPM_LIMIT", "0"))
+GROQ_OTPM_LIMIT = int(os.getenv("GROQ_OTPM_LIMIT", "0"))
+GROQ_BACKUP_WAIT_SECONDS = float(os.getenv("GROQ_BACKUP_WAIT_SECONDS", "20"))
+GROQ_SUPPORT_BACKEND = os.getenv("GROQ_SUPPORT_BACKEND", "gemini").lower()
+SCENE_REPAIR_CALLS = int(os.getenv("SCENE_REPAIR_CALLS", "2"))
 # Route Planner/Critic/Editor/Verifier to a local GGUF and reserve Groq for the
 # Writer. Only activates when a local model is present and loadable.
 HYBRID_ROUTING = os.getenv("HYBRID_ROUTING", "true").lower() in ("1", "true", "yes", "on")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_API_KEYS = [k.strip() for k in os.getenv("GEMINI_API_KEYS", "").split(",") if k.strip()]
+if GEMINI_API_KEY and GEMINI_API_KEY not in GEMINI_API_KEYS:
+    GEMINI_API_KEYS.insert(0, GEMINI_API_KEY)
+if not GEMINI_API_KEY and GEMINI_API_KEYS:
+    GEMINI_API_KEY = GEMINI_API_KEYS[0]
+GEMINI_ROTATE_ON_RATE_LIMIT = os.getenv("GEMINI_ROTATE_ON_RATE_LIMIT", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+GEMINI_PROACTIVE_ROTATION = os.getenv("GEMINI_PROACTIVE_ROTATION", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 GEMINI_TPM_LIMIT = int(os.getenv("GEMINI_TPM_LIMIT", "200000"))
 
@@ -87,6 +106,17 @@ GEMINI_MODELS = [
 ]
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_API_KEYS = [k.strip() for k in os.getenv("OPENROUTER_API_KEYS", "").split(",") if k.strip()]
+if OPENROUTER_API_KEY and OPENROUTER_API_KEY not in OPENROUTER_API_KEYS:
+    OPENROUTER_API_KEYS.insert(0, OPENROUTER_API_KEY)
+if not OPENROUTER_API_KEY and OPENROUTER_API_KEYS:
+    OPENROUTER_API_KEY = OPENROUTER_API_KEYS[0]
+OPENROUTER_ROTATE_ON_RATE_LIMIT = os.getenv("OPENROUTER_ROTATE_ON_RATE_LIMIT", "true").lower() in (
+    "1", "true", "yes", "on",
+)
+OPENROUTER_PROACTIVE_ROTATION = os.getenv("OPENROUTER_PROACTIVE_ROTATION", "true").lower() in (
+    "1", "true", "yes", "on",
+)
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-ultra-550b-a55b:free")
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MIN_REQUEST_INTERVAL = float(os.getenv("OPENROUTER_MIN_REQUEST_INTERVAL", "1.0"))
@@ -211,9 +241,10 @@ RETRY_BACKOFF_FACTOR = 2.0
 
 # Groq free/dev accounts are usually constrained more by request and token
 # windows than raw model speed. Keep these conservative to avoid 429 storms.
-GROQ_MIN_REQUEST_INTERVAL = float(os.getenv("GROQ_MIN_REQUEST_INTERVAL", "8.0"))
+GROQ_MIN_REQUEST_INTERVAL = float(os.getenv("GROQ_MIN_REQUEST_INTERVAL", "0.0"))
 GROQ_RATE_LIMIT_BUFFER = float(os.getenv("GROQ_RATE_LIMIT_BUFFER", "5.0"))
-GROQ_ROTATE_ON_RATE_LIMIT = os.getenv("GROQ_ROTATE_ON_RATE_LIMIT", "false").lower() in (
+# When rate-limited (429), immediately fail over to another healthy account key.
+GROQ_ROTATE_ON_RATE_LIMIT = os.getenv("GROQ_ROTATE_ON_RATE_LIMIT", "true").lower() in (
     "1",
     "true",
     "yes",
@@ -234,4 +265,3 @@ SSE_QUEUE_MAXSIZE = int(os.getenv("SSE_QUEUE_MAXSIZE", "1000"))
 VISION_BACKEND = os.getenv("VISION_BACKEND", "local").lower()
 OLLAMA_VISION_URL = os.getenv("OLLAMA_VISION_URL", "http://localhost:11434")
 OLLAMA_VISION_MODEL = os.getenv("OLLAMA_VISION_MODEL", "moondream")
-

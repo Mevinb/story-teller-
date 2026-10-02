@@ -27,6 +27,10 @@ class ContentBlockedError(Exception):
     """
 
 
+class QuotaExhaustedError(RuntimeError):
+    """A provider's daily quota is exhausted; another immediate retry cannot help."""
+
+
 # ─── Reasoning-tag filtering (shared by OpenAI-compatible backends) ──────
 _REASONING_BLOCK_RE = re.compile(
     r"<(?:think|analysis|reasoning)>.*?</(?:think|analysis|reasoning)>",
@@ -402,7 +406,13 @@ class LLMInterface(ABC):
                 )
             except PipelineCancelledError:
                 raise
+            except QuotaExhaustedError:
+                raise
             except Exception as e:
+                # Provider wrappers already honor Retry-After. Repeating the whole
+                # wrapper here multiplies 429s and can consume the daily request cap.
+                if getattr(e, "status_code", None) == 429:
+                    raise
                 last_error = e
                 err_str = str(e).lower()
                 

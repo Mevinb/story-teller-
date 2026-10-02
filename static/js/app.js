@@ -7,12 +7,15 @@
 let currentProject = null;
 let activeModel = '';
 let modelsCatalog = null;
+let modelPickerFilter = 'all';
 let runtimeSettings = null;
 let projectsList = [];
 let characters = [];
 let editCharacters = [];
 let isGenerating = false;
 let eventSource = null;
+let combineEventSource = null;
+let currentGenerationChapter = 0;
 let totalWords = 0;
 let scenesComplete = 0;
 let totalScenes = 0;
@@ -23,10 +26,13 @@ let manualScenesCompleted = 0;
 let manualChapterNum = 0;
 let manualIsGeneratingScene = false;
 let manualSceneTexts = new Map();
+let visionChatSessionId = null;
 
 // Premise Studio State
 let premiseSteps = [];
 let premiseCharacters = {};
+let premiseMode = 'continue';
+let premiseStoryAnalysis = null;
 
 // Reader State
 let currentChapterNumber = 1;
@@ -195,7 +201,7 @@ function refreshCurrentView() {
 // ─── Model Management (Universal Switcher & Modal) ────────────────
 async function loadModels() {
     try {
-        const res = await fetch('/api/models');
+        const res = await fetch('/api/models', { cache: 'no-store' });
         if (!res.ok) throw new Error('Failed to fetch models');
         modelsCatalog = await res.json();
 
@@ -221,7 +227,7 @@ async function loadModels() {
         }
 
         // Render modal model cards
-        renderModalModelCards('all');
+        renderModalModelCards(modelPickerFilter);
 
         // Populate settings active model select
         populateSettingsModelSelect(modelsCatalog);
@@ -232,10 +238,12 @@ async function loadModels() {
     }
 }
 
-function openModelModal() {
-    if (!modelsCatalog) loadModels();
+async function openModelModal() {
     document.getElementById('modelSwitcherModal')?.classList.remove('hidden');
     filterModalModels('all');
+    // Refresh on every opening so a previously loaded catalog cannot hide
+    // newly configured models. Server-rendered Groq cards cover first load.
+    await loadModels();
 }
 
 function closeModelModal() {
@@ -243,6 +251,7 @@ function closeModelModal() {
 }
 
 function filterModalModels(provider) {
+    modelPickerFilter = provider;
     document.querySelectorAll('#modalProviderTabs .bible-tab-btn').forEach(btn => {
         btn.classList.remove('active');
         if (btn.textContent.toLowerCase().includes(provider) || (provider === 'all' && btn.textContent.includes('All'))) {
@@ -378,7 +387,7 @@ async function switchModel(modelId) {
         activeModel = data.active || modelId;
         const provider = parseModelProvider(activeModel);
         showToast(`Switched active engine to ${formatModelDisplayName(activeModel)} (${provider.toUpperCase()})`, 'success');
-        
+
         closeModelModal();
         await loadModels();
         setStatus('online', 'Engine Ready');
@@ -623,6 +632,135 @@ function addCharacter() {
 function removeCharacter(idx) {
     characters.splice(idx, 1);
     renderCharacterList();
+}
+
+// ─── Draft Architect for Create Story View ────────────────────────
+let createArchMode = 'continue';
+
+function setCreateArchMode(mode) {
+    createArchMode = mode;
+    ['continue', 'rearchitect', 'auto'].forEach(m => {
+        const btn = document.getElementById(`btnCreateArch${m.charAt(0).toUpperCase() + m.slice(1)}`);
+        if (btn) {
+            if (m === mode) {
+                btn.classList.add('active');
+                btn.classList.remove('btn-secondary');
+                btn.classList.add('btn-primary');
+            } else {
+                btn.classList.remove('active');
+                btn.classList.remove('btn-primary');
+                btn.classList.add('btn-secondary');
+            }
+        }
+    });
+}
+
+async function generateFromDraftInCreateView() {
+    const input = document.getElementById('createDraftInput');
+    const text = (input?.value || '').trim();
+    if (!text) {
+        showToast('Please paste a story draft or narrative notes first', 'warning');
+        input?.focus();
+        return;
+    }
+
+    const scopeSel = document.getElementById('createArchScope')?.value || '8';
+    const targetChapters = parseInt(scopeSel, 10);
+    const btn = document.getElementById('btnCreateArchGenerate');
+    const banner = document.getElementById('createDraftGraspBanner');
+
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = createArchMode === 'continue' ? '⏩ Grasping Draft & Architecting Story...' : '✨ Architecting Master Story Plan...';
+    }
+    if (banner) banner.style.display = 'none';
+
+    try {
+        const res = await fetch('/api/premise/generate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                idea_text: text,
+                mode: createArchMode,
+                target_chapters: targetChapters,
+                model: typeof activeModel !== 'undefined' ? activeModel : null,
+                setting: document.getElementById('createSetting')?.value || '',
+                themes: (document.getElementById('createThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean),
+            }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate story details');
+
+        if (!data.steps || data.steps.length === 0) {
+            throw new Error('AI generation did not produce story beats. Please try again.');
+        }
+
+        // Populate title if empty or placeholder
+        const titleEl = document.getElementById('createTitle');
+        if (titleEl && (!titleEl.value.trim() || titleEl.value.startsWith('Untitled') || titleEl.value === 'USER:')) {
+            if (data.title) titleEl.value = data.title;
+        }
+
+        // Populate genre
+        const genreEl = document.getElementById('createGenre');
+        if (genreEl && data.genre) {
+            const matchOpt = Array.from(genreEl.options).find(o => 
+                o.value.toLowerCase() === data.genre.toLowerCase() || 
+                o.text.toLowerCase().includes(data.genre.toLowerCase())
+            );
+            if (matchOpt) genreEl.value = matchOpt.value;
+        }
+
+        // Populate premise steps
+        const premiseEl = document.getElementById('createPremise');
+        if (premiseEl) {
+            const formattedBeats = (data.steps || []).map((s, i) => `${i + 1}. ${s}`).join('\n\n');
+            premiseEl.value = formattedBeats || data.summary || premiseEl.value;
+        }
+
+        // Populate setting and themes
+        const settingEl = document.getElementById('createSetting');
+        if (settingEl && data.setting) settingEl.value = data.setting;
+
+        const themesEl = document.getElementById('createThemes');
+        if (themesEl && data.themes && data.themes.length > 0) {
+            themesEl.value = data.themes.join(', ');
+        }
+
+        // Add characters
+        if (data.characters && Object.keys(data.characters).length > 0) {
+            for (const [cname, cinfo] of Object.entries(data.characters)) {
+                const desc = typeof cinfo === 'string' ? cinfo : (cinfo.description || '');
+                const traits = typeof cinfo === 'object' && Array.isArray(cinfo.traits) ? cinfo.traits : [];
+                if (!characters.some(c => c.name.toLowerCase() === cname.toLowerCase())) {
+                    characters.push({ name: cname, description: desc, traits });
+                }
+            }
+            renderCharacterList();
+        }
+
+        if (banner) {
+            banner.style.display = 'block';
+            const grasp = data.story_analysis || {};
+            banner.innerHTML = `
+                <div style="font-weight:600; color:#c4b5fd;">
+                    ${grasp.mode_applied === 'continue' ? '⏩ Story Draft Grasped & Completed' : '🔄 Full Story Re-architected from Beginning'}
+                </div>
+                ${grasp.cutoff_point ? `<div style="color:var(--text-dim); margin-top:4px;"><em>Continuation Bridge:</em> ${escHtml(grasp.cutoff_point)}</div>` : ''}
+                ${grasp.central_conflict ? `<div style="margin-top:4px;"><strong>Conflict:</strong> ${escHtml(grasp.central_conflict)}</div>` : ''}
+            `;
+        }
+
+        showToast('Story details, premise beats, and characters successfully auto-filled!', 'success');
+    } catch (e) {
+        showToast(e.message || 'Draft analysis failed', 'error');
+    } finally {
+        if (btn) {
+            btn.disabled = false;
+            btn.textContent = '✨ Generate & Auto-Fill Story Details';
+        }
+    }
 }
 
 // ─── Create Story Action ──────────────────────────────────────────
@@ -890,16 +1028,59 @@ function renderPremiseCharactersChips(charsObj) {
     `).join('');
 }
 
+function setPremiseMode(mode) {
+    premiseMode = mode;
+    ['btnModeContinue', 'btnModeRearchitect', 'btnModeAuto'].forEach(id => {
+        const btn = document.getElementById(id);
+        if (btn) btn.classList.remove('active');
+    });
+    if (mode === 'continue') document.getElementById('btnModeContinue')?.classList.add('active');
+    else if (mode === 'rearchitect') document.getElementById('btnModeRearchitect')?.classList.add('active');
+    else if (mode === 'auto') document.getElementById('btnModeAuto')?.classList.add('active');
+}
+
+function onPremiseScopeChange() {
+    const sel = document.getElementById('premiseTargetScope')?.value;
+    const customWrap = document.getElementById('premiseCustomBeatsWrap');
+    if (customWrap) {
+        customWrap.style.display = sel === 'custom' ? 'block' : 'none';
+    }
+}
+
+async function syncPremiseLoreToBible() {
+    if (!currentProject) return;
+    const setting = (document.getElementById('premiseSetting')?.value || '').trim();
+    const themes = (document.getElementById('premiseThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean);
+    try {
+        const res = await fetch(`/api/project/${currentProject}/state`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                metadata: { setting, themes },
+                characters: premiseCharacters
+            })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to sync');
+        showToast('Story Bible updated with characters, setting & themes!', 'success');
+    } catch (e) {
+        showToast(e.message || 'Sync failed', 'error');
+    }
+}
+
 function renderPremiseTimeline() {
     const container = document.getElementById('premiseTimelineContainer');
     if (!container) return;
+
+    const counter = document.getElementById('premiseBeatsCounter');
+    if (counter) counter.textContent = `${premiseSteps.length} beat${premiseSteps.length === 1 ? '' : 's'}`;
 
     if (premiseSteps.length === 0) {
         container.innerHTML = `
             <div class="empty-state">
                 <span class="icon">📋</span>
                 <h3>No beats defined</h3>
-                <p>Enter an outline on the left and click "Generate Structured Beats" or add beats manually.</p>
+                <p>Enter your outline or half-made story on the left and click "Architect Complete Story Timeline".</p>
             </div>
         `;
         return;
@@ -916,6 +1097,32 @@ function renderPremiseTimeline() {
             </div>
         </div>
     `).join('');
+}
+
+function renderPremiseGraspBanner(data) {
+    const banner = document.getElementById('premiseGraspBanner');
+    if (!banner) return;
+    const analysis = data.story_analysis || {};
+    const titleEl = document.getElementById('premiseGraspTitle');
+    const typeEl = document.getElementById('premiseGraspType');
+    const detailsEl = document.getElementById('premiseGraspDetails');
+
+    banner.classList.remove('hidden');
+    const modeApplied = analysis.mode_applied || premiseMode;
+    if (modeApplied === 'continue') {
+        titleEl.textContent = '⏩ Half-Made Story Grasped & Completed';
+        typeEl.textContent = 'Draft Continued to Climax';
+    } else {
+        titleEl.textContent = '🔄 Full Master Story Arc Re-architected';
+        typeEl.textContent = 'Full Timeline from Scratch';
+    }
+
+    const charCount = Object.keys(data.characters || {}).length;
+    const cutoff = analysis.cutoff_point ? ` · <em>Cutoff / Bridge:</em> ${escHtml(analysis.cutoff_point)}` : '';
+    const conflict = analysis.central_conflict ? `<br><strong>Central Conflict:</strong> ${escHtml(analysis.central_conflict)}` : '';
+    const summary = data.summary ? `<br><strong>Master Arc:</strong> ${escHtml(data.summary)}` : '';
+
+    detailsEl.innerHTML = `Identified ${charCount} character${charCount === 1 ? '' : 's'}${cutoff}${conflict}${summary}`;
 }
 
 function addBlankPremiseStep() {
@@ -949,27 +1156,68 @@ async function aiGeneratePremise() {
         return;
     }
 
+    const scopeSel = document.getElementById('premiseTargetScope')?.value || '8';
+    let targetBeats = null;
+    let targetChapters = null;
+    if (scopeSel === 'custom') {
+        targetBeats = parseInt(document.getElementById('premiseCustomBeats')?.value || '18', 10);
+    } else {
+        targetChapters = parseInt(scopeSel, 10);
+    }
+
+    const autoSync = !!document.getElementById('premiseAutoSyncBible')?.checked;
+
     const btn = document.getElementById('btnPremiseGenerate');
-    if (btn) { btn.disabled = true; btn.textContent = '✨ Architecting Beats...'; }
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = premiseMode === 'continue' ? '⏩ Grasping Draft & Finishing Story...' : '✨ Architecting Master Timeline...';
+    }
 
     try {
         const res = await fetch(`/api/project/${currentProject}/premise/generate`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ idea_text: text }),
+            body: JSON.stringify({
+                idea_text: text,
+                mode: premiseMode,
+                target_chapters: targetChapters,
+                target_beats: targetBeats,
+                model: activeModel,
+                apply_to_bible: autoSync,
+                characters: premiseCharacters,
+                setting: document.getElementById('premiseSetting')?.value || '',
+                themes: (document.getElementById('premiseThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean)
+            }),
         });
 
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate beats');
 
         premiseSteps = data.steps || [];
+        premiseStoryAnalysis = data.story_analysis || null;
+
+        // Auto-populate extracted characters if returned
+        if (data.characters && Object.keys(data.characters).length > 0) {
+            premiseCharacters = { ...premiseCharacters, ...data.characters };
+            renderPremiseCharactersChips(premiseCharacters);
+        }
+        if (data.setting && !document.getElementById('premiseSetting')?.value) {
+            document.getElementById('premiseSetting').value = data.setting;
+        }
+        if (data.themes && data.themes.length > 0 && !document.getElementById('premiseThemes')?.value) {
+            document.getElementById('premiseThemes').value = data.themes.join(', ');
+        }
+
         renderPremiseTimeline();
-        showToast(`Generated ${premiseSteps.length} narrative timeline beats!`, 'success');
+        renderPremiseGraspBanner(data);
+
+        const modeLabel = (data.story_analysis?.mode_applied || premiseMode) === 'continue' ? 'continued from draft' : 'architected from beginning';
+        showToast(`Successfully ${modeLabel}: generated ${premiseSteps.length} narrative beats!`, 'success');
 
     } catch (e) {
         showToast(e.message || 'Generation failed', 'error');
     } finally {
-        if (btn) { btn.disabled = false; btn.textContent = '✨ Generate Structured Beats from Outline'; }
+        if (btn) { btn.disabled = false; btn.textContent = '✨ Architect Complete Story Timeline'; }
     }
 }
 
@@ -982,7 +1230,13 @@ async function aiRefinePremiseFlow() {
         const res = await fetch(`/api/project/${currentProject}/premise/refine`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ steps: premiseSteps }),
+            body: JSON.stringify({
+                steps: premiseSteps,
+                model: activeModel,
+                characters: premiseCharacters,
+                setting: document.getElementById('premiseSetting')?.value || '',
+                themes: (document.getElementById('premiseThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean)
+            }),
         });
 
         const data = await res.json();
@@ -1008,7 +1262,13 @@ async function aiExpandPremiseBeats() {
         const res = await fetch(`/api/project/${currentProject}/premise/expand`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ steps: premiseSteps }),
+            body: JSON.stringify({
+                steps: premiseSteps,
+                model: activeModel,
+                characters: premiseCharacters,
+                setting: document.getElementById('premiseSetting')?.value || '',
+                themes: (document.getElementById('premiseThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean)
+            }),
         });
 
         const data = await res.json();
@@ -1031,20 +1291,23 @@ async function savePremiseToProject() {
     if (btn) { btn.disabled = true; btn.textContent = '💾 Saving...'; }
 
     const formattedPremise = premiseSteps.map((s, i) => `${i + 1}. ${s}`).join('\n\n');
+    const setting = (document.getElementById('premiseSetting')?.value || '').trim();
+    const themes = (document.getElementById('premiseThemes')?.value || '').split(',').map(s => s.trim()).filter(Boolean);
 
     try {
         const res = await fetch(`/api/project/${currentProject}/state`, {
             method: 'PUT',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-                metadata: { premise: formattedPremise },
+                metadata: { premise: formattedPremise, setting, themes },
+                characters: premiseCharacters,
             }),
         });
 
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || 'Failed to save');
 
-        showToast('Saved premise timeline to Story Bible!', 'success');
+        showToast('Saved premise timeline, characters & setting to Story Bible!', 'success');
 
     } catch (e) {
         showToast(e.message || 'Save failed', 'error');
@@ -1112,9 +1375,14 @@ function connectSSEStream() {
         eventSource = null;
     }
 
-    eventSource = new EventSource(`/api/project/${currentProject}/generate/stream`);
+    const stream = new EventSource(`/api/project/${currentProject}/generate/stream`);
+    eventSource = stream;
 
-    eventSource.onmessage = (e) => {
+    stream.onopen = () => {
+        if (isGenerating || manualIsGeneratingScene) setStatus('generating', 'Pipeline Active');
+    };
+
+    stream.onmessage = (e) => {
         try {
             const data = JSON.parse(e.data);
             handleSSEEvent(data);
@@ -1123,12 +1391,17 @@ function connectSSEStream() {
         }
     };
 
-    eventSource.onerror = (e) => {
-        console.warn('SSE stream closed or disconnected');
-        if (eventSource) {
-            eventSource.close();
-            eventSource = null;
+    stream.onerror = () => {
+        if (stream !== eventSource) return;
+        if (stream.readyState === EventSource.CONNECTING) {
+            // EventSource reconnects with Last-Event-ID. Keep the generation
+            // controls active; a transport interruption doesn't stop its worker.
+            setStatus('generating', 'Reconnecting to live progress...');
+            return;
         }
+        console.warn('SSE stream closed');
+        stream.close();
+        eventSource = null;
         // Reset UI if we were generating when the stream died
         if (isGenerating) {
             isGenerating = false;
@@ -1144,6 +1417,12 @@ function handleSSEEvent(payload) {
     const eventType = payload.type || payload.event;
     const data = payload.payload || payload.data || payload;
 
+    if (eventType === 'heartbeat') return;
+    if (eventType === 'done' || eventType === 'error') {
+        eventSource?.close();
+        eventSource = null;
+    }
+
     // Log terminal
     appendLogEntry(payload);
 
@@ -1154,9 +1433,20 @@ function handleSSEEvent(payload) {
     }
 
     // Status message
+    if (eventType === 'quota') {
+        if (data.phase === 'backup') {
+            document.getElementById('statStatus').textContent = `Using backup: ${data.model}`;
+        } else if (data.phase === 'waiting') {
+            document.getElementById('statStatus').textContent = `Waiting for ${data.reason}: ${Math.ceil(data.wait_seconds || 0)}s`;
+        }
+    }
     if (eventType === 'status') {
         const msg = typeof data === 'string' ? data : (data.content || '');
         document.getElementById('statStatus').textContent = msg;
+    }
+
+    if (eventType === 'chapter_start') {
+        currentGenerationChapter = Number(data.chapter || 0);
     }
 
     // Scene start
@@ -1164,14 +1454,15 @@ function handleSSEEvent(payload) {
         const output = document.getElementById('genOutput');
         const sceneNum = data.scene || 1;
         // Prevent duplicates on reconnect
-        if (document.getElementById(`sceneCard_${sceneNum}`)) return;
+        const sceneId = `sceneCard_${currentGenerationChapter}_${sceneNum}`;
+        if (document.getElementById(sceneId)) return;
         const cardHtml = `
-            <div class="scene-output-card" id="sceneCard_${sceneNum}">
+            <div class="scene-output-card" id="${sceneId}">
                 <div class="scene-output-card-header">
                     <span class="scene-output-title">Scene ${sceneNum}</span>
-                    <span class="scene-meta" id="sceneMeta_${sceneNum}">Writing...</span>
+                    <span class="scene-meta">Writing...</span>
                 </div>
-                <div class="scene-prose" id="sceneProse_${sceneNum}"></div>
+                <div class="scene-prose"></div>
             </div>
         `;
         output.insertAdjacentHTML('beforeend', cardHtml);
@@ -1179,8 +1470,13 @@ function handleSSEEvent(payload) {
     }
 
     // Stream token
-    if (eventType === 'stream_token') {
+    if (eventType === 'stream_token' || eventType === 'token') {
         const token = typeof data === 'string' ? data : (data.token || data.content || '');
+        if (manualIsGeneratingScene) {
+            const manualOutput = document.getElementById('manualStreamOutput');
+            if (manualOutput) manualOutput.textContent += token;
+            return;
+        }
         const cards = document.querySelectorAll('.scene-output-card');
         const lastCard = cards[cards.length - 1];
         if (lastCard) {
@@ -1197,10 +1493,11 @@ function handleSSEEvent(payload) {
     if (eventType === 'scene_complete') {
         const sceneNum = data.scene || 1;
         const words = data.word_count || (data.text || '').split(/\s+/).filter(Boolean).length;
-        const metaEl = document.getElementById(`sceneMeta_${sceneNum}`);
+        const card = document.getElementById(`sceneCard_${currentGenerationChapter}_${sceneNum}`);
+        const metaEl = card?.querySelector('.scene-meta');
         if (metaEl) metaEl.textContent = `${words} words • Score: ${(data.score || 0.85).toFixed(2)}`;
 
-        const proseEl = document.getElementById(`sceneProse_${sceneNum}`);
+        const proseEl = card?.querySelector('.scene-prose');
         if (proseEl && data.text) proseEl.textContent = data.text;
 
         totalWords += words;
@@ -1208,19 +1505,50 @@ function handleSSEEvent(payload) {
     }
 
     // Chapter complete / Done
-    if (eventType === 'chapter_complete' || eventType === 'done') {
+    if (eventType === 'chapter_complete') {
+        setStatus('generating', 'Chapter Complete — continuing');
+        loadProjects();
+    }
+
+    if (eventType === 'manual_scene_done') {
+        manualIsGeneratingScene = false;
+        document.getElementById('btnManualScene').disabled = false;
+        document.getElementById('btnManualStopScene')?.classList.add('hidden');
+        syncManualStatus();
+        if (data.status === 'cancelled') showToast('Scene generation stopped', 'info');
+        else if (data.error) showToast(data.error, 'error');
+        else showToast('Scene completed', 'success');
+    }
+
+    if (eventType === 'done') {
         isGenerating = false;
         document.getElementById('btnGenerate')?.classList.remove('hidden');
         document.getElementById('btnCancel')?.classList.add('hidden');
         setStatus('online', 'Chapter Complete');
         markAllPipelineNodesDone();
-        showToast('Chapter generation complete!', 'success');
+        if (data.status === 'cancelled') {
+            setStatus('online', 'Cancelled');
+            showToast(data.message || 'Generation cancelled', 'info');
+        } else if (manualSessionActive) {
+            manualSessionActive = false;
+            document.getElementById('manualStartCard')?.classList.remove('hidden');
+            document.getElementById('manualSceneCard')?.classList.add('hidden');
+            showToast('Chapter finalized successfully!', 'success');
+            switchView('reader');
+        } else {
+            showToast('Generation complete!', 'success');
+        }
         loadProjects();
     }
 
     // Error
     if (eventType === 'error') {
         isGenerating = false;
+        if (manualIsGeneratingScene) {
+            manualIsGeneratingScene = false;
+            document.getElementById('btnManualScene').disabled = false;
+            document.getElementById('btnManualStopScene')?.classList.add('hidden');
+        }
         document.getElementById('btnGenerate')?.classList.remove('hidden');
         document.getElementById('btnCancel')?.classList.add('hidden');
         setStatus('error', 'Error');
@@ -1546,12 +1874,8 @@ async function finishManualChapter() {
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || 'Failed to finish chapter');
 
-        showToast('Chapter finished and stored successfully!', 'success');
-        manualSessionActive = false;
-        document.getElementById('manualStartCard')?.classList.remove('hidden');
-        document.getElementById('manualSceneCard')?.classList.add('hidden');
-        loadProjects();
-        switchView('reader');
+        connectSSEStream();
+        showToast('Finalizing chapter...', 'info');
 
     } catch (e) {
         showToast(e.message, 'error');
@@ -1559,12 +1883,41 @@ async function finishManualChapter() {
 }
 
 function cancelManualSession() {
-    showConfirmModal('Reset Session', 'Discard active uncommitted manual chapter session?', () => {
-        manualSessionActive = false;
-        document.getElementById('manualStartCard')?.classList.remove('hidden');
-        document.getElementById('manualSceneCard')?.classList.add('hidden');
-        showToast('Session reset', 'info');
+    showConfirmModal('Reset Session', 'Stop this session? Your work-in-progress will be kept for resuming.', async () => {
+        try {
+            const res = await fetch(`/api/project/${currentProject}/generate/manual/abort`, { method: 'POST' });
+            const data = await res.json();
+            if (!res.ok || data.error) throw new Error(data.error || 'Failed to stop session');
+            manualSessionActive = false;
+            document.getElementById('manualStartCard')?.classList.remove('hidden');
+            document.getElementById('manualSceneCard')?.classList.add('hidden');
+            showToast('Session stopped; draft preserved', 'info');
+        } catch (e) {
+            showToast(e.message, 'error');
+        }
     });
+}
+
+async function stopManualScene() {
+    if (!currentProject) return;
+    const res = await fetch(`/api/project/${currentProject}/generate/manual/cancel_scene`, { method: 'POST' });
+    if (!res.ok) showToast('Could not stop scene generation', 'error');
+}
+
+async function editManualScene(idx) {
+    const current = manualSceneTexts.get(idx) || '';
+    const replacement = window.prompt(`Edit Scene ${idx + 1}:`, current);
+    if (replacement === null || !replacement.trim()) return;
+    try {
+        const res = await fetch(`/api/project/${currentProject}/generate/manual/scene/${idx}`, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text: replacement.trim() }),
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Failed to edit scene');
+        await syncManualStatus();
+        showToast('Scene updated', 'success');
+    } catch (e) { showToast(e.message, 'error'); }
 }
 
 // ─── Story Reader Studio ──────────────────────────────────────────
@@ -1625,6 +1978,7 @@ async function loadChapter(num) {
         document.getElementById('readerChapterTitle').innerHTML = `<span class="icon">📖</span> Chapter ${num}: ${escHtml(data.title || `Chapter ${num}`)}`;
         document.getElementById('readerContent').innerHTML = formatProseMarkdown(currentChapterRaw);
         document.getElementById('readerEditor').value = currentChapterRaw;
+        loadScenePrompts(`chapter:${num}`, 'readerContent');
 
     } catch (e) {
         showToast('Failed to read chapter', 'error');
@@ -1813,13 +2167,15 @@ async function loadCombineVersion(suffix) {
             document.getElementById('combineAnalysis').textContent = data.analysis;
         }
 
-        if (data.polished) {
+        const revised = data.revised || data.polished || '';
+        if (revised) {
             document.getElementById('combinePolishedCard')?.classList.remove('hidden');
-            document.getElementById('combinePolished').innerHTML = formatProseMarkdown(data.polished);
+            document.getElementById('combinePolished').innerHTML = formatProseMarkdown(revised);
+            loadScenePrompts(`story:${suffix}`, 'combinePolished');
         }
 
         document.getElementById('combineDownloadCard')?.classList.remove('hidden');
-        document.getElementById('combineStats').textContent = `${(data.polished || '').split(/\s+/).length} words`;
+        document.getElementById('combineStats').textContent = `${revised.split(/\s+/).filter(Boolean).length} words`;
 
     } catch (e) {
         console.warn('Error loading version:', e);
@@ -1837,15 +2193,13 @@ async function startCombine() {
         const res = await fetch(`/api/project/${currentProject}/combine`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model }),
+            body: JSON.stringify({ model, mode: 'polish' }),
         });
 
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || 'Combine failed');
 
-        showToast('Combine and Polish completed!', 'success');
-        document.getElementById('combineProgress')?.classList.add('hidden');
-        loadCombineVersions();
+        connectCombineStream();
 
     } catch (e) {
         document.getElementById('combineProgress')?.classList.add('hidden');
@@ -1864,15 +2218,13 @@ async function startWholeStory() {
         const res = await fetch(`/api/project/${currentProject}/combine`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ model, whole_story: true }),
+            body: JSON.stringify({ model, mode: 'whole' }),
         });
 
         const data = await res.json();
         if (!res.ok || data.error) throw new Error(data.error || 'Generation failed');
 
-        showToast('Generated whole story successfully!', 'success');
-        document.getElementById('combineProgress')?.classList.add('hidden');
-        loadCombineVersions();
+        connectCombineStream();
 
     } catch (e) {
         document.getElementById('combineProgress')?.classList.add('hidden');
@@ -1888,6 +2240,38 @@ function cancelCombine() {
     showToast('Combiner cancelled', 'info');
 }
 
+function connectCombineStream() {
+    combineEventSource?.close();
+    const stream = new EventSource(`/api/project/${currentProject}/combine/stream`);
+    combineEventSource = stream;
+    stream.onmessage = (event) => {
+        const message = JSON.parse(event.data);
+        const data = message.payload || message.data || {};
+        if (message.type === 'combine_status') {
+            document.getElementById('combineStatusText').textContent = data.step || data.content || 'Working...';
+        } else if (message.type === 'combine_done') {
+            combineEventSource.close(); combineEventSource = null;
+            document.getElementById('combineProgress')?.classList.add('hidden');
+            showToast('Story processing completed!', 'success');
+            loadCombineVersions();
+        } else if (message.type === 'combine_error') {
+            combineEventSource.close(); combineEventSource = null;
+            document.getElementById('combineProgress')?.classList.add('hidden');
+            showToast(data.error || 'Story processing failed', 'error');
+        }
+    };
+    stream.onerror = () => {
+        if (stream !== combineEventSource) return;
+        if (stream.readyState === EventSource.CONNECTING) {
+            document.getElementById('combineStatusText').textContent = 'Reconnecting to live progress...';
+            return;
+        }
+        stream.close(); combineEventSource = null;
+        document.getElementById('combineProgress')?.classList.add('hidden');
+        showToast('Combine progress stream disconnected', 'error');
+    };
+}
+
 function toggleCombineSection(contentId, btnId) {
     const el = document.getElementById(contentId);
     const btn = document.getElementById(btnId);
@@ -1899,7 +2283,8 @@ function toggleCombineSection(contentId, btnId) {
 
 function downloadCombined(type) {
     if (!currentProject) return;
-    window.open(`/api/project/${currentProject}/combine/download/${type}`, '_blank');
+    const suffix = document.getElementById('combineVersionSelect')?.value || 'latest';
+    window.open(`/api/project/${currentProject}/combine/download/${type}?suffix=${encodeURIComponent(suffix)}`, '_blank');
 }
 
 function renameSelectedVersion() {
@@ -1990,7 +2375,7 @@ async function refreshState() {
 function switchBibleTab(tabName) {
     const stateView = document.getElementById('viewState');
     if (!stateView) return;
-    
+
     stateView.querySelectorAll('.bible-tab-btn').forEach(btn => {
         btn.classList.remove('active');
         if (btn.textContent.toLowerCase().includes(tabName)) btn.classList.add('active');
@@ -2007,11 +2392,14 @@ function switchBibleTab(tabName) {
 
 // ─── Live Terminal Logs ───────────────────────────────────────────
 function appendLogEntry(payload) {
+    const eventType = payload.type || payload.event || 'LOG';
+    // Prose is already streamed into the scene view. A terminal DOM row per
+    // tiny fragment makes the progress consumer unnecessarily expensive.
+    if (['token', 'stream_token', 'heartbeat'].includes(eventType)) return;
     const terminal = document.getElementById('logTerminal');
     if (!terminal) return;
 
     const time = new Date().toLocaleTimeString();
-    const eventType = payload.type || payload.event || 'LOG';
     const content = payload.content || (typeof payload.payload === 'string' ? payload.payload : JSON.stringify(payload.payload || ''));
 
     let tagClass = 'tag-sys';
@@ -2029,6 +2417,7 @@ function appendLogEntry(payload) {
     `;
 
     terminal.appendChild(row);
+    while (terminal.children.length > 500) terminal.firstElementChild.remove();
 
     const autoScroll = document.getElementById('logAutoScroll')?.checked;
     if (autoScroll) {
@@ -2055,13 +2444,11 @@ function filterLogs() {
 let visionSelectedFile = null;
 
 function checkVisionStatus() {
-    fetch('/vision/status')
+    fetch('/api/vision/status')
         .then(res => res.json())
         .then(data => {
             const badge = document.getElementById('visionStatusBadge');
-            if (badge) {
-                badge.textContent = data.backend === 'local' ? 'OLLAMA READY' : 'CLOUD VISION READY';
-            }
+            if (badge) badge.textContent = data.success ? 'VISION READY' : 'VISION UNAVAILABLE';
         })
         .catch(() => {
             const badge = document.getElementById('visionStatusBadge');
@@ -2108,10 +2495,10 @@ async function runVisionAnalysis() {
     const formData = new FormData();
     formData.append('image', visionSelectedFile);
     formData.append('mode', mode);
-    formData.append('extra_prompt', promptExtra);
+    formData.append('prompt_extra', promptExtra);
 
     try {
-        const res = await fetch('/vision/analyze', {
+        const res = await fetch('/api/vision/analyze', {
             method: 'POST',
             body: formData,
         });
@@ -2120,7 +2507,15 @@ async function runVisionAnalysis() {
         if (!res.ok || data.error) throw new Error(data.error || 'Vision analysis failed');
 
         document.getElementById('visionChatInterface')?.classList.remove('hidden');
-        appendVisionChatMessage('assistant', data.analysis || 'Analysis complete.');
+        appendVisionChatMessage('assistant', JSON.stringify(data.data || {}, null, 2));
+        const chatData = new FormData();
+        chatData.append('image', visionSelectedFile);
+        const chatRes = await fetch('/api/vision/chat/start', { method: 'POST', body: chatData });
+        const chatResult = await chatRes.json();
+        if (chatRes.ok && chatResult.success) {
+            visionChatSessionId = chatResult.data.session_id;
+            appendVisionChatMessage('assistant', chatResult.data.initial_message || 'Ask me about the image.');
+        }
         showToast('Character visual breakdown completed!', 'success');
 
     } catch (e) {
@@ -2161,13 +2556,15 @@ async function sendVisionChatMessage() {
     appendVisionChatMessage('user', text);
 
     try {
-        const res = await fetch('/vision/chat', {
+        if (!visionChatSessionId) throw new Error('Analyze an image to start a chat first.');
+        const res = await fetch('/api/vision/chat/message', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ message: text }),
+            body: JSON.stringify({ session_id: visionChatSessionId, message: text }),
         });
         const data = await res.json();
-        appendVisionChatMessage('assistant', data.reply || 'No response.');
+        if (!res.ok || !data.success) throw new Error(data.error || 'Chat failed');
+        appendVisionChatMessage('assistant', data.data?.response || 'No response.');
     } catch (e) {
         appendVisionChatMessage('assistant', `Error: ${e.message}`);
     }
@@ -2204,9 +2601,73 @@ async function loadSettings() {
         });
 
         document.getElementById('settingsSummary').textContent = `Active: ${mode.toUpperCase()} (${formatModelDisplayName(s.ACTIVE_MODEL)})`;
+        await loadKeyRotationStatus();
 
     } catch (e) {
         showToast('Error loading settings', 'error');
+    }
+}
+
+async function loadKeyRotationStatus() {
+    const container = document.getElementById('keyStatusCards');
+    const summaryText = document.getElementById('keyStatusSummaryText');
+    if (!container) return;
+
+    try {
+        const res = await fetch('/api/keys/status');
+        if (!res.ok) return;
+        const data = await res.json();
+
+        let html = '';
+        let totalHealthy = 0;
+        let totalAccounts = 0;
+
+        for (const [provider, info] of Object.entries(data)) {
+            if (!info || !info.total_accounts) continue;
+            totalAccounts += info.total_accounts;
+            totalHealthy += info.healthy_accounts;
+
+            const provTitle = provider.toUpperCase();
+
+            html += `<div style="padding:6px 8px; background:rgba(255,255,255,0.03); border-radius:4px; margin-bottom:4px; border:1px solid rgba(255,255,255,0.05);">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                    <span style="font-weight:600; color:var(--text-primary, #eee);">${provTitle}</span>
+                    <span style="font-size:0.72rem; color:var(--text-muted, #888);">${info.healthy_accounts}/${info.total_accounts} Healthy (${info.strategy})</span>
+                </div>
+                <div style="display:flex; flex-wrap:wrap; gap:4px;">`;
+
+            for (const acc of info.accounts) {
+                let statusBg = '#22c55e'; // green
+                let statusText = 'Ready';
+                if (acc.status === 'cooldown') {
+                    statusBg = '#eab308'; // yellow
+                    statusText = `Cooldown (${acc.seconds_until_available}s)`;
+                } else if (acc.status === 'exhausted') {
+                    statusBg = '#ef4444'; // red
+                    statusText = `Exhausted (${acc.seconds_until_available}s)`;
+                } else if (acc.status === 'disabled') {
+                    statusBg = '#6b7280'; // gray
+                    statusText = 'Invalid Key';
+                }
+
+                html += `<span style="padding:2px 6px; border-radius:3px; background:${statusBg}22; border:1px solid ${statusBg}66; color:${statusBg}; font-family:monospace; font-size:0.75rem;">
+                    ${acc.masked_key}: ${statusText} [${acc.total_requests} reqs]
+                </span>`;
+            }
+
+            html += `</div></div>`;
+        }
+
+        if (!html) {
+            html = '<span style="color:var(--text-muted,#888);">No multi-account pools configured. Add keys above.</span>';
+        }
+
+        container.innerHTML = html;
+        if (summaryText) {
+            summaryText.textContent = `${totalHealthy}/${totalAccounts} Accounts Available`;
+        }
+    } catch (e) {
+        console.error('Failed to load key rotation status', e);
     }
 }
 
@@ -2264,4 +2725,70 @@ document.addEventListener('DOMContentLoaded', () => {
     loadProjects();
     loadModels();
     setStatus('online', 'Engine Ready');
+
+    const btnRefresh = document.getElementById('btnRefreshKeyStatus');
+    if (btnRefresh) {
+        btnRefresh.addEventListener('click', (e) => {
+            e.preventDefault();
+            loadKeyRotationStatus();
+        });
+    }
 });
+
+// Scene prompts are plain text for use with externally attached references.
+const scenePromptPanels = new Map();
+async function loadScenePrompts(source, anchorId) {
+    const project = currentProject;
+    const anchor = document.getElementById(anchorId);
+    if (!anchor) return;
+    const panelId = `${anchorId}ImagePrompts`;
+    let panel = document.getElementById(panelId);
+    if (!panel) {
+        panel = document.createElement('section');
+        panel.id = panelId;
+        panel.className = 'card mt-6';
+        anchor.insertAdjacentElement('beforebegin', panel);
+    }
+    const token = {};
+    scenePromptPanels.set(panelId, {project, source, token, highlights: []});
+    async function refresh() {
+        const state = scenePromptPanels.get(panelId);
+        if (state.token !== token || currentProject !== project) return;
+        try {
+            const res = await fetch(`/api/project/${encodeURIComponent(project)}/image-prompts?source=${encodeURIComponent(source)}`);
+            const data = await res.json();
+            if (!res.ok) throw new Error(data.error || 'Unable to load prompts');
+            if (scenePromptPanels.get(panelId).token !== token || currentProject !== project) return;
+            state.highlights = data.highlights || [];
+            panel.innerHTML = `<h3>Scene image prompts</h3><p class="text-dim">Attach the named character references in your external image tool. Sensitive scenes use non-explicit imagery.</p>
+                <p>${escHtml(data.status === 'generating' ? 'Writing prompts…' : data.status === 'missing' ? 'No prompts for this version yet. Generate them below.' : data.status === 'failed' ? (data.error || 'Prompt generation failed. Retry below.') : '')}</p>
+                <button class="btn btn-secondary" data-action="generate" ${data.status === 'generating' ? 'disabled' : ''}>${data.highlights?.length ? 'Regenerate' : 'Generate prompts'}</button>
+                ${state.highlights.length ? '<button class="btn btn-secondary" data-action="copy-all">Copy all</button> <button class="btn btn-secondary" data-action="download">Download prompts</button>' : ''}
+                ${state.highlights.map((h, i) => `<article class="mt-4"><h4>${escHtml(h.title)}</h4><p>${escHtml(h.context)}</p><p class="text-dim">${escHtml((h.references || []).join(' · '))}</p><pre style="white-space:pre-wrap;font:inherit">${escHtml(h.prompt)}</pre><button class="btn btn-secondary" data-action="copy" data-index="${i}">Copy prompt</button></article>`).join('')}`;
+            if (data.status === 'generating') setTimeout(refresh, 2000);
+        } catch (e) { panel.textContent = e.message; }
+    }
+    panel.onclick = async (event) => {
+        const button = event.target.closest('button[data-action]');
+        if (!button) return;
+        const state = scenePromptPanels.get(panelId);
+        const allText = state.highlights.map(h => `${h.title}\n${h.context}\n${h.prompt}`).join('\n\n');
+        try {
+            if (button.dataset.action === 'generate') {
+                button.disabled = true;
+                const res = await fetch(`/api/project/${encodeURIComponent(project)}/image-prompts`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({source})});
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Unable to generate prompts');
+                await refresh();
+            } else if (button.dataset.action === 'download') {
+                const url = URL.createObjectURL(new Blob([allText], {type: 'text/plain;charset=utf-8'}));
+                const a = document.createElement('a'); a.href = url; a.download = 'scene-image-prompts.txt'; a.click();
+                setTimeout(() => URL.revokeObjectURL(url), 1000);
+            } else {
+                await navigator.clipboard.writeText(button.dataset.action === 'copy' ? state.highlights[Number(button.dataset.index)].prompt : allText);
+                showToast('Prompt copied', 'success');
+            }
+        } catch (e) { button.disabled = false; showToast(e.message, 'error'); }
+    };
+    await refresh();
+}

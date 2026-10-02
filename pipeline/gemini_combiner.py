@@ -23,6 +23,7 @@ from google import genai
 from google.genai import types
 
 import config
+from logger import log_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -103,13 +104,32 @@ def _generate_content_with_retry(client: genai.Client, model: str, contents, con
     _throttle_request(est_tokens)
     
     delay = initial_delay
+    prompt_sample = str(contents)[:300] if contents else ""
     for attempt in range(max_retries):
         if is_cancelled and is_cancelled():
             raise RuntimeError("Cancellation requested by user")
+        t0 = time.time()
         try:
             sanitized_config = _sanitize_generate_config(model, config)
-            return client.models.generate_content(model=model, contents=contents, config=sanitized_config)
+            resp = client.models.generate_content(model=model, contents=contents, config=sanitized_config)
+            dur = time.time() - t0
+            usage = {}
+            if hasattr(resp, "usage_metadata") and resp.usage_metadata:
+                usage = {
+                    "prompt_tokens": getattr(resp.usage_metadata, "prompt_token_count", 0),
+                    "completion_tokens": getattr(resp.usage_metadata, "candidates_token_count", 0),
+                }
+            log_llm_call(
+                provider="gemini-combiner",
+                model=model,
+                prompt=prompt_sample,
+                response=getattr(resp, "text", "") or "",
+                latency=dur,
+                usage=usage,
+            )
+            return resp
         except Exception as e:
+            dur = time.time() - t0
             err_str = str(e)
             is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "quota" in err_str.lower()
             is_daily_limit = "daily" in err_str.lower() or "limit: 20" in err_str.lower() or "free_tier_requests" in err_str.lower() or "limit: 0" in err_str.lower()
@@ -124,6 +144,13 @@ def _generate_content_with_retry(client: genai.Client, model: str, contents, con
                     slept += 0.5
                 delay *= 2.0
             else:
+                log_llm_call(
+                    provider="gemini-combiner",
+                    model=model,
+                    prompt=prompt_sample,
+                    error=e,
+                    latency=dur,
+                )
                 try:
                     from models.groq_model import GroqModel
                     logger.warning(f"Gemini API failed/exhausted ({e}). Falling back to Groq for combine & polish pass...")
@@ -757,6 +784,9 @@ FINAL STORY TO REPAIR:
 def combine_chapters(chapters_dir: str, metadata: dict) -> str:
     """Concatenate all chapter files into one Markdown document."""
     chapters = _read_chapters(chapters_dir)
+    if "current_chapter" in metadata:
+        committed = int(metadata.get("current_chapter", 0) or 0)
+        chapters = [(num, text) for num, text in chapters if num <= committed]
     if not chapters:
         raise RuntimeError("No chapter files found to combine.")
     

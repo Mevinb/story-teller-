@@ -18,12 +18,76 @@ from .base import (
     ReasoningStreamFilter,
     parse_retry_after_seconds,
 )
-from pipeline.errors import PipelineCancelledError
+from .key_rotator import KeyRotator, AccountKey, KeyStatus
+from logger import get_logger, log_llm_call
 
-logger = logging.getLogger(__name__)
+logger = get_logger("openrouter")
 
 # OpenRouter is generally more generous with rate limits than Groq.
 _RATE_LIMIT_BUFFER = 2.0
+
+_openrouter_rotator = KeyRotator(
+    provider="openrouter",
+    keys=config.OPENROUTER_API_KEYS,
+    strategy=getattr(config, "KEY_ROTATION_STRATEGY", "least_loaded"),
+)
+
+
+class OpenRouterKeyManager:
+    """Manages multi-account rotation and health tracking of OpenRouter API keys."""
+    rotator = _openrouter_rotator
+
+    @classmethod
+    def sync_keys(cls, keys=None):
+        if keys is None:
+            keys = config.OPENROUTER_API_KEYS
+        else:
+            config.OPENROUTER_API_KEYS = [k.strip() for k in keys if k.strip()]
+            if config.OPENROUTER_API_KEYS:
+                config.OPENROUTER_API_KEY = config.OPENROUTER_API_KEYS[0]
+        cls.rotator.set_keys(keys)
+
+    @classmethod
+    def get_keys(cls) -> list:
+        keys = cls.rotator.get_keys()
+        if not keys and config.OPENROUTER_API_KEY:
+            return [config.OPENROUTER_API_KEY]
+        return keys
+
+    @classmethod
+    def get_key(cls, proactive_rotate: bool = False, model: Optional[str] = None, estimated_tokens: int = 0) -> str:
+        key = cls.rotator.get_key(proactive_rotate=proactive_rotate, model=model, estimated_tokens=estimated_tokens)
+        if not key:
+            return config.OPENROUTER_API_KEY
+        return key
+
+    @classmethod
+    def get_active_account(cls, proactive_rotate: bool = False, model: Optional[str] = None, estimated_tokens: int = 0):
+        return cls.rotator.get_active_account(proactive_rotate=proactive_rotate, model=model, estimated_tokens=estimated_tokens)
+
+    @classmethod
+    def rotate(cls) -> bool:
+        return cls.rotator.rotate()
+
+    @classmethod
+    def mark_rate_limited(cls, key: str, retry_after: float, is_daily: bool = False, header_limit: Optional[int] = None, model: Optional[str] = None):
+        return cls.rotator.mark_rate_limited(key, retry_after, is_daily, header_limit, model)
+
+    @classmethod
+    def mark_success(cls, key: str, tokens: int = 0):
+        cls.rotator.mark_success(key, tokens)
+
+    @classmethod
+    def mark_error(cls, key: str, error: Exception):
+        cls.rotator.mark_error(key, error)
+
+    @classmethod
+    def are_all_daily_exhausted(cls) -> bool:
+        return cls.rotator.are_all_daily_exhausted()
+
+    @classmethod
+    def status_summary(cls):
+        return cls.rotator.status_summary()
 
 
 class OpenRouterModel(ReasoningStreamFilter, LLMInterface):
@@ -47,13 +111,13 @@ class OpenRouterModel(ReasoningStreamFilter, LLMInterface):
 
     @property
     def api_key(self) -> str:
-        return self._custom_api_key or config.OPENROUTER_API_KEY
+        return self._custom_api_key or OpenRouterKeyManager.get_key()
 
     @property
     def client(self) -> OpenAI:
         current_key = self.api_key
         if self._client is not None:
-            if getattr(self, '_client_key', None) != current_key:
+            if getattr(self, '_client_key', None) is not None and self._client_key != current_key:
                 self._client = None
 
         if self._client is None:
@@ -152,7 +216,7 @@ class OpenRouterModel(ReasoningStreamFilter, LLMInterface):
         kwargs = {
             "model": self.model,
             "messages": messages,
-            "temperature": temperature or config.CLOUD_MODEL_PARAMS["temperature"],
+            "temperature": config.CLOUD_MODEL_PARAMS["temperature"] if temperature is None else temperature,
             "top_p": config.CLOUD_MODEL_PARAMS["top_p"],
             "max_tokens": max_tokens or config.CLOUD_MODEL_PARAMS["max_tokens"],
         }
@@ -160,10 +224,16 @@ class OpenRouterModel(ReasoningStreamFilter, LLMInterface):
         if schema:
             kwargs["response_format"] = {"type": "json_object"}
 
+        if _retry_count == 0 and getattr(config, "OPENROUTER_PROACTIVE_ROTATION", False) and not self._custom_api_key and len(OpenRouterKeyManager.get_keys()) > 1:
+            OpenRouterKeyManager.rotate()
+            self._client = None
+
+        current_key = self.api_key
         self._throttle_before_request()
+        start_time = time.monotonic()
 
         try:
-            logger.debug(f"[OpenRouter] Generating with model={self.model}")
+            logger.debug(f"[OpenRouter] Generating with model={self.model} using key={current_key[:8]}...")
             response = self.client.chat.completions.create(**kwargs)
 
             choice = response.choices[0]
@@ -179,19 +249,83 @@ class OpenRouterModel(ReasoningStreamFilter, LLMInterface):
                     "[OpenRouter] Response hit max_tokens. Partial content returned."
                 )
 
+            tokens = 0
+            usage_dict = {
+                "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+                "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+            }
+            if response.usage:
+                tokens = (response.usage.prompt_tokens or 0) + (response.usage.completion_tokens or 0)
+            OpenRouterKeyManager.mark_success(current_key, tokens=tokens)
+
+            result_text = self._strip_reasoning(choice.message.content or "")
+            latency = time.monotonic() - start_time
+            log_llm_call(
+                provider="openrouter",
+                model=self.model,
+                prompt=prompt,
+                system=system,
+                response=result_text,
+                latency=latency,
+                usage=usage_dict,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+
             return LLMResponse(
-                content=self._strip_reasoning(choice.message.content or ""),
+                content=result_text,
                 model=self.model,
                 provider="openrouter",
-                usage={
-                    "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
-                    "completion_tokens": response.usage.completion_tokens if response.usage else 0,
-                },
+                usage=usage_dict,
                 raw=response,
             )
 
-        except RateLimitError as e:
-            retry_after = self._mark_rate_limited(e)
+        except Exception as e:
+            latency = time.monotonic() - start_time
+            log_llm_call(
+                provider="openrouter",
+                model=self.model,
+                prompt=prompt,
+                system=system,
+                error=e,
+                latency=latency,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+
+            if isinstance(e, RateLimitError):
+                current_key = self.api_key
+                retry_after = self._mark_rate_limited(e)
+
+                all_keys = OpenRouterKeyManager.get_keys()
+                if (getattr(config, "OPENROUTER_ROTATE_ON_RATE_LIMIT", True) or len(all_keys) > 1) and not self._custom_api_key:
+                    has_alt, min_wait, next_acc = OpenRouterKeyManager.mark_rate_limited(
+                        key=current_key,
+                        retry_after=retry_after,
+                        model=self.model,
+                    )
+                    if has_alt and _retry_count < max(len(all_keys), 1) * 3:
+                        logger.warning(
+                            "[OpenRouter] Rate limited on key %s. Immediately rotating to %s (attempt %d).",
+                            current_key[:8] + "...", next_acc.account_id if next_acc else "next account", _retry_count + 1,
+                        )
+                        self._client = None
+                        return self.generate(
+                            prompt, system, schema, temperature, max_tokens, stream,
+                            _retry_count=_retry_count + 1,
+                        )
+                    if _retry_count < 3:
+                        self._raise_if_cancelled()
+                        logger.warning(
+                            "[OpenRouter] All %d accounts in cooldown. Waiting %.1fs (attempt %d/3).",
+                            len(all_keys), min_wait, _retry_count + 1,
+                        )
+                        self._sleep_interruptible(min_wait)
+                        self._client = None
+                        return self.generate(
+                            prompt, system, schema, temperature, max_tokens, stream,
+                            _retry_count=_retry_count + 1,
+                        )
 
             if _retry_count < 5:
                 self._raise_if_cancelled()
@@ -299,13 +433,33 @@ class OpenRouterModel(ReasoningStreamFilter, LLMInterface):
             stream = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=temperature or config.CLOUD_MODEL_PARAMS["temperature"],
+                temperature=config.CLOUD_MODEL_PARAMS["temperature"] if temperature is None else temperature,
                 top_p=config.CLOUD_MODEL_PARAMS["top_p"],
                 max_tokens=max_tokens or config.CLOUD_MODEL_PARAMS["max_tokens"],
                 stream=True,
             )
         except RateLimitError as e:
+            current_key = self.api_key
             retry_after = self._mark_rate_limited(e)
+
+            all_keys = OpenRouterKeyManager.get_keys()
+            if (getattr(config, "OPENROUTER_ROTATE_ON_RATE_LIMIT", True) or len(all_keys) > 1) and not self._custom_api_key:
+                has_alt, min_wait, next_acc = OpenRouterKeyManager.mark_rate_limited(
+                    key=current_key,
+                    retry_after=retry_after,
+                    model=self.model,
+                )
+                if has_alt and _retry_count < max(len(all_keys), 1) * 3:
+                    logger.warning(
+                        "[OpenRouter] Streaming rate limited on key %s. Immediately rotating to %s (attempt %d).",
+                        current_key[:8] + "...", next_acc.account_id if next_acc else "next account", _retry_count + 1,
+                    )
+                    self._client = None
+                    yield from self.generate_streaming(
+                        prompt, system, temperature, max_tokens,
+                        _retry_count=_retry_count + 1,
+                    )
+                    return
 
             if _retry_count < 5:
                 self._raise_if_cancelled()
@@ -351,4 +505,3 @@ class OpenRouterModel(ReasoningStreamFilter, LLMInterface):
             if hasattr(e, 'status_code') and e.status_code == 400:
                 self._content_blocked = True
             raise
-

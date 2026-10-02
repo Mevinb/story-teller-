@@ -893,6 +893,34 @@ body::before {
     }
 }
 
+.premise-mode-btn {
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-surface);
+    color: var(--text-dim);
+    transition: all var(--trans-fast);
+    text-align: center;
+    padding: 7px 8px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.premise-mode-btn:hover {
+    background: rgba(139, 92, 246, 0.1);
+    color: var(--text-primary);
+    border-color: rgba(139, 92, 246, 0.4);
+}
+
+.premise-mode-btn.active {
+    background: rgba(139, 92, 246, 0.22);
+    border-color: var(--accent-purple);
+    color: #e9d5ff;
+    font-weight: 600;
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.25);
+}
+
 .premise-beat-card {
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid var(--border-subtle);

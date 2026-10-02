@@ -11,6 +11,7 @@ from typing import Optional
 
 import config
 from .base import LLMInterface, LLMResponse
+from logger import log_llm_call
 
 logger = logging.getLogger(__name__)
 
@@ -273,33 +274,49 @@ class LlamaCPP(LLMInterface):
                 "temperature": kwargs.get("temperature"),
             },
         )
-        with self.inference_lock:
-            response = self.llm(**kwargs)
-        elapsed = time.time() - started
-        usage = response.get("usage", {})
-        logger.info(
-            "llama.cpp generation finished",
-            extra={
-                "model": self.model,
-                "elapsed_seconds": round(elapsed, 2),
-                "completion_tokens": usage.get("completion_tokens"),
-                "total_tokens": usage.get("total_tokens"),
-            },
-        )
-        choice = (response.get("choices") or [{}])[0]
-        content = choice.get("text", "")
-        if not content.strip():
-            raise RuntimeError(
-                f"llama.cpp returned empty output for '{self.model}'. "
-                "Try a lower LOCAL_NUM_CTX or a different GGUF quantization."
+        try:
+            with self.inference_lock:
+                response = self.llm(**kwargs)
+            elapsed = time.time() - started
+            usage = response.get("usage", {})
+            choice = (response.get("choices") or [{}])[0]
+            content = choice.get("text", "")
+            if not content.strip():
+                raise RuntimeError(
+                    f"llama.cpp returned empty output for '{self.model}'. "
+                    "Try a lower LOCAL_NUM_CTX or a different GGUF quantization."
+                )
+            log_llm_call(
+                provider="llama.cpp",
+                model=self.model,
+                prompt=prompt,
+                system=system,
+                response=content,
+                latency=elapsed,
+                usage=usage,
+                max_tokens=kwargs.get("max_tokens"),
+                temperature=kwargs.get("temperature"),
             )
-        return LLMResponse(
-            content=content,
-            model=self.model,
-            provider="llama.cpp",
-            usage=response.get("usage", {}),
-            raw=response,
-        )
+            return LLMResponse(
+                content=content,
+                model=self.model,
+                provider="llama.cpp",
+                usage=response.get("usage", {}),
+                raw=response,
+            )
+        except Exception as e:
+            elapsed = time.time() - started
+            log_llm_call(
+                provider="llama.cpp",
+                model=self.model,
+                prompt=prompt,
+                system=system,
+                error=e,
+                latency=elapsed,
+                max_tokens=kwargs.get("max_tokens"),
+                temperature=kwargs.get("temperature"),
+            )
+            raise
 
     def generate_streaming(
         self,

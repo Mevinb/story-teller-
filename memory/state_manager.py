@@ -18,6 +18,7 @@ import os
 import shutil
 import logging
 import re
+import tempfile
 from datetime import datetime
 from typing import Optional, Callable
 from copy import deepcopy
@@ -318,6 +319,12 @@ class StateManager:
     Manages the structured JSON state for a story project.
     This is the 'hard memory' — deterministic facts the model must respect.
     """
+    # Individual requests and background jobs create separate StateManager
+    # instances for the same project.  An instance lock alone therefore cannot
+    # prevent stale snapshots from overwriting a newer change.
+    _PROJECT_LOCKS: dict[str, threading.RLock] = {}
+    _PROJECT_LOCKS_GUARD = threading.Lock()
+
     def __init__(self, project_dir: str):
         self.project_dir = project_dir
         self.state_path = os.path.join(project_dir, "state.json")
@@ -327,11 +334,19 @@ class StateManager:
         self._lock = threading.RLock()
         self._state: Optional[dict] = None
 
+    def _project_lock(self) -> threading.RLock:
+        key = os.path.abspath(self.project_dir)
+        with self._PROJECT_LOCKS_GUARD:
+            return self._PROJECT_LOCKS.setdefault(key, threading.RLock())
+
     # ─── Core I/O ────────────────────────────────────────────────────
 
     def load(self) -> dict:
         """Load state from disk, or create a fresh one."""
-        with self._lock:
+        with self._project_lock(), self._lock:
+            # Always refresh a public read.  A request-scoped manager must not
+            # keep returning data superseded by a generator or another request.
+            self._state = None
             self._ensure_loaded_locked()
             return deepcopy(self._state)
 
@@ -393,6 +408,12 @@ class StateManager:
                 # Also remove loose top-level generated keys written by older code
                 for stale_key in ("emotion", "location", "goal"):
                     char.pop(stale_key, None)
+                # A reset starts a new timeline, so lifecycle facts from the
+                # discarded one (for example "dead") must not survive.
+                char["status"] = "active"
+            self._sync_character_entities_in_state(
+                current, remove_missing_characters=True,
+            )
             return current
 
         self._transition("reset_generated", {}, mutator)
@@ -430,7 +451,8 @@ class StateManager:
 
     def save(self) -> None:
         """Save current state to disk with atomic write."""
-        with self._lock:
+        with self._project_lock(), self._lock:
+            self._ensure_loaded_locked()
             self._save_locked()
 
     def _save_locked(self) -> None:
@@ -439,10 +461,18 @@ class StateManager:
         meta["state_version"] = int(meta.get("state_version", 0)) + 1
         self._state["metadata"]["updated_at"] = datetime.now().isoformat()
         os.makedirs(self.project_dir, exist_ok=True)
-        tmp_path = self.state_path + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(self._state, f, indent=2, ensure_ascii=False)
-        shutil.move(tmp_path, self.state_path)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".state.", suffix=".tmp", dir=self.project_dir,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self._state, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self.state_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     def _log_change(self, action: str, data: dict) -> None:
         """Append a change entry to the history log."""
@@ -515,7 +545,9 @@ class StateManager:
             changed = True
             logger.info("Registered location entity '%s'", name)
 
-        return changed
+        before = deepcopy(entities)
+        self._sync_character_entities_in_state(self._state)
+        return changed or entities != before
 
     def _dedupe_characters_locked(self) -> bool:
         chars = self._state.get("characters", {})
@@ -543,7 +575,11 @@ class StateManager:
         return changed
 
     def _transition(self, action: str, data: dict, mutator: Callable[[dict], dict]) -> None:
-        with self._lock:
+        with self._project_lock(), self._lock:
+            # Mutate the latest on-disk version while holding the project-wide
+            # lock.  This prevents one manager's cached full document from
+            # clobbering a different manager's intervening update.
+            self._state = None
             self._ensure_loaded_locked()
             next_state = mutator(deepcopy(self._state))
             if not isinstance(next_state, dict):
@@ -551,6 +587,69 @@ class StateManager:
             self._state = next_state
             self._save_locked()
             self._log_change(action, data)
+
+    def replace_state(self, state: dict, action: str = "replace_state") -> dict:
+        """Atomically replace state from a trusted in-process recovery snapshot."""
+        if not isinstance(state, dict):
+            raise ValueError("state replacement must be a dictionary")
+
+        snapshot = deepcopy(state)
+
+        def mutator(_: dict) -> dict:
+            return deepcopy(snapshot)
+
+        self._transition(action, {}, mutator)
+        return self.load()
+
+    def mutate_state(self, action: str, data: dict, mutator: Callable[[dict], None]) -> dict:
+        """Apply an in-place mutation to the latest state through the normal transaction path."""
+        def transition(current: dict) -> dict:
+            mutator(current)
+            return current
+
+        self._transition(action, data, transition)
+        return self.load()
+
+    @staticmethod
+    def _sync_character_entities_in_state(
+        state: dict, *, remove_missing_characters: bool = False,
+    ) -> None:
+        """Keep the character map and authoritative entity registry aligned."""
+        characters = state.setdefault("characters", {})
+        entities = state.setdefault("entities", {})
+        if not isinstance(characters, dict):
+            state["characters"] = characters = {}
+        if not isinstance(entities, dict):
+            state["entities"] = entities = {}
+
+        character_ids = set()
+        for name, info in characters.items():
+            if not isinstance(info, dict):
+                continue
+            entity_id = _canonical_character_key(name)
+            if not entity_id:
+                continue
+            character_ids.add(entity_id)
+            existing = entities.get(entity_id)
+            aliases = set(info.get("aliases", []))
+            if isinstance(existing, dict):
+                aliases.update(existing.get("aliases", []))
+            entities[entity_id] = _create_default_entity(
+                name,
+                entity_type="character",
+                chapter=int(info.get("first_seen") or 0),
+                aliases=sorted(str(a).strip() for a in aliases if str(a).strip()),
+                status=str(info.get("status", "active")),
+            )
+
+        if remove_missing_characters:
+            for entity_id, record in list(entities.items()):
+                if (
+                    isinstance(record, dict)
+                    and record.get("type") == "character"
+                    and entity_id not in character_ids
+                ):
+                    entities.pop(entity_id, None)
 
     # ─── State Access ────────────────────────────────────────────────
 
@@ -703,20 +802,25 @@ class StateManager:
 
         def mutator(current: dict) -> dict:
             entities = current.setdefault("entities", {})
-            canonical = self.resolve_entity_name(name)
-            if canonical:
-                target = _canonical_character_key(canonical)
-                record = entities.get(target)
-                if isinstance(record, dict):
-                    record["status"] = status
-                char = current.get("characters", {}).get(canonical)
-                if isinstance(char, dict):
-                    char["status"] = status
-            else:
-                entity_id = _canonical_character_key(name)
-                entities[entity_id] = _create_default_entity(
-                    name, entity_type="character", status=status,
+            entity_id = _canonical_character_key(name)
+            target_name = None
+            for character_name in current.get("characters", {}):
+                if _canonical_character_key(character_name) == entity_id:
+                    target_name = character_name
+                    break
+            record = entities.get(entity_id)
+            if not isinstance(record, dict):
+                record = _create_default_entity(
+                    target_name or name,
+                    entity_type="character",
+                    aliases=[],
+                    status=status,
                 )
+                entities[entity_id] = record
+            record["status"] = status
+            if target_name:
+                current["characters"][target_name]["status"] = status
+            self._sync_character_entities_in_state(current)
             return current
 
         self._transition("update_entity_status", {"name": name, "status": status}, mutator)
@@ -754,6 +858,7 @@ class StateManager:
             if characters:
                 for name, info in characters.items():
                     next_state["characters"][name] = _create_default_character(info)
+            self._sync_character_entities_in_state(next_state, remove_missing_characters=True)
             return next_state
 
         self._transition("initialize", payload, mutator)
@@ -823,6 +928,7 @@ class StateManager:
                                 progression.append(entry)
                 else:
                     char[key] = val
+            self._sync_character_entities_in_state(current)
             return current
 
         self._transition("update_character", {"name": name, "updates": updates}, mutator)
@@ -982,6 +1088,21 @@ class StateManager:
                     e for e in story_events
                     if chapter_num(e.get("chapter", 0)) <= max_chapter
                 ]
+            retained_statuses = {}
+            for event in plot.get("story_events", []):
+                if not isinstance(event, dict):
+                    continue
+                event_type = str(event.get("type", "")).strip().lower()
+                status = {
+                    "death": "dead",
+                    "capture": "imprisoned",
+                    "escape": "active",
+                    "rescue": "active",
+                    "arrival": "active",
+                }.get(event_type)
+                if status:
+                    for character_name in event.get("characters", []):
+                        retained_statuses[_canonical_character_key(character_name)] = status
 
             # legend_memory — no chapter provenance, wipe entirely on full reset
             if max_chapter == 0:
@@ -1026,13 +1147,15 @@ class StateManager:
                     if not isinstance(char, dict):
                         continue
 
-                    if (
-                        char.get("generated")
-                        or (
-                            char.get("role") == "supporting"
-                            and str(char.get("description", "")).strip()
-                            in {"", "Supporting character introduced by the story."}
-                        )
+                    generated_character = bool(char.get("generated")) or (
+                        char.get("role") == "supporting"
+                        and str(char.get("description", "")).strip()
+                        in {"", "Supporting character introduced by the story."}
+                    )
+                    introduced_chapter = chapter_num(char.get("first_seen", 0))
+                    if generated_character and (
+                        max_chapter == 0
+                        or (introduced_chapter and introduced_chapter > max_chapter)
                     ):
                         characters.pop(name, None)
                         summary["supporting_characters_removed"] += 1
@@ -1059,6 +1182,9 @@ class StateManager:
                     char["first_seen"] = 0
                     char["last_seen"] = 0
                     char["importance_score"] = 0.7 if char.get("role") == "main" else 0.3
+                    char["status"] = retained_statuses.get(
+                        _canonical_character_key(name), "active"
+                    )
 
                     if char.get("state") != {"emotion": "neutral", "goal": "", "location": ""}:
                         summary["character_states_reset"] += 1
@@ -1070,22 +1196,30 @@ class StateManager:
                             char.pop(stale_key, None)
                             summary["generated_character_fields_removed"] += 1
 
+            self._sync_character_entities_in_state(
+                current, remove_missing_characters=True,
+            )
             return current
 
         self._transition("prune_after_chapter", payload, mutator)
         return summary
 
-    def apply_state_update(self, updates: dict) -> None:
+    def apply_state_update(self, updates: dict, *, replace_characters: bool = False) -> None:
         """
         Apply a bulk state update from the Consistency Engine or Architect.
         Expects a dict with optional keys: characters, world, plot, metadata.
+        ``replace_characters`` is for an author explicitly saving the complete
+        character editor; normal model updates remain additive.
         """
         def merge_character(existing_char: dict, char_updates: dict) -> dict:
             for key, val in char_updates.items():
                 if key == "traits" and isinstance(val, list):
-                    trait_set = set(existing_char.get("traits", []))
-                    trait_set.update(val)
-                    existing_char["traits"] = _normalize_traits_list(list(trait_set))
+                    if replace_characters:
+                        existing_char["traits"] = _normalize_traits_list(val)
+                    else:
+                        trait_set = set(existing_char.get("traits", []))
+                        trait_set.update(val)
+                        existing_char["traits"] = _normalize_traits_list(list(trait_set))
                 elif key == "relationships" and isinstance(val, dict):
                     existing_char.setdefault("relationships", {}).update(val)
                 elif key == "state" and isinstance(val, dict):
@@ -1119,12 +1253,18 @@ class StateManager:
                 if "unresolved_threads" in updates["plot"]:
                     current["plot"]["unresolved_threads"].extend(updates["plot"]["unresolved_threads"])
             if "characters" in updates:
+                incoming = updates["characters"] if isinstance(updates["characters"], dict) else {}
+                if replace_characters:
+                    incoming_ids = {_canonical_character_key(name) for name in incoming}
+                    for existing_name in list(current.get("characters", {})):
+                        if _canonical_character_key(existing_name) not in incoming_ids:
+                            current["characters"].pop(existing_name, None)
                 existing = {k.lower(): k for k in current.get("characters", {}).keys()}
                 canonical_existing = {
                     _canonical_character_key(k): k
                     for k in current.get("characters", {}).keys()
                 }
-                for name, char_updates in updates["characters"].items():
+                for name, char_updates in incoming.items():
                     matched = existing.get(name.lower())
                     if not matched:
                         matched = canonical_existing.get(_canonical_character_key(name))
@@ -1142,6 +1282,9 @@ class StateManager:
                             char_updates,
                         )
                         logger.info("Added new supporting character from state update: '%s'", name)
+                self._sync_character_entities_in_state(
+                    current, remove_missing_characters=replace_characters,
+                )
             return current
 
         self._transition("apply_state_update", {"keys": list(updates.keys())}, mutator)

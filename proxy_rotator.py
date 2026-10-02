@@ -8,6 +8,7 @@ proxy. It does not provide anonymity by itself; use trusted upstream proxies.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import select
 import socket
@@ -17,14 +18,18 @@ from dataclasses import dataclass
 from typing import Iterable
 from urllib.parse import urlsplit
 
+logger = logging.getLogger("storyteller.proxy")
+
 
 def parse_proxy_list(value: str) -> list[str]:
     """Parse comma/newline-separated proxy URLs and reject unsupported values."""
     proxies = [item.strip() for item in value.replace("\n", ",").split(",") if item.strip()]
     for proxy in proxies:
         parsed = urlsplit(proxy)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-            raise ValueError(f"Unsupported proxy URL: {proxy!r}; use http[s]://host:port")
+        if parsed.scheme != "http" or not parsed.hostname:
+            raise ValueError(f"Unsupported proxy URL: {proxy!r}; use http://host:port")
+        if parsed.username or parsed.password:
+            raise ValueError("Authenticated upstream proxies are not supported")
         if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
             raise ValueError(f"Proxy URL must not contain a path/query: {proxy!r}")
     return proxies
@@ -83,6 +88,7 @@ class RotatingProxyHandler(socketserver.StreamRequestHandler):
             else:
                 self._forward_http(upstream, method, target, version, headers)
         except (OSError, ValueError) as exc:
+            logger.warning("Proxy error handling request: %s", exc)
             self._error(502, str(exc))
 
     def _read_headers(self) -> list[tuple[str, str]]:
@@ -110,7 +116,7 @@ class RotatingProxyHandler(socketserver.StreamRequestHandler):
 
     def _forward_http(self, upstream: Upstream, method: str, target: str, version: str, headers: list[tuple[str, str]]) -> None:
         parsed = urlsplit(target)
-        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        if parsed.scheme != "http" or not parsed.hostname:
             raise ValueError("HTTP proxy requests must use an absolute URL")
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         path = parsed.path or "/"
@@ -119,7 +125,10 @@ class RotatingProxyHandler(socketserver.StreamRequestHandler):
         request = [f"{method} {target if parsed.scheme == 'http' else path} {version}\r\n"]
         request.extend(f"{name}: {value}\r\n" for name, value in headers if name.lower() != "host")
         request.append(f"Host: {parsed.hostname}:{port}\r\n\r\n")
-        body = self.rfile.read(int(dict(headers).get("Content-Length", "0")))
+        normalized_headers = {name.lower(): value for name, value in headers}
+        if "transfer-encoding" in normalized_headers:
+            raise ValueError("Chunked request bodies are not supported")
+        body = self.rfile.read(int(normalized_headers.get("content-length", "0")))
         with socket.create_connection((upstream.host, upstream.port), self.timeout) as remote:
             remote.sendall("".join(request).encode("latin-1") + body)
             self._copy(remote, self.connection)

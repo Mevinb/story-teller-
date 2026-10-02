@@ -465,6 +465,13 @@ def _build_scene_prompt(scene_plan, chapter_num, context, previous_ending, genre
     return "\n".join(parts)
 
 
+class SceneRepairBudgetExceeded(RuntimeError):
+    """Keep the latest draft for review when all repair sources share a cap."""
+    def __init__(self, text):
+        super().__init__("Scene repair budget exhausted")
+        self.text = text
+
+
 class SceneWriter(AgentContract):
     def __init__(self, primary_model: LLMInterface, fallback_model: LLMInterface):
         self.name = "writer"
@@ -474,6 +481,27 @@ class SceneWriter(AgentContract):
         self._genre = ""
         self._is_explicit_genre = False
         self._compact_mode = False
+        self._call_budget = None
+        self._budget_draft = ""
+        self._budget_scope = None
+        self.needs_review = False
+
+    def begin_scene(self, scope=None):
+        if scope is not None and scope == self._budget_scope:
+            return
+        self._budget_scope = scope
+        self._call_budget = 1 + config.SCENE_REPAIR_CALLS
+        self._budget_draft = ""
+        self.needs_review = False
+
+    def reserve_edit(self, text):
+        self._budget_draft = text
+        if self._call_budget is None:
+            return True
+        if self._call_budget <= 0:
+            return False
+        self._call_budget -= 1
+        return True
 
     def set_compact_mode(self, enabled: bool):
         self._compact_mode = bool(enabled)
@@ -515,6 +543,12 @@ class SceneWriter(AgentContract):
                 stream_callback=state.get("stream_callback"),
             )
             next_action = "critic"
+        original = state.get("original_text", "")
+        if original and len(scene_text.split()) < min(config.MIN_SCENE_WORDS, len(original.split()) * 0.8):
+            logger.warning("Repair removed too much prose; retaining the full draft for review")
+            scene_text = original
+            self.needs_review = True
+        self._budget_draft = scene_text
         return {
             "output": {"scene_text": scene_text, "provider": self.last_provider},
             "confidence": 0.75,
@@ -523,6 +557,8 @@ class SceneWriter(AgentContract):
 
     @property
     def last_provider(self) -> str:
+        if hasattr(self.primary, "_cache_scope"):
+            return self.primary.provider
         return self._last_provider
 
     def set_genre(self, genre: str):
@@ -639,11 +675,11 @@ class SceneWriter(AgentContract):
             f"Output ONLY the new paragraph text. No intro, no meta."
         )
         system = "You are an expert editor fixing a single paragraph."
-        new_para = self._generate_with_fallback(prompt, system, temperature=0.7)
+        new_para = self._generate_with_fallback(prompt, system, temperature=0.7, max_tokens=400)
         new_para = self._sanitize_scene_text(new_para)
         
         if new_para:
-            return original_text.replace(nearest, new_para)
+            return original_text.replace(nearest, new_para, 1)
         return original_text
 
     def final_patch_scene(self, original_text, scene_plan):
@@ -672,7 +708,7 @@ class SceneWriter(AgentContract):
             "Write ONLY the paragraph text. Do not add metadata or conversational intro."
         )
         system = "You are an expert writer generating a specific missing beat. Use the exact character names provided."
-        new_para = self._generate_with_fallback(prompt, system, temperature=0.7)
+        new_para = self._generate_with_fallback(prompt, system, temperature=0.7, max_tokens=200)
         new_para = self._sanitize_scene_text(new_para)
         
         if new_para:
@@ -743,6 +779,19 @@ class SceneWriter(AgentContract):
         return "".join(chunks)
 
     def _generate_with_fallback(
+        self, prompt, system, temperature=None, stream_callback=None, max_tokens=None,
+    ):
+        if self._call_budget is not None:
+            if self._call_budget <= 0:
+                self.needs_review = True
+                raise SceneRepairBudgetExceeded(self._budget_draft)
+            self._call_budget -= 1
+        text = self._generate_with_fallback_impl(prompt, system, temperature, stream_callback, max_tokens)
+        if not self._budget_draft or len(text.split()) >= max(40, len(self._budget_draft.split()) // 2):
+            self._budget_draft = text
+        return text
+
+    def _generate_with_fallback_impl(
         self,
         prompt,
         system,
@@ -756,7 +805,7 @@ class SceneWriter(AgentContract):
                     self.fallback, prompt, system, temperature, stream_callback, max_tokens,
                 )
                 if content.strip():
-                    self._last_provider = "groq" if isinstance(self.fallback, GroqModel) else "llama.cpp"
+                    self._last_provider = getattr(self.fallback, "provider", "groq" if isinstance(self.fallback, GroqModel) else "llama.cpp")
                     return self._sanitize_scene_text(content)
 
             response = self.fallback.generate_with_retry(
@@ -776,7 +825,7 @@ class SceneWriter(AgentContract):
                     self.primary, prompt, system, temperature, stream_callback, max_tokens,
                 )
                 if content.strip():
-                    self._last_provider = "groq" if isinstance(self.primary, GroqModel) else "llama.cpp"
+                    self._last_provider = getattr(self.primary, "provider", "groq" if isinstance(self.primary, GroqModel) else "llama.cpp")
                     return self._sanitize_scene_text(content)
             else:
                 response = self.primary.generate_with_retry(

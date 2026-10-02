@@ -15,6 +15,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import config
 from models.groq_model import GroqKeyManager
+from models.openrouter_model import OpenRouterKeyManager
 from .local_provider import LocalVisionProvider
 from .cloud_provider import CloudVisionProvider
 from .schema import PersonAnalysisResult
@@ -168,9 +169,10 @@ class VisionChatProvider:
         Returns (client, model_name, provider_name).
         """
         # Prefer OpenRouter with dolphin (uncensored) model
-        if config.OPENROUTER_API_KEY:
+        or_key = OpenRouterKeyManager.get_key()
+        if or_key:
             client = OpenAI(
-                api_key=config.OPENROUTER_API_KEY,
+                api_key=or_key,
                 base_url=config.OPENROUTER_BASE_URL,
                 default_headers={
                     "HTTP-Referer": "http://localhost:5000",
@@ -205,9 +207,10 @@ class VisionChatProvider:
                 return client, "llama-3.3-70b-versatile", "groq"
         elif failed_provider == "groq":
             # Try OpenRouter as fallback
-            if config.OPENROUTER_API_KEY:
+            or_key = OpenRouterKeyManager.get_key()
+            if or_key:
                 client = OpenAI(
-                    api_key=config.OPENROUTER_API_KEY,
+                    api_key=or_key,
                     base_url=config.OPENROUTER_BASE_URL,
                     default_headers={
                         "HTTP-Referer": "http://localhost:5000",
@@ -326,6 +329,9 @@ class VisionChatProvider:
                     logger.error("Fallback also failed: %s", fb_err)
             elif provider == "groq" and GroqKeyManager.rotate():
                 logger.info("Rotated Groq key, retrying...")
+                return self.chat(session_id, user_message)
+            elif provider == "openrouter" and OpenRouterKeyManager.rotate():
+                logger.info("Rotated OpenRouter key, retrying...")
                 return self.chat(session_id, user_message)
             raise RuntimeError(f"Chat API Rate Limit: {str(e)}")
 

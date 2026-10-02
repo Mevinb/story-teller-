@@ -58,3 +58,11 @@ test_story_analysis.md
 PRODUCTION_READINESS.md
 agent_system_report.md
 story_system_explained.md
+# Durable quotas, drafts and task checkpoints (private, never source assets).
+runtime/
+
+# React build and browser test artifacts (recreated by start.sh).
+frontend/node_modules/
+frontend/test-results/
+frontend/playwright-report/
+static/app/

@@ -14,6 +14,8 @@ import queue
 import logging
 import re
 import time
+import uuid
+from collections import deque
 from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -21,14 +23,94 @@ sys.path.insert(0, os.path.dirname(__file__))
 from flask import Flask, render_template, request, jsonify, Response
 import config
 from pipeline.orchestrator import PipelineOrchestrator, normalize_project_name
+from pipeline.premise_architect import PremiseArchitect
 from pipeline.gemini_combiner import combine_chapters, analyze_and_polish, generate_whole_story
 from pipeline.errors import PipelineCancelledError
-from models.groq_model import GroqModel
-from models.openrouter_model import OpenRouterModel
+from models.groq_model import GroqModel, GroqKeyManager
+from models.gemini_model import GeminiModel, GeminiKeyManager
+from models.openrouter_model import OpenRouterModel, OpenRouterKeyManager
 from models.llm import LlamaCPP, list_gguf_models, resolve_model_path, to_model_id
 from vision.router import vision_bp
+import logger as sys_logger
 
-logger = logging.getLogger(__name__)
+sys_logger.init_logging()
+logger = sys_logger.get_logger("api")
+
+
+class _EventSubscription:
+    def __init__(self, channel, cursor=None):
+        self.channel = channel
+        self.cursor = channel._base_index if cursor is None else cursor
+
+    def get(self, timeout=None):
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self.channel._condition:
+            while True:
+                self.cursor = max(self.cursor, self.channel._base_index)
+                offset = self.cursor - self.channel._base_index
+                if offset < len(self.channel._messages):
+                    message = self.channel._messages[offset]
+                    self.cursor += 1
+                    return message
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise queue.Empty
+                self.channel._condition.wait(remaining)
+
+
+class _EventChannel:
+    """Broadcast live events while keeping a bounded, rolling replay history.
+
+    Reading doesn't consume another subscriber's events. When replay fills,
+    expire its oldest entry instead of rejecting every subsequent live event.
+    A subscriber that falls behind the replay window resumes at its start.
+    """
+    def __init__(self, maxsize=0):
+        self.maxsize = max(1, int(maxsize or 100))
+        self._messages = deque()
+        self._base_index = 0
+        self._stream_id = uuid.uuid4().hex
+        self._condition = threading.Condition()
+        self._compat_subscription = None
+
+    def subscribe(self, last_event_id=None):
+        with self._condition:
+            cursor = self._base_index
+            if last_event_id:
+                stream_id, separator, index = str(last_event_id).partition(":")
+                if separator and stream_id == self._stream_id:
+                    try:
+                        cursor = max(self._base_index, min(
+                            int(index), self._base_index + len(self._messages),
+                        ))
+                    except ValueError:
+                        pass
+            return _EventSubscription(self, cursor)
+
+    def put_nowait(self, message):
+        with self._condition:
+            if len(self._messages) >= self.maxsize:
+                self._messages.popleft()
+                self._base_index += 1
+            self._messages.append(message)
+            self._condition.notify_all()
+
+    def get_nowait(self):
+        with self._condition:
+            if not self._messages:
+                raise queue.Empty
+            self._base_index += 1
+            return self._messages.popleft()
+
+    def clear(self):
+        with self._condition:
+            self._base_index += len(self._messages)
+            self._messages.clear()
+
+    def get(self, timeout=None):
+        if self._compat_subscription is None:
+            self._compat_subscription = self.subscribe()
+        return self._compat_subscription.get(timeout)
 
 # Global state for active generation
 _active_pipelines = {}
@@ -57,12 +139,17 @@ _active_combines = {}
 _combine_results = {}
 _combine_cancel_requests = set()
 _manual_sessions = {}  # project_name -> {"pipeline": ..., "session": ..., "eq": ...}
+_maintenance_projects = set()
 _CHAPTER_FILE_RE = re.compile(r"^chapter_(\d{3,})\.md$")
 _GROQ_MODEL_OPTION = "__groq_api__"
 _GEMINI_MODEL_OPTION = "__gemini_api__"
 _OPENROUTER_MODEL_OPTION = "__openrouter_api__"
 _ENV_PATH = os.path.join(os.path.dirname(__file__), ".env")
-_SENSITIVE_SETTING_KEYS = {"GROQ_API_KEY", "GROQ_API_KEYS", "GEMINI_API_KEY", "OPENROUTER_API_KEY"}
+_SENSITIVE_SETTING_KEYS = {
+    "GROQ_API_KEY", "GROQ_API_KEYS",
+    "GEMINI_API_KEY", "GEMINI_API_KEYS",
+    "OPENROUTER_API_KEY", "OPENROUTER_API_KEYS",
+}
 _REDACTED_VALUE = "********"
 
 # Editable settings exposed by /api/settings. Defaults are sourced from
@@ -73,13 +160,20 @@ _SETTING_DEFS = {
     "GROQ_API_KEYS": {"type": "str", "default": ""},
     "GROQ_MODEL": {"type": "str", "default": config.GROQ_MODEL},
     "GEMINI_API_KEY": {"type": "str", "default": ""},
+    "GEMINI_API_KEYS": {"type": "str", "default": ""},
     "GEMINI_MODEL": {"type": "str", "default": config.GEMINI_MODEL},
     "OPENROUTER_API_KEY": {"type": "str", "default": ""},
+    "OPENROUTER_API_KEYS": {"type": "str", "default": ""},
     "OPENROUTER_MODEL": {"type": "str", "default": config.OPENROUTER_MODEL},
     "OPENROUTER_MIN_REQUEST_INTERVAL": {
         "type": "float", "default": config.OPENROUTER_MIN_REQUEST_INTERVAL,
     },
     "USE_CLOUD_MODEL": {"type": "bool", "default": False},
+    "KEY_ROTATION_STRATEGY": {"type": "str", "default": getattr(config, "KEY_ROTATION_STRATEGY", "round_robin")},
+    "GEMINI_ROTATE_ON_RATE_LIMIT": {"type": "bool", "default": getattr(config, "GEMINI_ROTATE_ON_RATE_LIMIT", True)},
+    "GEMINI_PROACTIVE_ROTATION": {"type": "bool", "default": getattr(config, "GEMINI_PROACTIVE_ROTATION", False)},
+    "OPENROUTER_ROTATE_ON_RATE_LIMIT": {"type": "bool", "default": getattr(config, "OPENROUTER_ROTATE_ON_RATE_LIMIT", True)},
+    "OPENROUTER_PROACTIVE_ROTATION": {"type": "bool", "default": getattr(config, "OPENROUTER_PROACTIVE_ROTATION", False)},
     "LLAMA_MODELS_DIR": {"type": "str", "default": config.LLAMA_MODELS_DIR},
     "LLAMA_MODEL_PATH": {"type": "str", "default": config.LLAMA_MODEL_PATH},
     "LLAMA_PROMPT_TEMPLATE": {"type": "str", "default": config.LLAMA_PROMPT_TEMPLATE},
@@ -212,38 +306,59 @@ def _queue_event(eq: queue.Queue, message: dict, force: bool = False) -> bool:
 
 def _is_groq_selection(selected: str) -> bool:
     """Return True if the model selection string refers to Groq."""
-    return selected == _GROQ_MODEL_OPTION or selected.startswith("groq:")
+    if not selected:
+        return False
+    s = selected.lower().strip()
+    return s in (_GROQ_MODEL_OPTION, "groq") or s.startswith("groq:") or "groq" in s
 
 
 def _groq_model_from_selection(selected: str) -> str:
     """Extract the Groq model ID from a selection string."""
+    if not selected:
+        return config.GROQ_MODEL
     if selected.startswith("groq:"):
         return selected.split(":", 1)[1]
-    return config.GROQ_MODEL
+    if selected == _GROQ_MODEL_OPTION or selected == "groq":
+        return config.GROQ_MODEL
+    return selected
 
 
 def _is_gemini_selection(selected: str) -> bool:
     """Return True if the model selection string refers to Gemini."""
-    return selected == _GEMINI_MODEL_OPTION or selected.startswith("gemini:")
+    if not selected:
+        return False
+    s = selected.lower().strip()
+    return s in (_GEMINI_MODEL_OPTION, "gemini") or s.startswith("gemini:") or "gemini" in s
 
 
 def _gemini_model_from_selection(selected: str) -> str:
     """Extract the Gemini model ID from a selection string."""
+    if not selected:
+        return config.GEMINI_MODEL
     if selected.startswith("gemini:"):
         return selected.split(":", 1)[1]
-    return config.GEMINI_MODEL
+    if selected == _GEMINI_MODEL_OPTION or selected == "gemini":
+        return config.GEMINI_MODEL
+    return selected
 
 
 def _is_openrouter_selection(selected: str) -> bool:
     """Return True if the model selection string refers to OpenRouter."""
-    return selected == _OPENROUTER_MODEL_OPTION or selected.startswith("openrouter:")
+    if not selected:
+        return False
+    s = selected.lower().strip()
+    return s in (_OPENROUTER_MODEL_OPTION, "openrouter") or s.startswith("openrouter:") or "openrouter" in s
 
 
 def _openrouter_model_from_selection(selected: str) -> str:
     """Extract the OpenRouter model ID from a selection string."""
+    if not selected:
+        return config.OPENROUTER_MODEL
     if selected.startswith("openrouter:"):
         return selected.split(":", 1)[1]
-    return config.OPENROUTER_MODEL
+    if selected == _OPENROUTER_MODEL_OPTION or selected == "openrouter":
+        return config.OPENROUTER_MODEL
+    return selected
 
 
 def _active_model_selection() -> str:
@@ -388,21 +503,51 @@ def _apply_runtime_settings(settings: dict) -> None:
         os.environ[key] = _setting_to_env(value)
 
     config.GROQ_API_KEY = settings.get("GROQ_API_KEY", config.GROQ_API_KEY)
-    raw_keys = settings.get("GROQ_API_KEYS", "")
-    groq_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
-    if config.GROQ_API_KEY and config.GROQ_API_KEY not in groq_keys:
-        groq_keys.insert(0, config.GROQ_API_KEY)
-    config.GROQ_API_KEYS = groq_keys
+    if "GROQ_API_KEYS" in settings or "GROQ_API_KEY" in settings:
+        raw_keys = settings.get("GROQ_API_KEYS", ",".join(config.GROQ_API_KEYS))
+        groq_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        if config.GROQ_API_KEY and config.GROQ_API_KEY not in groq_keys:
+            groq_keys.insert(0, config.GROQ_API_KEY)
+        if not config.GROQ_API_KEY and groq_keys:
+            config.GROQ_API_KEY = groq_keys[0]
+        config.GROQ_API_KEYS = groq_keys
+        GroqKeyManager.sync_keys(groq_keys)
     config.GROQ_MODEL = settings.get("GROQ_MODEL", config.GROQ_MODEL)
+
     config.GEMINI_API_KEY = settings.get("GEMINI_API_KEY", config.GEMINI_API_KEY)
+    if "GEMINI_API_KEYS" in settings or "GEMINI_API_KEY" in settings:
+        raw_keys = settings.get("GEMINI_API_KEYS", ",".join(getattr(config, "GEMINI_API_KEYS", [])))
+        gemini_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        if config.GEMINI_API_KEY and config.GEMINI_API_KEY not in gemini_keys:
+            gemini_keys.insert(0, config.GEMINI_API_KEY)
+        if not config.GEMINI_API_KEY and gemini_keys:
+            config.GEMINI_API_KEY = gemini_keys[0]
+        config.GEMINI_API_KEYS = gemini_keys
+        GeminiKeyManager.sync_keys(gemini_keys)
     config.GEMINI_MODEL = settings.get("GEMINI_MODEL", config.GEMINI_MODEL)
+
     config.OPENROUTER_API_KEY = settings.get("OPENROUTER_API_KEY", config.OPENROUTER_API_KEY)
+    if "OPENROUTER_API_KEYS" in settings or "OPENROUTER_API_KEY" in settings:
+        raw_keys = settings.get("OPENROUTER_API_KEYS", ",".join(getattr(config, "OPENROUTER_API_KEYS", [])))
+        or_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        if config.OPENROUTER_API_KEY and config.OPENROUTER_API_KEY not in or_keys:
+            or_keys.insert(0, config.OPENROUTER_API_KEY)
+        if not config.OPENROUTER_API_KEY and or_keys:
+            config.OPENROUTER_API_KEY = or_keys[0]
+        config.OPENROUTER_API_KEYS = or_keys
+        OpenRouterKeyManager.sync_keys(or_keys)
     config.OPENROUTER_MODEL = settings.get("OPENROUTER_MODEL", config.OPENROUTER_MODEL)
     config.OPENROUTER_MIN_REQUEST_INTERVAL = settings.get(
         "OPENROUTER_MIN_REQUEST_INTERVAL",
         config.OPENROUTER_MIN_REQUEST_INTERVAL,
     )
     config.USE_CLOUD_MODEL = bool(settings.get("USE_CLOUD_MODEL", config.USE_CLOUD_MODEL))
+
+    if "KEY_ROTATION_STRATEGY" in settings:
+        strat = settings["KEY_ROTATION_STRATEGY"]
+        GroqKeyManager.rotator.strategy = strat
+        GeminiKeyManager.rotator.strategy = strat
+        OpenRouterKeyManager.rotator.strategy = strat
 
     config.LLAMA_MODELS_DIR = os.path.abspath(settings.get("LLAMA_MODELS_DIR", config.LLAMA_MODELS_DIR))
     config.LLAMA_MODEL_PATH = settings.get("LLAMA_MODEL_PATH", config.LLAMA_MODEL_PATH)
@@ -434,6 +579,13 @@ def _apply_runtime_settings(settings: dict) -> None:
         "GROQ_RATE_LIMIT_BUFFER",
         "GROQ_ROTATE_ON_RATE_LIMIT",
         "GROQ_CONTINUATION_ATTEMPTS",
+        "GROQ_TPM_LIMIT",
+        "GROQ_TPM_WINDOW_SECONDS",
+        "GROQ_TPM_SAFETY_MARGIN",
+        "GROQ_TPM_RESERVE_DEFAULT",
+        "GROQ_TPM_PACING",
+        "GROQ_PROACTIVE_ROTATION",
+        "HYBRID_ROUTING",
         "RETRY_BASE_DELAY",
         "RETRY_MAX_DELAY",
         "RETRY_BACKOFF_FACTOR",
@@ -447,7 +599,11 @@ def _apply_runtime_settings(settings: dict) -> None:
         "MAX_TOKEN_BUDGET",
         "TOP_K_RETRIEVAL",
         "CONTEXT_TOKEN_BUDGET",
-        "SSE_QUEUE_MAXSIZE",
+        "KEY_ROTATION_STRATEGY",
+        "GEMINI_ROTATE_ON_RATE_LIMIT",
+        "GEMINI_PROACTIVE_ROTATION",
+        "OPENROUTER_ROTATE_ON_RATE_LIMIT",
+        "OPENROUTER_PROACTIVE_ROTATION",
         "FLASK_HOST",
         "FLASK_PORT",
         "FLASK_DEBUG",
@@ -502,6 +658,129 @@ def create_app():
     app = Flask(__name__, static_folder="static", template_folder="templates")
     app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", os.urandom(24).hex())
     app.register_blueprint(vision_bp)
+
+    prompt_jobs = set()
+
+    @app.before_request
+    def _log_req_start():
+        request._start_time = time.monotonic()
+
+    @app.after_request
+    def _log_req_end(response):
+        if request.path.startswith("/static/"):
+            return response
+        duration = time.monotonic() - getattr(request, "_start_time", time.monotonic())
+        if request.method != "GET" or duration > 0.4 or response.status_code >= 400:
+            logger.info(
+                "HTTP %s %s -> %s (%.2fs)",
+                request.method, request.path, response.status_code, duration
+            )
+        return response
+
+    @app.route("/api/logs", methods=["GET"])
+    def get_system_logs():
+        """Retrieve recent logs from the unified logging system."""
+        log_type = request.args.get("type", "app")
+        try:
+            lines = int(request.args.get("lines", 100))
+        except (ValueError, TypeError):
+            lines = 100
+        query = request.args.get("q", "")
+        lines_content = sys_logger.read_recent_logs(log_type=log_type, max_lines=lines, filter_query=query)
+        return jsonify({
+            "type": log_type,
+            "count": len(lines_content),
+            "lines": lines_content,
+        })
+
+    @app.route("/api/project/<name>/image-prompts", methods=["GET", "POST"])
+    def image_prompts_api(name):
+        from pipeline.image_prompts import read, generate, fail
+        name = normalize_project_name(name)
+        data = (request.get_json(silent=True) or {}) if request.method == "POST" else request.args
+        source = str(data.get("source", ""))
+        project_dir = os.path.join(config.PROJECTS_DIR, name)
+        if re.fullmatch(r"chapter:[1-9][0-9]*", source):
+            path = os.path.join(project_dir, "chapters", f"chapter_{int(source.split(':')[1]):03d}.md")
+        elif re.fullmatch(r"story:[A-Za-z0-9_-]+", source):
+            suffix = source.split(":", 1)[1]
+            path = os.path.join(project_dir, "combined_polished" + ("" if suffix == "latest" else "_" + suffix) + ".md")
+        else:
+            return jsonify({"error": "Invalid prompt source"}), 400
+        try:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        except OSError:
+            return jsonify({"error": "Story source not found"}), 404
+        key = (name, source)
+        if request.method == "GET":
+            result = read(project_dir, text)
+            if key in prompt_jobs:
+                result["status"] = "generating"
+            return jsonify(dict(result, source=source))
+        with _generation_lock:
+            if _project_busy(name):
+                return jsonify({"error": "Project is busy. Retry when generation finishes."}), 409
+            prompt_jobs.add(key)
+        def run():
+            try:
+                pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+                model = pipeline.cloud_model if pipeline._cloud_available else pipeline.local_model
+                generate(project_dir, text, model, force=True)
+            except Exception as exc:
+                fail(project_dir, text, exc)
+                logger.exception("Unable to initialize scene prompt model")
+            finally:
+                with _generation_lock:
+                    prompt_jobs.discard(key)
+        threading.Thread(target=run, daemon=True).start()
+        return jsonify({"status": "generating", "source": source}), 202
+
+    def _storage_pipeline(name: str) -> PipelineOrchestrator:
+        """Construct project storage without requiring a usable inference backend."""
+        return PipelineOrchestrator(name, initialize_models=False)
+
+    def _project_busy(name: str) -> bool:
+        return (
+            name in _active_pipelines
+            or name in _manual_sessions
+            or name in _active_combines
+            or name in _maintenance_projects
+            or any(key[0] == name for key in prompt_jobs)
+        )
+
+    def _busy_response(name: str):
+        if _project_busy(name):
+            return jsonify({"error": "Another operation is active for this project"}), 409
+        return None
+
+    def _claim_maintenance(name: str) -> bool:
+        with _generation_lock:
+            if _project_busy(name):
+                return False
+            _maintenance_projects.add(name)
+            # A queued outage retry must not resurrect deleted/rewound prose
+            # or continue with settings that the user has just replaced.
+            from pipeline.job_store import JobStore
+            JobStore().cancel(name)
+            return True
+
+    def _release_maintenance(name: str) -> None:
+        with _generation_lock:
+            _maintenance_projects.discard(name)
+
+    def _premise_request_context(name: str, data: dict) -> tuple[dict, str, object]:
+        """Use canonical project context unless the caller explicitly overrides it."""
+        state_path = os.path.join(config.PROJECTS_DIR, name, "state.json")
+        state = {}
+        if os.path.exists(state_path):
+            with open(state_path, encoding="utf-8") as handle:
+                state = json.load(handle)
+        metadata = state.get("metadata", {})
+        characters = data.get("characters", state.get("characters", {}))
+        setting = data.get("setting", metadata.get("setting", ""))
+        themes = data.get("themes", metadata.get("themes", []))
+        return characters, setting, themes
 
     def _resolve_generation_pipeline_kwargs(requested_model: str):
         global _selected_local_model_path, _selected_backend
@@ -565,9 +844,19 @@ def create_app():
         return pipeline_kwargs, None, None
 
     # ─── Pages ────────────────────────────────────────────────────
-    @app.route("/")
-    def index():
-        return render_template("index.html")
+    from web_ui import register_ui
+    register_ui(app)
+
+    @app.get("/api/project/<name>/activity")
+    def project_activity(name):
+        """Allow a refreshed browser to reconnect without starting another job."""
+        name = normalize_project_name(name)
+        with _generation_lock:
+            return jsonify({
+                "generation": name in _active_pipelines,
+                "combine": name in _active_combines,
+                "manual": name in _manual_sessions,
+            })
 
     # ─── API: Model Management ────────────────────────────────────
     @app.route("/api/settings", methods=["GET"])
@@ -633,11 +922,15 @@ def create_app():
             return jsonify({"error": "Groq API key is required for hybrid or full Groq mode"}), 400
 
         gemini_key = updates.get("GEMINI_API_KEY", config.GEMINI_API_KEY)
-        if mode == "gemini" and not gemini_key:
+        gemini_raw_keys = updates.get("GEMINI_API_KEYS", ",".join(getattr(config, "GEMINI_API_KEYS", [])))
+        has_gemini_key = bool(gemini_key or gemini_raw_keys.strip())
+        if mode == "gemini" and not has_gemini_key:
             return jsonify({"error": "Gemini API key is required for Gemini mode"}), 400
 
         openrouter_key = updates.get("OPENROUTER_API_KEY", config.OPENROUTER_API_KEY)
-        if mode == "openrouter" and not openrouter_key:
+        openrouter_raw_keys = updates.get("OPENROUTER_API_KEYS", ",".join(getattr(config, "OPENROUTER_API_KEYS", [])))
+        has_openrouter_key = bool(openrouter_key or openrouter_raw_keys.strip())
+        if mode == "openrouter" and not has_openrouter_key:
             return jsonify({"error": "OpenRouter API key is required for OpenRouter mode"}), 400
 
         updates["BACKEND_MODE"] = mode
@@ -651,6 +944,33 @@ def create_app():
             "status": "ok",
             **_settings_payload(),
         })
+
+    @app.route("/api/keys/status", methods=["GET"])
+    def get_keys_status():
+        """Return live health and rotation metrics for all multi-account key pools."""
+        return jsonify({
+            "groq": GroqKeyManager.status_summary(),
+            "groq_quota": __import__("models.quota_scheduler", fromlist=["QuotaScheduler"]).QuotaScheduler().status(),
+            "gemini": GeminiKeyManager.status_summary(),
+            "openrouter": OpenRouterKeyManager.status_summary(),
+        })
+
+    @app.route("/api/keys/rotate/<provider>", methods=["POST"])
+    def rotate_provider_key(provider):
+        """Manually rotate the active key for a provider to the next available account."""
+        prov = str(provider).lower()
+        if prov == "groq":
+            success = GroqKeyManager.rotate()
+            summary = GroqKeyManager.status_summary()
+        elif prov == "gemini":
+            success = GeminiKeyManager.rotate()
+            summary = GeminiKeyManager.status_summary()
+        elif prov == "openrouter":
+            success = OpenRouterKeyManager.rotate()
+            summary = OpenRouterKeyManager.status_summary()
+        else:
+            return jsonify({"error": f"Unknown provider '{provider}'. Must be groq, gemini, or openrouter"}), 400
+        return jsonify({"status": "ok", "provider": prov, "rotated": success, "summary": summary})
 
     @app.route("/api/models", methods=["GET"])
     def list_models():
@@ -807,7 +1127,8 @@ def create_app():
                     if os.path.exists(chap_dir):
                         chap_files = [f for f in os.listdir(chap_dir) if f.startswith("chapter_") and (f.endswith(".md") or f.endswith(".txt"))]
 
-                    total_chapters = len(chap_files) or meta.get("current_chapter", 0)
+                    committed_chapters = int(meta.get("current_chapter", 0) or 0)
+                    total_chapters = min(len(chap_files), committed_chapters) if chap_files else committed_chapters
                     word_cnt = meta.get("word_count", 0)
                     if not word_cnt and os.path.exists(chap_dir):
                         for f in chap_files:
@@ -845,11 +1166,20 @@ def create_app():
 
         project_name = normalize_project_name(title)
         try:
-            pipeline = PipelineOrchestrator(project_name, **_current_pipeline_kwargs())
-            state = pipeline.create_project(
-                title=title, genre=genre, premise=premise,
-                characters=characters, themes=themes, setting=setting,
-            )
+            # Check and initialize under the shared operation lock so two
+            # simultaneous requests cannot both reset the same project.
+            with _generation_lock:
+                state_path = os.path.join(config.PROJECTS_DIR, project_name, "state.json")
+                if os.path.exists(os.path.dirname(state_path)):
+                    return jsonify({
+                        "status": "error",
+                        "error": f"A project named '{project_name}' already exists",
+                    }), 409
+                pipeline = _storage_pipeline(project_name)
+                state = pipeline.create_project(
+                    title=title, genre=genre, premise=premise,
+                    characters=characters, themes=themes, setting=setting,
+                )
             return jsonify({"status": "ok", "project": project_name, "state": state})
         except Exception as e:
             return jsonify({"status": "error", "error": str(e)}), 500
@@ -919,13 +1249,70 @@ def create_app():
     @app.route("/api/project/<name>/state", methods=["PUT"])
     def update_project_state(name):
         name = normalize_project_name(name)
+        if not _claim_maintenance(name):
+            return _busy_response(name)
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = _storage_pipeline(name)
             pipeline.load_project()
-            updates = request.json
-            pipeline.state_manager.apply_state_update(updates)
+            updates = request.json or {}
+            pipeline.state_manager.apply_state_update(
+                updates,
+                replace_characters="characters" in updates,
+            )
             return jsonify({"status": "ok", "state": pipeline.get_state()})
         except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            _release_maintenance(name)
+
+    @app.route("/api/premise/generate", methods=["POST"])
+    def generate_premise_standalone():
+        """
+        Standalone premise generator for creating new stories from drafts/notes
+        before a project is created.
+        """
+        try:
+            data = request.json or {}
+            idea = data.get("idea", data.get("idea_text", ""))
+            requested_model = data.get("model")
+            mode = data.get("mode", "auto")
+            target_chapters = data.get("target_chapters")
+            target_beats = data.get("target_beats")
+            characters = data.get("characters", {})
+            setting = data.get("setting", "")
+            themes = data.get("themes", [])
+
+            if target_chapters and not target_beats:
+                try:
+                    target_beats = int(target_chapters) * config.PREMISE_STEPS_PER_CHAPTER
+                except (ValueError, TypeError):
+                    pass
+
+            logger.info(
+                "Standalone premise request: model=%s, idea_chars=%d, mode=%s, chapters=%s, beats=%s",
+                requested_model, len(idea), mode, target_chapters, target_beats
+            )
+            llm = _get_llm_for_premise(requested_model)
+
+            result = PremiseArchitect.generate(
+                idea_text=idea,
+                mode=mode,
+                target_beats=target_beats,
+                characters=characters,
+                setting=setting,
+                themes=themes,
+                llm=llm,
+            )
+            logger.info(
+                "Standalone premise success: title=%r, beats=%d, characters=%d, genre=%s",
+                result.get("title", ""),
+                len(result.get("steps", [])),
+                len(result.get("characters", {})),
+                result.get("genre", ""),
+            )
+            return jsonify(result)
+        except Exception as e:
+            logger.exception("Error in generate_premise_standalone: %s", e)
             return jsonify({"error": str(e)}), 500
 
     @app.route("/api/project/<name>/premise/generate", methods=["POST"])
@@ -933,48 +1320,62 @@ def create_app():
         name = normalize_project_name(name)
         try:
             data = request.json or {}
-            characters = data.get("characters", {})
-            setting = data.get("setting", "")
-            themes = data.get("themes", "")
-            idea = data.get("idea", "")
+            characters, setting, themes = _premise_request_context(name, data)
+            idea = data.get("idea", data.get("idea_text", ""))
             requested_model = data.get("model")
+            mode = data.get("mode", "auto")
+            target_chapters = data.get("target_chapters")
+            target_beats = data.get("target_beats")
+            if target_chapters and not target_beats:
+                try:
+                    target_beats = int(target_chapters) * config.PREMISE_STEPS_PER_CHAPTER
+                except (ValueError, TypeError):
+                    pass
 
+            logger.info(
+                "Project premise request [%s]: model=%s, idea_chars=%d, mode=%s",
+                name, requested_model, len(idea), mode
+            )
             llm = _get_llm_for_premise(requested_model)
 
-            # Build characters context
-            chars_txt = ""
-            if isinstance(characters, dict):
-                for cname, cinfo in characters.items():
-                    desc = cinfo.get("description", "")
-                    traits = ", ".join(cinfo.get("traits", []))
-                    chars_txt += f"- {cname}: {desc} (Traits: {traits})\n"
-            elif isinstance(characters, list):
-                for c in characters:
-                    chars_txt += f"- {c.get('name')}: {c.get('description')} (Traits: {', '.join(c.get('traits', []))})\n"
-
-            prompt = (
-                "You are a master story architect. Your task is to transform a rough story idea/timeline and character/setting details "
-                "into a clean, highly structured, sequential story premise outline.\n\n"
-                "=== INPUT DETAILS ===\n"
-                f"CHARACTERS:\n{chars_txt}\n"
-                f"SETTING: {setting}\n"
-                f"THEMES: {themes}\n\n"
-                f"ROUGH STORY IDEA / TIMELINE:\n{idea}\n\n"
-                "=== REQUIREMENTS ===\n"
-                "1. Output the premise as a clean list of sequential story steps (one step per line).\n"
-                "2. Ensure the steps flow in strict chronological order, starting from the introduction and building logically to the climax and resolution.\n"
-                "3. Do NOT include act divisions, chapter headings, metadata, commentary, or short lines with colons.\n"
-                "4. Each step should be a clear, concrete event or scene (about 1-3 sentences describing who does what and the consequence).\n"
-                "5. Aim for 8 to 20 steps, depending on the complexity of the story.\n"
-                "6. Output ONLY the story steps list. Do not write any introduction (like 'Here is the premise') or wrap the output in markdown code blocks."
+            result = PremiseArchitect.generate(
+                idea_text=idea,
+                mode=mode,
+                target_beats=target_beats,
+                characters=characters,
+                setting=setting,
+                themes=themes,
+                llm=llm,
+            )
+            logger.info(
+                "Project premise success [%s]: title=%r, beats=%d, characters=%d",
+                name,
+                result.get("title", ""),
+                len(result.get("steps", [])),
+                len(result.get("characters", {})),
             )
 
-            response = llm.generate(prompt=prompt, system="You are an expert developer and novelist planning a structured outline.")
-            content = response.content or ""
-            
-            # Parse content into steps
-            steps = PipelineOrchestrator._premise_steps(content)
-            return jsonify({"status": "ok", "steps": steps})
+            # Auto-apply extracted lore if requested or if Story Bible is currently empty
+            if data.get("apply_to_bible"):
+                try:
+                    pipeline = _storage_pipeline(name)
+                    pipeline.load_project()
+                    updates = {}
+                    if result.get("characters"):
+                        updates["characters"] = result["characters"]
+                    meta_updates = {}
+                    if result.get("setting"):
+                        meta_updates["setting"] = result["setting"]
+                    if result.get("themes"):
+                        meta_updates["themes"] = result["themes"]
+                    if meta_updates:
+                        updates["metadata"] = meta_updates
+                    if updates:
+                        pipeline.state_manager.apply_state_update(updates, replace_characters=False)
+                except Exception as ex:
+                    logger.warning(f"Could not auto-apply extracted lore to state: {ex}")
+
+            return jsonify(result)
         except Exception as e:
             logger.exception("Error in generate_premise")
             return jsonify({"error": str(e)}), 500
@@ -985,43 +1386,17 @@ def create_app():
         try:
             data = request.json or {}
             steps = data.get("steps", [])
-            characters = data.get("characters", {})
-            setting = data.get("setting", "")
-            themes = data.get("themes", "")
+            characters, setting, themes = _premise_request_context(name, data)
             requested_model = data.get("model")
 
             llm = _get_llm_for_premise(requested_model)
-
-            # Build characters and current steps context
-            chars_txt = ""
-            if isinstance(characters, dict):
-                for cname, cinfo in characters.items():
-                    desc = cinfo.get("description", "")
-                    traits = ", ".join(cinfo.get("traits", []))
-                    chars_txt += f"- {cname}: {desc} (Traits: {traits})\n"
-            
-            steps_txt = "\n".join(f"{i+1}. {step}" for i, step in enumerate(steps))
-
-            prompt = (
-                "You are a developmental editor. Your task is to refine, correct, and optimize the chronological flow of a story premise.\n\n"
-                "=== INPUT DETAILS ===\n"
-                f"CHARACTERS:\n{chars_txt}\n"
-                f"SETTING: {setting}\n"
-                f"THEMES: {themes}\n\n"
-                f"CURRENT STORY PREMISE STEPS:\n{steps_txt}\n\n"
-                "=== REQUIREMENTS ===\n"
-                "1. Analyze the steps for narrative drift, logical gaps, pacing issues, or premature conflict resolutions.\n"
-                "2. Correct any character inconsistencies, rename errors, or spelling issues based on the character profiles.\n"
-                "3. Ensure the events are in the absolute correct chronological order of how they must be generated.\n"
-                "4. Output the refined premise as a clean list of sequential story steps (one step per line).\n"
-                "5. Do NOT include headings, act divisions, metadata, or commentary.\n"
-                "6. Output ONLY the story steps list. Do not write any introductory/concluding text or wrap in code blocks."
+            refined_steps = PremiseArchitect.refine(
+                steps=steps,
+                characters=characters,
+                setting=setting,
+                themes=themes,
+                llm=llm,
             )
-
-            response = llm.generate(prompt=prompt, system="You are an expert developmental editor focusing on pacing and continuity.")
-            content = response.content or ""
-            
-            refined_steps = PipelineOrchestrator._premise_steps(content)
             return jsonify({"status": "ok", "steps": refined_steps})
         except Exception as e:
             logger.exception("Error in refine_premise")
@@ -1033,43 +1408,19 @@ def create_app():
         try:
             data = request.json or {}
             steps = data.get("steps", [])
-            characters = data.get("characters", {})
-            setting = data.get("setting", "")
-            themes = data.get("themes", "")
+            characters, setting, themes = _premise_request_context(name, data)
             requested_model = data.get("model")
+            target_beats = data.get("target_beats")
 
             llm = _get_llm_for_premise(requested_model)
-
-            # Build characters and current steps context
-            chars_txt = ""
-            if isinstance(characters, dict):
-                for cname, cinfo in characters.items():
-                    desc = cinfo.get("description", "")
-                    traits = ", ".join(cinfo.get("traits", []))
-                    chars_txt += f"- {cname}: {desc} (Traits: {traits})\n"
-            
-            steps_txt = "\n".join(f"{i+1}. {step}" for i, step in enumerate(steps))
-
-            prompt = (
-                "You are a creative writer. Your task is to expand an existing story premise by introducing new intermediate events, scenes, or beats.\n\n"
-                "=== INPUT DETAILS ===\n"
-                f"CHARACTERS:\n{chars_txt}\n"
-                f"SETTING: {setting}\n"
-                f"THEMES: {themes}\n\n"
-                f"CURRENT STORY PREMISE STEPS:\n{steps_txt}\n\n"
-                "=== REQUIREMENTS ===\n"
-                "1. Creatively invent and insert new intermediate steps/scenes between the existing steps to flesh out the narrative arc.\n"
-                "2. Focus on character relationships, build suspense/conflict gradually, and add detailed pacing beats.\n"
-                "3. Maintain absolute continuity with the existing steps — do NOT alter their key outcomes, but insert setup or reaction scenes between them.\n"
-                "4. Output the expanded premise as a clean list of sequential story steps (one step per line).\n"
-                "5. Do NOT include headings, act divisions, metadata, or commentary.\n"
-                "6. Output ONLY the story steps list. Do not write any introductory/concluding text or wrap in code blocks."
+            expanded_steps = PremiseArchitect.expand(
+                steps=steps,
+                characters=characters,
+                setting=setting,
+                themes=themes,
+                target_beats=target_beats,
+                llm=llm,
             )
-
-            response = llm.generate(prompt=prompt, system="You are an expert creative novelist fleshing out outlines.")
-            content = response.content or ""
-            
-            expanded_steps = PipelineOrchestrator._premise_steps(content)
             return jsonify({"status": "ok", "steps": expanded_steps})
         except Exception as e:
             logger.exception("Error in expand_premise")
@@ -1081,6 +1432,15 @@ def create_app():
         name = normalize_project_name(name)
         chapters_dir = os.path.join(config.PROJECTS_DIR, name, "chapters")
         chapters = []
+        committed_chapter = 0
+        state_path = os.path.join(config.PROJECTS_DIR, name, "state.json")
+        try:
+            with open(state_path, encoding="utf-8") as state_file:
+                committed_chapter = int(
+                    json.load(state_file).get("metadata", {}).get("current_chapter", 0)
+                )
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
         
         # Track which chapters we've already seen as completed
         seen_nums = set()
@@ -1092,6 +1452,8 @@ def create_app():
                 if not match:
                     continue
                 num = int(match.group(1))
+                if num > committed_chapter:
+                    continue
                 seen_nums.add(num)
                 path = os.path.join(chapters_dir, f)
                 with open(path, encoding="utf-8") as fh:
@@ -1113,7 +1475,7 @@ def create_app():
                 if not match:
                     continue
                 num = int(match.group(1))
-                if num in seen_nums:
+                if num in seen_nums and num <= committed_chapter:
                     continue
                 
                 path = os.path.join(chapters_dir, f)
@@ -1147,7 +1509,26 @@ def create_app():
         if not os.path.exists(chapter_path):
             chapter_path = os.path.join(chapters_dir, f"chapter_{num:03d}.txt")
         if not os.path.exists(chapter_path):
-            return jsonify({"error": "Chapter not found"}), 404
+            wip_path = os.path.join(chapters_dir, f".wip_chapter_{num:03d}.json")
+            if not os.path.exists(wip_path):
+                return jsonify({"error": "Chapter not found"}), 404
+            try:
+                with open(wip_path, encoding="utf-8") as handle:
+                    wip = json.load(handle)
+                title = wip.get("chapter_plan", {}).get("chapter_title", f"Chapter {num}")
+                scenes = wip.get("completed_scenes", [])
+                text = "\n\n* * *\n\n".join(
+                    str(scene.get("text", "")) if isinstance(scene, dict) else str(scene)
+                    for scene in scenes
+                )
+                return jsonify({
+                    "chapter": num,
+                    "content": f"# Chapter {num}: {title}\n\n{text}".strip(),
+                    "title": f"{title} (In Progress)",
+                    "status": "writing",
+                })
+            except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
+                return jsonify({"error": f"Cannot read chapter checkpoint: {error}"}), 500
         try:
             with open(chapter_path, encoding="utf-8") as f:
                 text = f.read()
@@ -1163,15 +1544,21 @@ def create_app():
         content = (data.get("content", "") or "").strip()
         if not content:
             return jsonify({"error": "content is required and cannot be empty"}), 400
+        if not _claim_maintenance(name):
+            return _busy_response(name)
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = _storage_pipeline(name)
             pipeline.load_project()
             result = pipeline.update_chapter_content(num, content)
+            from pipeline.image_prompts import prune
+            prune(pipeline.project_dir)
             return jsonify({"status": "ok", **result})
         except FileNotFoundError as e:
             return jsonify({"error": str(e)}), 404
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+        finally:
+            _release_maintenance(name)
 
     @app.route("/api/project/<name>/chapters/delete", methods=["POST"])
     def delete_chapters(name):
@@ -1188,16 +1575,107 @@ def create_app():
             return jsonify({"error": "from_chapter must be an integer >= 1"}), 400
         if from_chapter < 1:
             return jsonify({"error": "from_chapter must be >= 1"}), 400
+        if not _claim_maintenance(name):
+            return _busy_response(name)
 
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = _storage_pipeline(name)
             pipeline.load_project()
             result = pipeline.delete_chapters_from(from_chapter)
+            from pipeline.image_prompts import prune
+            prune(pipeline.project_dir)
             return jsonify(result)
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+        finally:
+            _release_maintenance(name)
 
     # ─── API: Generation (SSE) ────────────────────────────────────
+    def launch_durable_job(name, pacing, chapter_count, pipeline_kwargs, requested_model, manual_spec=None):
+        from pipeline.job_store import JobStore
+        store = JobStore()
+        state_path = os.path.join(config.PROJECTS_DIR, name, "state.json")
+        try:
+            with open(state_path, encoding="utf-8") as handle:
+                current = int(json.load(handle).get("metadata", {}).get("current_chapter", 0))
+        except (OSError, ValueError):
+            return jsonify({"error": "Project state is missing or invalid"}), 404
+        params = {"pacing": pacing, "chapter_count": chapter_count, "model": requested_model,
+                  "pipeline_kwargs": pipeline_kwargs, "manual_spec": manual_spec}
+        with _generation_lock:
+            if _project_busy(name):
+                return jsonify({"error": "Generation already active"}), 409
+            job = store.claim(name, params, current)
+            if not job:
+                return jsonify({"error": "Job already owned or awaiting recovery"}), 409
+            _active_pipelines[name] = None
+            _cancel_requests.discard(name)
+            eq = _event_queues.get(name) if job['attempts'] else None
+            if eq is None:
+                eq = _EventChannel(maxsize=config.SSE_QUEUE_MAXSIZE)
+            _event_queues[name] = eq
+        params = job['request']
+        finished = threading.Event()
+
+        def progress_cb(event, data=None, **kwargs):
+            _queue_event(eq, _normalize_event(event, data))
+
+        def keep_lease():
+            while not finished.wait(10):
+                if not store.heartbeat(name, job['owner']):
+                    with _generation_lock:
+                        pipeline = _active_pipelines.get(name)
+                        if pipeline: pipeline.cancel()
+                    return
+
+        def run_pipeline():
+            try:
+                pipeline = PipelineOrchestrator(name, progress_cb, **params['pipeline_kwargs'])
+                pipeline.load_project()
+                with _generation_lock:
+                    cancel_requested = name in _cancel_requests
+                    if not cancel_requested: _active_pipelines[name] = pipeline
+                if cancel_requested:
+                    store.finish(name, job['owner'], 'cancelled')
+                    _queue_event(eq, _normalize_event('done', {'status': 'cancelled'}), force=True)
+                    return
+                count = job['remaining']
+                if params.get('manual_spec'):
+                    result = pipeline.generate_chapter_manual(pacing=params['pacing'], **params['manual_spec'])
+                elif count > 1 or count in (-1, -2):
+                    results = pipeline.generate_chapters(count=count, pacing=params['pacing'])
+                    result = results[-1] if results else {}
+                else:
+                    result = pipeline.generate_chapter(pacing=params['pacing'])
+                status = 'cancelled' if result.get('status') == 'cancelled' else 'done'
+                store.finish(name, job['owner'], status)
+                _queue_event(eq, _normalize_event('done', result), force=True)
+            except PipelineCancelledError:
+                store.finish(name, job['owner'], 'cancelled')
+                _queue_event(eq, _normalize_event('done', {'status': 'cancelled'}), force=True)
+            except Exception as error:
+                from models.base import QuotaExhaustedError
+                from openai import APIConnectionError, APIStatusError
+                # Retries are for capacity/outage failures; invalid inputs stay visible.
+                transient = isinstance(error, (QuotaExhaustedError, APIConnectionError)) or (
+                    isinstance(error, APIStatusError) and error.status_code >= 500)
+                transient = transient or any(term in str(error).lower() for term in (
+                    'rate limit', 'quota', 'connection lost', 'timed out', 'temporarily unavailable'))
+                if transient:
+                    store.finish(name, job['owner'], 'retry', type(error).__name__)
+                    _queue_event(eq, _normalize_event('status', 'Job saved; automatically retrying after the provider recovers.'))
+                else:
+                    store.finish(name, job['owner'], 'failed', type(error).__name__)
+                    _queue_event(eq, _normalize_event('error', {'error': str(error)}), force=True)
+            finally:
+                finished.set()
+                with _generation_lock:
+                    _active_pipelines.pop(name, None)
+
+        threading.Thread(target=keep_lease, daemon=True).start()
+        threading.Thread(target=run_pipeline, daemon=True).start()
+        return jsonify({"status": "started", "chapters": job['remaining']})
+
     @app.route("/api/project/<name>/generate", methods=["POST"])
     def start_generation(name):
         name = normalize_project_name(name)
@@ -1214,61 +1692,7 @@ def create_app():
         if err_resp is not None:
             return err_resp, err_code
 
-        with _generation_lock:
-            if name in _active_pipelines:
-                return jsonify({"error": "Generation already active"}), 409
-            # Reserve the slot synchronously. The real pipeline is built in a
-            # worker thread; without a placeholder two rapid requests could
-            # both pass the check above and generate concurrently.
-            _active_pipelines[name] = None
-            _cancel_requests.discard(name)
-            eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
-            _event_queues[name] = eq
-
-        def progress_cb(event, data=None, **kwargs):
-            msg = _normalize_event(event, data)
-            if not _queue_event(eq, msg):
-                logger.warning(f"SSE queue full for project '{name}'. Dropping event '{event}'.")
-
-        def run_pipeline():
-            try:
-                pipeline = PipelineOrchestrator(
-                    name,
-                    progress_cb,
-                    **pipeline_kwargs,
-                )
-                pipeline.load_project()
-                with _generation_lock:
-                    cancel_requested = name in _cancel_requests
-                    if not cancel_requested:
-                        _active_pipelines[name] = pipeline
-                if cancel_requested:
-                    _queue_event(eq, _normalize_event("done", {
-                        "status": "cancelled",
-                        "message": "Generation cancelled before it started.",
-                    }), force=True)
-                    return
-                if chapter_count > 1 or chapter_count in (-1, -2):
-                    results = pipeline.generate_chapters(count=chapter_count, pacing=pacing)
-                    _queue_event(eq, _normalize_event("done", results[-1] if results else {}), force=True)
-                else:
-                    result = pipeline.generate_chapter(pacing=pacing)
-                    _queue_event(eq, _normalize_event("done", result), force=True)
-            except PipelineCancelledError:
-                _queue_event(eq, _normalize_event("done", {
-                    "status": "cancelled",
-                    "message": "Generation cancelled by user.",
-                }), force=True)
-            except Exception as e:
-                _queue_event(eq, _normalize_event("error", {"error": str(e)}), force=True)
-            finally:
-                with _generation_lock:
-                    _active_pipelines.pop(name, None)
-
-        thread = threading.Thread(target=run_pipeline, daemon=True)
-        thread.start()
-
-        return jsonify({"status": "started", "chapters": chapter_count})
+        return launch_durable_job(name, pacing, chapter_count, pipeline_kwargs, requested_model)
 
     @app.route("/api/project/<name>/generate/manual", methods=["POST"])
     def start_manual_generation(name):
@@ -1299,61 +1723,8 @@ def create_app():
         if err_resp is not None:
             return err_resp, err_code
 
-        with _generation_lock:
-            if name in _active_pipelines:
-                return jsonify({"error": "Generation already active"}), 409
-            # Reserve the slot synchronously (same rationale as start_generation).
-            _active_pipelines[name] = None
-            _cancel_requests.discard(name)
-            eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
-            _event_queues[name] = eq
-
-        final_scenes = scenes[:scene_count]
-
-        def progress_cb(event, data=None, **kwargs):
-            msg = _normalize_event(event, data)
-            if not _queue_event(eq, msg):
-                logger.warning(f"SSE queue full for project '{name}'. Dropping event '{event}'.")
-
-        def run_pipeline():
-            try:
-                pipeline = PipelineOrchestrator(
-                    name,
-                    progress_cb,
-                    **pipeline_kwargs,
-                )
-                pipeline.load_project()
-                with _generation_lock:
-                    cancel_requested = name in _cancel_requests
-                    if not cancel_requested:
-                        _active_pipelines[name] = pipeline
-                if cancel_requested:
-                    _queue_event(eq, _normalize_event("done", {
-                        "status": "cancelled",
-                        "message": "Generation cancelled before it started.",
-                    }), force=True)
-                    return
-                result = pipeline.generate_chapter_manual(
-                    chapter_title=chapter_title,
-                    scene_briefs=final_scenes,
-                    pacing=pacing,
-                )
-                _queue_event(eq, _normalize_event("done", result), force=True)
-            except PipelineCancelledError:
-                _queue_event(eq, _normalize_event("done", {
-                    "status": "cancelled",
-                    "message": "Generation cancelled by user.",
-                }), force=True)
-            except Exception as e:
-                _queue_event(eq, _normalize_event("error", {"error": str(e)}), force=True)
-            finally:
-                with _generation_lock:
-                    _active_pipelines.pop(name, None)
-
-        thread = threading.Thread(target=run_pipeline, daemon=True)
-        thread.start()
-
-        return jsonify({"status": "started", "chapters": 1, "scenes": len(final_scenes)})
+        return launch_durable_job(name, pacing, 1, pipeline_kwargs, requested_model,
+                                  {"chapter_title": chapter_title, "scene_briefs": scenes[:scene_count]})
 
     # ─── API: Interactive Manual Generation (Scene-by-Scene) ──────
     @app.route("/api/project/<name>/generate/manual/start", methods=["POST"])
@@ -1375,14 +1746,14 @@ def create_app():
         with _generation_lock:
             if name in _manual_sessions:
                 return jsonify({"error": "A manual session is already active for this project"}), 409
-            if name in _active_pipelines:
+            if _project_busy(name):
                 return jsonify({"error": "Generation already active"}), 409
             # Reserve synchronously: pipeline construction below is slow and
             # must not let a second request slip past this check.
             _manual_sessions[name] = None
 
         try:
-            eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
+            eq = _EventChannel(maxsize=config.SSE_QUEUE_MAXSIZE)
 
             def progress_cb(event, data=None, **kwargs):
                 msg = _normalize_event(event, data)
@@ -1433,12 +1804,10 @@ def create_app():
                 return jsonify({"error": "No active manual session. Call /manual/start first."}), 404
             if name in _active_pipelines:
                 return jsonify({"error": "A scene is currently being generated. Wait for it to finish."}), 409
-
-        pipeline = ms["pipeline"]
-        session = ms["session"]
-        eq = ms["eq"]
-
-        with _generation_lock:
+            pipeline = ms["pipeline"]
+            session = ms["session"]
+            eq = ms["eq"]
+            eq.clear()
             _cancel_requests.discard(name)
             _active_pipelines[name] = pipeline
 
@@ -1540,7 +1909,7 @@ def create_app():
             _manual_sessions[name] = None
 
         try:
-            eq = queue.Queue(maxsize=config.SSE_QUEUE_MAXSIZE)
+            eq = _EventChannel(maxsize=config.SSE_QUEUE_MAXSIZE)
 
             def progress_cb(event, data=None, **kwargs):
                 msg = _normalize_event(event, data)
@@ -1585,29 +1954,42 @@ def create_app():
                 return jsonify({"error": "No active manual session."}), 404
             if name in _active_pipelines:
                 return jsonify({"error": "A scene is currently being generated. Wait for it to finish."}), 409
-
-        pipeline = ms["pipeline"]
-        session = ms["session"]
-        eq = ms["eq"]
-
-        with _generation_lock:
+            pipeline = ms["pipeline"]
+            session = ms["session"]
+            eq = ms["eq"]
+            eq.clear()
             _active_pipelines[name] = pipeline
 
         def run_finish():
+            success = False
             try:
                 result = pipeline.finish_manual_chapter(session=session)
+                success = True
                 _queue_event(eq, _normalize_event("done", result), force=True)
             except Exception as e:
                 _queue_event(eq, _normalize_event("error", {"error": str(e)}), force=True)
             finally:
                 with _generation_lock:
                     _active_pipelines.pop(name, None)
-                    _manual_sessions.pop(name, None)
+                    if success:
+                        _manual_sessions.pop(name, None)
 
         thread = threading.Thread(target=run_finish, daemon=True)
         thread.start()
 
         return jsonify({"status": "finishing", "scenes_count": len(session["completed_scenes"])})
+
+    @app.route("/api/project/<name>/generate/manual/abort", methods=["POST"])
+    def abort_manual_session_api(name):
+        """Abandon the in-memory manual session while preserving its WIP checkpoint."""
+        name = normalize_project_name(name)
+        with _generation_lock:
+            if name in _active_pipelines:
+                return jsonify({"error": "A scene is currently running; stop it first"}), 409
+            session = _manual_sessions.pop(name, None)
+            _event_queues.pop(name, None)
+            _cancel_requests.discard(name)
+        return jsonify({"status": "aborted", "had_session": bool(session)})
 
     @app.route("/api/project/<name>/generate/manual/scene/<int:index>", methods=["DELETE"])
     def delete_manual_scene_api(name, index):
@@ -1686,23 +2068,24 @@ def create_app():
     @app.route("/api/project/<name>/generate/stream", methods=["GET"])
     def stream_generation(name):
         name = normalize_project_name(name)
+        last_event_id = request.headers.get("Last-Event-ID")
         def event_stream():
             eq = _event_queues.get(name)
             if not eq:
                 yield f"data: {json.dumps(_normalize_event('error', {'error': 'No active generation'}))}\n\n"
                 return
+            subscription = eq.subscribe(last_event_id)
             try:
                 while True:
                     try:
-                        msg = eq.get(timeout=120)
-                        yield f"data: {json.dumps(msg)}\n\n"
+                        msg = subscription.get(timeout=15)
+                        yield f"id: {eq._stream_id}:{subscription.cursor}\ndata: {json.dumps(msg)}\n\n"
                         if msg.get("type") in ("done", "error"):
                             break
                     except queue.Empty:
                         yield f"data: {json.dumps(_normalize_event('heartbeat', {}))}\n\n"
             finally:
-                with _generation_lock:
-                    _event_queues.pop(name, None)
+                pass
 
         return Response(
             event_stream(),
@@ -1716,6 +2099,8 @@ def create_app():
     @app.route("/api/project/<name>/generate/cancel", methods=["POST"])
     def cancel_generation(name):
         name = normalize_project_name(name)
+        from pipeline.job_store import JobStore
+        JobStore().cancel(name)
         with _generation_lock:
             _cancel_requests.add(name)
             pipeline = _active_pipelines.get(name)
@@ -1745,14 +2130,16 @@ def create_app():
 
         data = request.json or {}
         requested_model = data.get("model")
-        mode = data.get("mode", "polish")
+        mode = data.get("mode", "whole" if data.get("whole_story") else "polish")
+        if mode not in {"polish", "whole"}:
+            return jsonify({"error": "mode must be 'polish' or 'whole'"}), 400
 
         with _generation_lock:
-            if name in _active_combines:
+            if _project_busy(name):
                 return jsonify({"error": "Combine already in progress"}), 409
             # Claim synchronously so concurrent requests can't double-start.
             _active_combines[name] = True
-            eq = queue.Queue(maxsize=100)
+            eq = _EventChannel(maxsize=100)
             _combine_queues[name] = eq
             _combine_cancel_requests.discard(name)
 
@@ -1762,7 +2149,7 @@ def create_app():
 
         def run_combine():
             try:
-                pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+                pipeline = _storage_pipeline(name)
                 pipeline.load_project()
                 state = pipeline.get_state()
                 metadata = state.get("metadata", {})
@@ -1830,6 +2217,13 @@ def create_app():
                 with open(analysis_path, "w", encoding="utf-8") as f:
                     f.write(result["analysis"])
 
+                from pipeline.image_prompts import generate as generate_image_prompts
+                try:
+                    _queue_event(eq, _normalize_event("combine_status", {"step": "Writing scene image prompts..."}))
+                    generate_image_prompts(output_dir, result["final_story"], GeminiModel(model=requested_model))
+                except Exception:
+                    logger.exception("Scene prompts failed; polished story retained")
+
                 _combine_results[name] = {
                     "analysis": result["analysis"],
                     "model": result["model"],
@@ -1879,24 +2273,25 @@ def create_app():
     def stream_combine(name):
         """SSE stream for combine progress events."""
         name = normalize_project_name(name)
+        last_event_id = request.headers.get("Last-Event-ID")
 
         def event_stream():
             eq = _combine_queues.get(name)
             if not eq:
                 yield f"data: {json.dumps(_normalize_event('combine_error', {'error': 'No active combine'}))}\n\n"
                 return
+            subscription = eq.subscribe(last_event_id)
             try:
                 while True:
                     try:
-                        msg = eq.get(timeout=300)
-                        yield f"data: {json.dumps(msg)}\n\n"
+                        msg = subscription.get(timeout=15)
+                        yield f"id: {eq._stream_id}:{subscription.cursor}\ndata: {json.dumps(msg)}\n\n"
                         if msg.get("type") in ("combine_done", "combine_error"):
                             break
                     except queue.Empty:
                         yield f"data: {json.dumps(_normalize_event('heartbeat', {}))}\n\n"
             finally:
-                with _generation_lock:
-                    _combine_queues.pop(name, None)
+                pass
 
         return Response(
             event_stream(),
@@ -2077,6 +2472,8 @@ def create_app():
                 if os.path.exists(f):
                     os.remove(f)
                     deleted = True
+            from pipeline.image_prompts import prune
+            prune(project_dir)
             return jsonify({"status": "ok", "deleted": deleted})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -2137,6 +2534,8 @@ def create_app():
                         os.remove(path)
                         deleted = True
             
+            from pipeline.image_prompts import prune
+            prune(project_dir)
             return jsonify({"status": "ok", "deleted": deleted})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -2145,6 +2544,8 @@ def create_app():
     @app.route("/api/project/<name>/delete", methods=["POST"])
     def delete_project(name):
         name = normalize_project_name(name)
+        if not _claim_maintenance(name):
+            return _busy_response(name)
         try:
             deleted = PipelineOrchestrator.delete_project(name)
             if deleted:
@@ -2152,24 +2553,31 @@ def create_app():
             return jsonify({"error": "Project not found"}), 404
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+        finally:
+            _release_maintenance(name)
 
     @app.route("/api/project/<name>/reset", methods=["POST"])
     def reset_project(name):
         """Reset generated content (chapters, plot, vectors) while keeping user data."""
         name = normalize_project_name(name)
+        if not _claim_maintenance(name):
+            return _busy_response(name)
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = _storage_pipeline(name)
             pipeline.load_project()
             pipeline.state_manager.reset_generated()
+            pipeline.vector_store.prune_chapters(0)
             return jsonify({"status": "ok", "message": "Generated content cleared"})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
+        finally:
+            _release_maintenance(name)
 
     @app.route("/api/project/<name>/export", methods=["GET"])
     def export_project(name):
         name = normalize_project_name(name)
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = _storage_pipeline(name)
             pipeline.load_project()
             content = pipeline.export_full_story()
             return Response(
@@ -2191,7 +2599,10 @@ def create_app():
         use_llm = bool(data.get("use_llm", False))
         max_chapters = int(data.get("max_chapters", 999))
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = (
+                PipelineOrchestrator(name, **_current_pipeline_kwargs())
+                if use_llm else _storage_pipeline(name)
+            )
             pipeline.load_project()
             result = pipeline.generate_world_bible(
                 use_llm=use_llm,
@@ -2229,7 +2640,7 @@ def create_app():
         data = request.json or {}
         fmt = str(data.get("format", "md")).lower()
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = _storage_pipeline(name)
             pipeline.load_project()
             result = pipeline.export_story(fmt=fmt)
             return jsonify(result)
@@ -2328,7 +2739,7 @@ def create_app():
         """
         name = normalize_project_name(name)
         try:
-            pipeline = PipelineOrchestrator(name, **_current_pipeline_kwargs())
+            pipeline = _storage_pipeline(name)
             pipeline.load_project()
             return jsonify(pipeline.continuity_report())
         except Exception as e:
@@ -2369,6 +2780,7 @@ def create_app():
                 traceback.print_exc()
                 return jsonify({"error": str(e)}), 500
 
+            eq.clear()
             _cancel_requests.discard(name)
             _active_pipelines[name] = pipeline
 
@@ -2403,6 +2815,28 @@ def create_app():
 
         scene_number = session["scene_counter"] + 1
         return jsonify({"status": "started", "scene_number": scene_number})
+
+    @app.route("/api/jobs", methods=["GET"])
+    def job_status():
+        from pipeline.job_store import JobStore
+        return jsonify({"jobs": JobStore().status()})
+
+    if os.getenv("STORY_AUTO_RESUME", "false").lower() in ("1", "true", "yes"):
+        def recover_jobs():
+            from pipeline.job_store import JobStore
+            store = JobStore()
+            while True:
+                try:
+                    for saved in store.recoverable():
+                        name = normalize_project_name(saved['project'])
+                        params = json.loads(saved['request'])
+                        with app.app_context():
+                            launch_durable_job(name, params['pacing'], params['chapter_count'],
+                                               params['pipeline_kwargs'], params.get('model', ''), params.get('manual_spec'))
+                except Exception:
+                    logger.exception("Job recovery failed; checking again shortly")
+                time.sleep(10)
+        threading.Thread(target=recover_jobs, daemon=True).start()
 
     return app
 

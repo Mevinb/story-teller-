@@ -252,9 +252,15 @@ class EvolutionEngine:
 
         # Step 2: Process entities (new characters, aliases)
         cb("Processing character entities...")
-        entities = evolution_data.get("entities", [])
+        entities, pending_entities = self._split_by_confidence(
+            evolution_data.get("entities", [])
+        )
         summary["entities_found"] = self._process_entities(
             entities, state_manager, chapter_num,
+        )
+        summary["pending_updates"].extend(
+            {"type": "entity", "chapter": chapter_num, "data": u}
+            for u in pending_entities
         )
 
         # Step 3: Update emotional histories
@@ -283,16 +289,28 @@ class EvolutionEngine:
 
         # Step 5: Extract and store events
         cb("Extracting story events...")
-        events = evolution_data.get("events", [])
+        events, pending_events = self._split_by_confidence(
+            evolution_data.get("events", [])
+        )
         summary["events_extracted"] = self._process_events(
             events, state_manager, chapter_num, scene_num,
+        )
+        summary["pending_updates"].extend(
+            {"type": "event", "chapter": chapter_num, "data": u}
+            for u in pending_events
         )
 
         # Step 6: Update character arcs
         cb("Tracking character arcs...")
-        arc_updates = evolution_data.get("arc_updates", [])
+        arc_updates, pending_arcs = self._split_by_confidence(
+            evolution_data.get("arc_updates", [])
+        )
         summary["arcs_updated"] = self._process_arc_updates(
             arc_updates, state_manager, chapter_num,
+        )
+        summary["pending_updates"].extend(
+            {"type": "arc", "chapter": chapter_num, "data": u}
+            for u in pending_arcs
         )
 
         # Step 7: Store transition state
@@ -314,32 +332,39 @@ class EvolutionEngine:
         self._update_importance_scores(state_manager, scene_text, chapter_num)
 
         # Step 10: Promote legend events
-        promoted = MemoryCompressor.promote_events_to_legend(
-            state_manager.state,
-            self._get_story_events(state_manager),
-        )
+        promoted = []
+        def promote(snapshot):
+            promoted.extend(MemoryCompressor.promote_events_to_legend(
+                snapshot, snapshot.get("plot", {}).get("story_events", []),
+            ))
+        state_manager.mutate_state("promote_legend_events", {}, promote)
         summary["legend_promoted"] = len(promoted)
-        if promoted:
-            state_manager.save()
 
         # Step 11: Record narrative tension
         cb("Recording narrative tension...")
         tension_score = TensionTracker.estimate_tension_from_text(scene_text)
         phase_label = summary.get("narrative_phase", "") or ""
-        TensionTracker.record_chapter_tension(
-            state_manager.state, chapter_num, tension_score, label=phase_label,
+        state_manager.mutate_state(
+            "record_chapter_tension",
+            {"chapter": chapter_num, "tension": tension_score},
+            lambda snapshot: TensionTracker.record_chapter_tension(
+                snapshot, chapter_num, tension_score, label=phase_label,
+            ),
         )
-        state_manager.save()
         summary["tension_recorded"] = True
         logger.debug("Tension recorded: %.3f for chapter %d", tension_score, chapter_num)
 
         # Step 12: Update motif tracking
         cb("Scanning for recurring motifs...")
-        motifs_found = MotifTracker.update_motifs_after_scene(
-            state_manager.state, scene_text, chapter_num,
+        motif_count = []
+        state_manager.mutate_state(
+            "update_motifs_after_scene",
+            {"chapter": chapter_num},
+            lambda snapshot: motif_count.append(
+                MotifTracker.update_motifs_after_scene(snapshot, scene_text, chapter_num)
+            ),
         )
-        if motifs_found:
-            state_manager.save()
+        motifs_found = motif_count[0] if motif_count else 0
         summary["motifs_found"] = motifs_found
 
         logger.info(
