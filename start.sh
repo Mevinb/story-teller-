@@ -50,6 +50,7 @@ export HF_HUB_DISABLE_PROGRESS_BARS=1
 export HF_HUB_DISABLE_SYMLINKS_WARNING=1
 export DISABLE_TQDM=1
 export TQDM_DISABLE=1
+export PYTHONUNBUFFERED=1
 export STORY_AUTO_RESUME=${STORY_AUTO_RESUME:-true}
 
 # Cleanup function to kill server and all child workers when script or terminal closes

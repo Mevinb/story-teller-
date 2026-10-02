@@ -11,10 +11,10 @@ timeout = 180
 graceful_timeout = 5
 keepalive = 5
 
-os.makedirs("logs", exist_ok=True)
-accesslog = "logs/gunicorn_access.log"
-errorlog = "logs/gunicorn_error.log"
-capture_output = True
+# Direct logs to terminal stdout/stderr so they are immediately visible
+accesslog = "-"
+errorlog = "-"
+capture_output = False
 loglevel = "info"
 
 def on_starting(server):
@@ -41,12 +41,3 @@ def post_fork(server, worker):
         libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
     except Exception:
         pass
-
-def on_reload(server):
-    """
-    When terminal window closes, SIGHUP is sent. In standard Gunicorn, SIGHUP reloads
-    workers and leaves them running in the background. In this desktop app, shutting down
-    cleanly is desired instead of orphaning in the background.
-    """
-    server.log.info("Terminal/Hangup signal received. Exiting Story Teller cleanly...")
-    sys.exit(0)

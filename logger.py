@@ -32,23 +32,53 @@ class PlainFormatter(logging.Formatter):
         return f"[{record.asctime}] [{record.levelname:<7}] [{record.name}] {record.getMessage()}"
 
 
+class TerminalFormatter(logging.Formatter):
+    """Vibrant, colored formatter for terminal stdout."""
+    COLORS = {
+        logging.DEBUG: "\033[36m",       # Cyan
+        logging.INFO: "\033[32m",        # Green
+        logging.WARNING: "\033[33m",     # Yellow
+        logging.ERROR: "\033[31m",       # Red
+        logging.CRITICAL: "\033[1;31m",  # Bold Red
+    }
+    RESET = "\033[0m"
+    DIM = "\033[2m"
+    MAGENTA = "\033[35m"
+
+    def format(self, record: logging.LogRecord) -> str:
+        record.asctime = self.formatTime(record, "%Y-%m-%d %H:%M:%S")
+        color = self.COLORS.get(record.levelno, self.RESET)
+        return (
+            f"{self.DIM}[{record.asctime}]{self.RESET} "
+            f"{color}[{record.levelname:<7}]{self.RESET} "
+            f"{self.MAGENTA}[{record.name}]{self.RESET} "
+            f"{record.getMessage()}"
+        )
+
+
 def init_logging(level: int = logging.INFO) -> None:
     """Initialize root logger and attach rotating file handlers for all project subsystems."""
     global _INITIALIZED
     if _INITIALIZED:
         return
 
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     root = logging.getLogger()
     root.setLevel(level)
 
     formatter = PlainFormatter()
 
-    # 1. Console Stream Handler (stdout)
+    # 1. Console Stream Handler (stdout - colored for terminal)
     has_console = any(isinstance(h, logging.StreamHandler) and not isinstance(h, RotatingFileHandler) for h in root.handlers)
     if not has_console:
         console_handler = logging.StreamHandler(sys.stdout)
         console_handler.setLevel(level)
-        console_handler.setFormatter(formatter)
+        console_handler.setFormatter(TerminalFormatter())
         root.addHandler(console_handler)
 
     # 2. Main Application Log: logs/app.log (10 MB, up to 5 backups)
