@@ -10,14 +10,7 @@ import time
 import uuid
 
 import config
-from .base import QuotaExhaustedError
-
-
-class QuotaDeferred(QuotaExhaustedError):
-    def __init__(self, reason, wait_seconds):
-        super().__init__(f"Groq waiting for {reason}: {wait_seconds:.1f}s")
-        self.wait_seconds = wait_seconds
-        self.reason = reason
+from .base import QuotaExhaustedError, QuotaDeferred
 
 
 def reset_seconds(value):

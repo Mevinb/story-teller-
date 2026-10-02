@@ -28,7 +28,34 @@ class ContentBlockedError(Exception):
 
 
 class QuotaExhaustedError(RuntimeError):
-    """A provider's daily quota is exhausted; another immediate retry cannot help."""
+    """A provider's daily quota or rate limit is exhausted; another immediate retry cannot help."""
+
+
+class QuotaDeferred(QuotaExhaustedError):
+    """A request is deferred due to quota or rate limit capacity."""
+    def __init__(self, reason: str = "quota_deferred", wait_seconds: float = 0.0):
+        super().__init__(f"Waiting for {reason}: {wait_seconds:.1f}s")
+        self.reason = reason
+        self.wait_seconds = wait_seconds
+
+
+class RateLimitExhaustedError(QuotaDeferred):
+    """Raised when rate limits (429 / TPM / daily quota) are exhausted across all available accounts."""
+    def __init__(self, message: str, wait_seconds: float = 0.0, is_daily: bool = False):
+        super().__init__(reason="repeated provider rate limit", wait_seconds=wait_seconds)
+        self.message = message
+        self.is_daily = is_daily
+
+    def __str__(self):
+        return self.message
+
+
+class ModelUnavailableError(RuntimeError):
+    """Raised when an LLM model is temporarily unavailable (503 high demand) or not found (404)."""
+    def __init__(self, message: str, is_temporary: bool = True, status_code: int = 503):
+        super().__init__(message)
+        self.is_temporary = is_temporary
+        self.status_code = status_code
 
 
 # ─── Reasoning-tag filtering (shared by OpenAI-compatible backends) ──────

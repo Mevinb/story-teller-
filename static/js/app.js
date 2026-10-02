@@ -704,8 +704,21 @@ async function generateFromDraftInCreateView() {
             body: JSON.stringify(reqBody),
         });
 
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate story details');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) {
+            const isUnavailable = res.status === 503 || (data.error_type === 'model_unavailable');
+            const isRateLimit = res.status === 429 || (data.error_type === 'rate_limit');
+            const is404 = res.status === 404 || (data.error_type === 'model_not_found');
+            let msg = data.error;
+            if (!msg) {
+                if (isUnavailable) msg = 'Model temporarily unavailable due to Google/server traffic spike. Please retry shortly.';
+                else if (isRateLimit) msg = 'Rate limit exceeded across all configured API accounts.';
+                else if (is404) msg = 'Model not found or discontinued. Please select an active model in Settings.';
+                else msg = 'Failed to generate story details';
+            }
+            showToast(msg, 'error', (isUnavailable || isRateLimit || is404) ? 8500 : 4500);
+            return;
+        }
 
         if (!data.steps || data.steps.length === 0) {
             throw new Error('AI generation did not produce story beats. Please try again.');
@@ -1207,8 +1220,21 @@ async function aiGeneratePremise() {
             body: JSON.stringify(reqBody),
         });
 
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to generate beats');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) {
+            const isUnavailable = res.status === 503 || (data.error_type === 'model_unavailable');
+            const isRateLimit = res.status === 429 || (data.error_type === 'rate_limit');
+            const is404 = res.status === 404 || (data.error_type === 'model_not_found');
+            let msg = data.error;
+            if (!msg) {
+                if (isUnavailable) msg = 'Model temporarily unavailable due to server traffic spike. Please retry shortly.';
+                else if (isRateLimit) msg = 'Rate limit exceeded across all configured API accounts.';
+                else if (is404) msg = 'Model not found or discontinued. Please select an active model in Settings.';
+                else msg = 'Failed to generate beats';
+            }
+            showToast(msg, 'error', (isUnavailable || isRateLimit || is404) ? 8500 : 4500);
+            return;
+        }
 
         premiseSteps = data.steps || [];
         premiseStoryAnalysis = data.story_analysis || null;
@@ -1256,8 +1282,14 @@ async function aiRefinePremiseFlow() {
             }),
         });
 
-        const data = await res.json();
-        if (!res.ok || data.error) throw new Error(data.error || 'Failed to refine');
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) {
+            const isUnavailable = res.status === 503 || (data.error_type === 'model_unavailable');
+            const isRateLimit = res.status === 429 || (data.error_type === 'rate_limit');
+            let msg = data.error || (isUnavailable ? 'Model temporarily unavailable.' : (isRateLimit ? 'Rate limit exceeded.' : 'Failed to refine'));
+            showToast(msg, 'error', (isUnavailable || isRateLimit) ? 8500 : 4500);
+            return;
+        }
 
         premiseSteps = data.steps || premiseSteps;
         renderPremiseTimeline();

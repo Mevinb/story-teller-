@@ -17,6 +17,9 @@ from .base import (
     LLMResponse,
     ReasoningStreamFilter,
     parse_retry_after_seconds,
+    ModelUnavailableError,
+    RateLimitExhaustedError,
+    QuotaExhaustedError,
 )
 from pipeline.errors import PipelineCancelledError
 from .key_rotator import KeyRotator
@@ -227,10 +230,34 @@ class GroqModel(ReasoningStreamFilter, LLMInterface):
         while attempt < max_attempts:
             self._raise_if_cancelled()
             client = self._client_for(key)
-            reservation = self.scheduler.acquire(
-                group, self.model, input_tokens, kwargs['max_tokens'],
-                self._raise_if_cancelled, self._sleep_interruptible, self._progress,
-                getattr(self, '_max_quota_wait', None))
+            try:
+                reservation = self.scheduler.acquire(
+                    group, self.model, input_tokens, kwargs['max_tokens'],
+                    self._raise_if_cancelled, self._sleep_interruptible, self._progress,
+                    getattr(self, '_max_quota_wait', None))
+            except (QuotaDeferred, QuotaExhaustedError) as q_err:
+                wait = getattr(q_err, 'wait_seconds', 15.0)
+                if not self._custom_api_key and len(all_keys) > 1:
+                    has_alt, min_wait, next_acc = GroqKeyManager.mark_rate_limited(
+                        key=key, retry_after=wait, model=self.model
+                    )
+                    if has_alt and next_acc and next_acc.key != key:
+                        logger.warning(
+                            "[Groq] Admission quota/TPM limit on %s (%s). Swapping to %s.",
+                            account.account_id if account else (key[:8] + "..."),
+                            q_err,
+                            next_acc.account_id
+                        )
+                        account = next_acc
+                        key = next_acc.key
+                        group = quota_group_for_key(key)
+                        attempt += 1
+                        continue
+                raise RateLimitExhaustedError(
+                    f"Groq token quota or TPM limit exceeded for model '{self.model}'. {q_err}",
+                    wait_seconds=wait,
+                ) from q_err
+
             dispatched = False
             try:
                 self._raise_if_cancelled()
@@ -277,7 +304,11 @@ class GroqModel(ReasoningStreamFilter, LLMInterface):
                 self._progress('waiting', {'model': self.model, 'reason': 'provider cooldown', 'wait_seconds': wait})
                 attempt += 1
                 if attempt >= max_attempts or (self._custom_api_key and attempt >= 2):
-                    raise QuotaDeferred('repeated provider rate limit', wait) from error
+                    raise RateLimitExhaustedError(
+                        f"Groq rate limit exceeded for model '{self.model}' across all accounts. Please retry in {int(wait)}s or switch to Gemini.",
+                        wait_seconds=wait,
+                        is_daily=is_daily,
+                    ) from error
                 self._sleep_interruptible(wait)
             except APIError as error:
                 self.scheduler.settle(reservation)
@@ -292,6 +323,20 @@ class GroqModel(ReasoningStreamFilter, LLMInterface):
                             group = quota_group_for_key(key)
                             attempt += 1
                             continue
+                # Handle 404 Not Found / Model Discontinued
+                if error.status_code == 404:
+                    raise ModelUnavailableError(
+                        f"Groq model '{self.model}' not found or discontinued (404 NOT FOUND). Please switch to an active model.",
+                        is_temporary=False,
+                        status_code=404,
+                    ) from error
+                # Handle 503 Service Unavailable / Server Overload
+                if error.status_code == 503 or any(term in str(error).lower() for term in ('unavailable', 'overloaded', 'high demand')):
+                    raise ModelUnavailableError(
+                        f"Groq model '{self.model}' is temporarily unavailable due to high demand (503 UNAVAILABLE). Please try again in a few moments or switch to Gemini.",
+                        is_temporary=True,
+                        status_code=503,
+                    ) from error
                 if error.status_code == 400 and 'response_format' in kwargs and any(
                         term in str(error).lower() for term in ('json_validate_failed', 'failed to generate json')):
                     kwargs = dict(kwargs)

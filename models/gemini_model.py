@@ -13,13 +13,59 @@ from google import genai
 from google.genai import types
 
 import config
-from .base import ContentBlockedError, LLMInterface, LLMResponse, ReasoningStreamFilter
+from .base import (
+    ContentBlockedError,
+    LLMInterface,
+    LLMResponse,
+    ReasoningStreamFilter,
+    ModelUnavailableError,
+    RateLimitExhaustedError,
+)
 from pipeline.errors import PipelineCancelledError
 
 from .key_rotator import KeyRotator, AccountKey, KeyStatus
 from logger import get_logger, log_llm_call
 
 logger = get_logger("gemini")
+
+
+def parse_gemini_rate_limit(error_str: str) -> tuple[float, bool]:
+    """
+    Parses retry delay and determines if it is a daily quota exhaustion.
+    Returns: (retry_after_seconds, is_daily)
+    """
+    error_lower = error_str.lower()
+    is_daily = any(t in error_lower for t in ("daily", "per day", "free_tier_requests", "perprojectpermodel", "day"))
+
+    # 1. Look for retryDelay in json: "retryDelay": "20468s"
+    m_delay = re.search(r'["\']retrydelay["\']\s*:\s*["\']?(\d+(?:\.\d+)?)s?["\']?', error_str, re.IGNORECASE)
+    if m_delay:
+        sec = float(m_delay.group(1))
+        if sec > 600:
+            is_daily = True
+        return sec, is_daily
+
+    # 2. Look for "retry in 5h41m8s" or "retry in 30s"
+    m_hms = re.search(r'retry in\s+(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+(?:\.\d+)?)s)?', error_str, re.IGNORECASE)
+    if m_hms:
+        hours = float(m_hms.group(1) or 0)
+        minutes = float(m_hms.group(2) or 0)
+        seconds = float(m_hms.group(3) or 0)
+        total = hours * 3600 + minutes * 60 + seconds
+        if total > 0:
+            if total > 600 or hours > 0:
+                is_daily = True
+            return total, is_daily
+
+    # 3. Look for "retry after (\d+)"
+    m_after = re.search(r'retry after\s+(\d+(?:\.\d+)?)', error_str, re.IGNORECASE)
+    if m_after:
+        sec = float(m_after.group(1))
+        if sec > 600:
+            is_daily = True
+        return sec, is_daily
+
+    return (86400.0 if is_daily else 30.0), is_daily
 
 _gemini_rotator = KeyRotator(
     provider="gemini",
@@ -141,11 +187,14 @@ class GeminiModel(ReasoningStreamFilter, LLMInterface):
                     "GEMINI_API_KEY not set. Get a key at https://aistudio.google.com/app/apikey "
                     "and add it to your .env file."
                 )
-            if getattr(self, "_fast_support", False):
-                self._client = genai.Client(api_key=current_key, http_options=types.HttpOptions(
-                    timeout=15000, retry_options=types.HttpRetryOptions(attempts=1)))
-            else:
-                self._client = genai.Client(api_key=current_key)
+            timeout_ms = 15000 if getattr(self, "_fast_support", False) else 120000
+            self._client = genai.Client(
+                api_key=current_key,
+                http_options=types.HttpOptions(
+                    timeout=timeout_ms,
+                    retry_options=types.HttpRetryOptions(attempts=1),
+                ),
+            )
             self._client_key = current_key
         return self._client
 
@@ -342,7 +391,8 @@ class GeminiModel(ReasoningStreamFilter, LLMInterface):
         except Exception as e:
             latency = time.monotonic() - start_time
             current_key = self.api_key
-            error_str = str(e).lower()
+            error_raw = str(e)
+            error_lower = error_raw.lower()
 
             log_llm_call(
                 provider="gemini",
@@ -355,70 +405,79 @@ class GeminiModel(ReasoningStreamFilter, LLMInterface):
                 temperature=temperature,
             )
 
-            if "safety" in error_str or "blocked" in error_str:
+            if "safety" in error_lower or "blocked" in error_lower:
                 self._content_blocked = True
                 raise ContentBlockedError(f"Content blocked by Gemini: {e}")
 
-            # 1. Handle transient spikes: 503 Unavailable / high demand / timeouts
-            is_transient = any(phrase in error_str for phrase in (
-                "503", "unavailable", "high demand", "spikes in demand", "overloaded",
-                "500", "internal", "504", "deadline_exceeded", "timeout",
+            # 1. Handle 404 NOT_FOUND / Deprecated model (Tell user immediately, never retry)
+            is_404 = any(term in error_lower for term in (
+                "404", "not_found", "not found", "is no longer available", "unknown model"
             ))
-            if is_transient and _retry_count < 3:
-                all_keys = GeminiKeyManager.get_keys()
-                if len(all_keys) > 1 and not self._custom_api_key:
-                    GeminiKeyManager.rotate()
-                    self._client = None
-                wait = 2.0 * (_retry_count + 1)
-                logger.warning(
-                    "[Gemini] Server transient spike (%s). Retrying in %.1fs (attempt %d/3)...",
-                    error_str[:60], wait, _retry_count + 1,
-                )
-                self._sleep_interruptible(wait)
-                self._client = None
-                return self.generate(
-                    prompt, system, schema, temperature, max_tokens, stream,
-                    _retry_count=_retry_count + 1,
-                )
+            if is_404:
+                logger.error("[Gemini] Model '%s' not found or deprecated: %s", self.model, e)
+                raise ModelUnavailableError(
+                    f"Gemini model '{self.model}' is no longer available or was not found (404 NOT FOUND). "
+                    f"Please switch to an active model (such as gemini-3.8-flash or gemini-3.1-flash-lite) in Settings.",
+                    is_temporary=False,
+                    status_code=404,
+                ) from e
 
-            # 2. Handle 429 / Quota / Rate limit
-            if "quota" in error_str or "rate" in error_str or "resource_exhausted" in error_str or "429" in error_str:
-                if getattr(self, "_fast_support", False):
-                    raise
-                match = re.search(r"retry after (\d+)", error_str)
-                wait = float(match.group(1)) if match else 30.0
+            # 2. Handle 503 UNAVAILABLE / Temporary Server Demand Spikes (Tell user immediately, never retry)
+            # Explicitly separate from 429 / quota errors so user knows it's a temporary Google server spike!
+            is_unavailable = any(term in error_lower for term in (
+                "503", "unavailable", "high demand", "spikes in demand", "overloaded",
+                "504", "deadline_exceeded", "deadline expired"
+            )) and not any(term in error_lower for term in ("quota", "resource_exhausted", "429"))
+
+            if is_unavailable:
+                logger.error("[Gemini] Model '%s' is temporarily unavailable on Google's servers (503/504 high demand). Telling user immediately without retrying.", self.model)
+                raise ModelUnavailableError(
+                    f"Gemini model '{self.model}' is temporarily unavailable due to high demand on Google's servers (503 UNAVAILABLE). "
+                    f"This is a temporary server traffic spike, NOT a rate limit or quota issue. "
+                    f"Please try again in a few moments or switch to a different model (e.g. gemini-3.5-flash-lite, gemini-3.1-flash-lite, or Groq).",
+                    is_temporary=True,
+                    status_code=503,
+                ) from e
+
+            # 3. Handle 429 / Quota / Rate limit / RESOURCE_EXHAUSTED
+            is_rate_limit = any(term in error_lower for term in (
+                "429", "quota", "resource_exhausted", "rate_limit", "rate limit", "requests_per_day"
+            ))
+            if is_rate_limit:
+                retry_wait, is_daily = parse_gemini_rate_limit(error_raw)
                 all_keys = GeminiKeyManager.get_keys()
-                if (getattr(config, "GEMINI_ROTATE_ON_RATE_LIMIT", True) or len(all_keys) > 1) and not self._custom_api_key:
+
+                if not self._custom_api_key and len(all_keys) > 1:
                     has_alt, min_wait, next_acc = GeminiKeyManager.mark_rate_limited(
                         key=current_key,
-                        retry_after=wait,
+                        retry_after=retry_wait,
+                        is_daily=is_daily,
                         model=self.model,
                     )
-                    if has_alt and _retry_count < max(len(all_keys), 1) * 3:
+                    if has_alt and next_acc and _retry_count < len(all_keys) * 2:
                         logger.warning(
-                            "[Gemini] Rate limited on key %s. Immediately rotating to %s (attempt %d).",
-                            current_key[:8] + "...", next_acc.account_id if next_acc else "next account", _retry_count + 1,
+                            "[Gemini] Rate limited/quota exceeded on %s (%s). Immediately rotating to %s with ZERO wait!",
+                            current_key[:8] + "...",
+                            "Daily Quota" if is_daily else f"Cooldown {int(retry_wait)}s",
+                            next_acc.account_id,
                         )
                         self._client = None
                         return self.generate(
                             prompt, system, schema, temperature, max_tokens, stream,
                             _retry_count=_retry_count + 1,
                         )
-                    if _retry_count < 3:
-                        self._raise_if_cancelled()
-                        logger.warning(
-                            "[Gemini] All %d Gemini accounts in cooldown. Waiting %.1fs (attempt %d/3).",
-                            len(all_keys), min_wait, _retry_count + 1,
-                        )
-                        self._sleep_interruptible(min_wait)
-                        self._client = None
-                        return self.generate(
-                            prompt, system, schema, temperature, max_tokens, stream,
-                            _retry_count=_retry_count + 1,
-                        )
-                logger.warning(f"[Gemini] Rate limited — waiting {wait}s before propagating error...")
-                self._sleep_interruptible(wait)
-                raise
+
+                # All keys are exhausted or single key rate-limited: FAIL FAST, tell user immediately!
+                daily_desc = "Daily free-tier request limit reached (limit: 20 requests/day)." if is_daily else "Per-minute rate limit reached."
+                wait_desc = f"Please retry in {int(retry_wait)}s" if retry_wait < 3600 else f"Please retry in {retry_wait / 3600:.1f} hours"
+                raise RateLimitExhaustedError(
+                    f"Gemini rate limit exceeded for model '{self.model}'. {daily_desc} {wait_desc}. "
+                    f"To continue immediately, add another GEMINI_API_KEYS entry in your .env file or switch to Groq.",
+                    wait_seconds=retry_wait,
+                    is_daily=is_daily,
+                ) from e
+
+            raise
             raise
 
     def generate_streaming(
@@ -488,78 +547,110 @@ class GeminiModel(ReasoningStreamFilter, LLMInterface):
             except Exception as e:
                 if isinstance(e, PipelineCancelledError) or emitted:
                     raise
-                error_str = str(e).lower()
-                if "safety" in error_str or "blocked" in error_str:
+                error_raw = str(e)
+                error_lower = error_raw.lower()
+                if "safety" in error_lower or "blocked" in error_lower:
                     self._content_blocked = True
-                    raise
-                
-                is_rate_limit = "503" in error_str or "unavailable" in error_str or "quota" in error_str or "rate" in error_str or "resource_exhausted" in error_str
-                if is_rate_limit and not self._custom_api_key and len(GeminiKeyManager.get_keys()) > 1:
-                    match = re.search(r"retry after (\d+)", error_str)
-                    wait = float(match.group(1)) if match else 15.0
-                    has_alt, min_wait, next_acc = GeminiKeyManager.mark_rate_limited(
-                        key=self.api_key, retry_after=wait, model=self.model
-                    )
-                    if has_alt:
-                        logger.warning(
-                            "[Gemini] Streaming rate limited on %s. Intelligently swapping to %s.",
-                            self.api_key[:8] + "...", next_acc.account_id if next_acc else "next account"
-                        )
-                        self._client = None
-                        yield from self.generate_streaming(prompt, system, temperature, max_tokens)
-                        return
+                    raise ContentBlockedError(f"Content blocked by Gemini: {e}")
 
-                is_transient = is_rate_limit
-                if is_transient and attempt < max_retries - 1:
-                    wait = delay
-                    if "rate" in error_str or "quota" in error_str:
-                        match = re.search(r"retry after (\d+)", error_str)
-                        wait = float(match.group(1)) if match else 15.0
-                    self._raise_if_cancelled()
-                    logger.warning(
-                        f"[Gemini] Streaming attempt {attempt + 1}/{max_retries} failed: {e}. "
-                        f"Retrying in {wait:.1f}s..."
-                    )
-                    self._sleep_interruptible(wait)
-                    delay = min(delay * config.RETRY_BACKOFF_FACTOR, config.RETRY_MAX_DELAY)
-                else:
-                    raise
+                # 1. 404 Not Found / Deprecated
+                if any(term in error_lower for term in ("404", "not_found", "not found", "is no longer available", "unknown model")):
+                    logger.error("[Gemini Streaming] Model '%s' not found or deprecated: %s", self.model, e)
+                    raise ModelUnavailableError(
+                        f"Gemini model '{self.model}' is no longer available or was not found (404 NOT FOUND). "
+                        f"Please switch to an active model (such as gemini-3.8-flash or gemini-3.1-flash-lite) in Settings.",
+                        is_temporary=False,
+                        status_code=404,
+                    ) from e
+
+                # 2. 503 Unavailable / Temporary Server High Demand (Tell user immediately, never retry)
+                is_unavailable = any(term in error_lower for term in (
+                    "503", "unavailable", "high demand", "spikes in demand", "overloaded",
+                    "504", "deadline_exceeded", "deadline expired"
+                )) and not any(term in error_lower for term in ("quota", "resource_exhausted", "429"))
+
+                if is_unavailable:
+                    logger.error("[Gemini Streaming] Model '%s' is temporarily unavailable (503 high demand). Telling user immediately without retrying.", self.model)
+                    raise ModelUnavailableError(
+                        f"Gemini model '{self.model}' is temporarily unavailable due to high demand on Google's servers (503 UNAVAILABLE). "
+                        f"This is a temporary server traffic spike, NOT a rate limit or quota issue. "
+                        f"Please try again in a few moments or switch to a different model (e.g. gemini-3.5-flash-lite, gemini-3.1-flash-lite, or Groq).",
+                        is_temporary=True,
+                        status_code=503,
+                    ) from e
+
+                # 3. 429 Rate Limit / Quota / Resource Exhausted
+                is_rate_limit = any(term in error_lower for term in (
+                    "429", "quota", "resource_exhausted", "rate_limit", "rate limit", "requests_per_day", "per_minute"
+                ))
+                if is_rate_limit:
+                    retry_wait, is_daily = parse_gemini_rate_limit(error_raw)
+                    all_keys = GeminiKeyManager.get_keys()
+                    if not self._custom_api_key and len(all_keys) > 1:
+                        has_alt, min_wait, next_acc = GeminiKeyManager.mark_rate_limited(
+                            key=self.api_key, retry_after=retry_wait, is_daily=is_daily, model=self.model
+                        )
+                        if has_alt and next_acc:
+                            logger.warning(
+                                "[Gemini Streaming] Rate limited on %s (%s). Immediately swapping to %s with ZERO wait!",
+                                self.api_key[:8] + "...",
+                                "Daily Quota" if is_daily else f"Cooldown {int(retry_wait)}s",
+                                next_acc.account_id,
+                            )
+                            self._client = None
+                            yield from self.generate_streaming(prompt, system, temperature, max_tokens)
+                            return
+
+                    daily_desc = "Daily free-tier request limit reached (limit: 20 requests/day)." if is_daily else "Per-minute rate limit reached."
+                    wait_desc = f"Please retry in {int(retry_wait)}s" if retry_wait < 3600 else f"Please retry in {retry_wait / 3600:.1f} hours"
+                    raise RateLimitExhaustedError(
+                        f"Gemini rate limit exceeded for model '{self.model}'. {daily_desc} {wait_desc}. "
+                        f"To continue immediately, add another GEMINI_API_KEYS entry in your .env file or switch to Groq.",
+                        wait_seconds=retry_wait,
+                        is_daily=is_daily,
+                    ) from e
+
+                raise
 
     def is_available(self) -> bool:
         """Check if Gemini API is reachable with a minimal request."""
         if not self.api_key:
             logger.warning("[Gemini] No API key configured.")
             return False
-            
-        max_retries = 5
-        delay = 2.0
-        
-        for attempt in range(max_retries):
-            try:
-                config_obj = types.GenerateContentConfig(
-                    max_output_tokens=40,
-                )
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents="Say hello.",
-                    config=config_obj,
-                )
-                return response is not None and len(response.candidates) > 0
-            except Exception as e:
-                error_str = str(e).lower()
-                is_transient = "503" in error_str or "unavailable" in error_str or "quota" in error_str or "rate" in error_str
-                if is_transient and attempt < max_retries - 1:
-                    logger.warning(
-                        f"[Gemini] Availability check attempt {attempt + 1}/{max_retries} failed: {e}. "
-                        f"Retrying in {delay:.1f}s..."
+
+        try:
+            config_obj = types.GenerateContentConfig(
+                max_output_tokens=40,
+            )
+            response = self.client.models.generate_content(
+                model=self.model,
+                contents="Say hello.",
+                config=config_obj,
+            )
+            return response is not None and len(response.candidates) > 0
+        except Exception as e:
+            error_raw = str(e)
+            error_lower = error_raw.lower()
+            if any(term in error_lower for term in ("404", "not_found", "not found", "is no longer available")):
+                logger.error("[Gemini] Availability check: Model '%s' not found/deprecated: %s", self.model, e)
+                return False
+            if any(term in error_lower for term in ("503", "unavailable", "high demand", "spikes in demand")):
+                logger.warning("[Gemini] Availability check: Model '%s' is temporarily unavailable (503 high demand): %s", self.model, e)
+                return False
+            if any(term in error_lower for term in ("429", "quota", "resource_exhausted", "rate_limit")):
+                retry_wait, is_daily = parse_gemini_rate_limit(error_raw)
+                all_keys = GeminiKeyManager.get_keys()
+                if not self._custom_api_key and len(all_keys) > 1:
+                    has_alt, min_wait, next_acc = GeminiKeyManager.mark_rate_limited(
+                        key=self.api_key, retry_after=retry_wait, is_daily=is_daily, model=self.model
                     )
-                    # Interruptible so a cancel during startup isn't stuck sleeping.
-                    self._sleep_interruptible(delay)
-                    delay *= 2.0
-                else:
-                    logger.warning(f"[Gemini] Availability check failed: {e}")
-                    return False
-        return False
+                    if has_alt:
+                        self._client = None
+                        return self.is_available()
+                logger.warning("[Gemini] Availability check: Rate limited on all keys: %s", e)
+                return False
+            logger.warning("[Gemini] Availability check failed: %s", e)
+            return False
 
     def get_name(self) -> str:
         return f"Gemini ({self.model})"

@@ -15,7 +15,15 @@ import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from models.base import LLMInterface, LLMResponse
+from models.base import (
+    LLMInterface,
+    LLMResponse,
+    ModelUnavailableError,
+    RateLimitExhaustedError,
+    QuotaExhaustedError,
+    ContentBlockedError,
+)
+from pipeline.errors import PipelineCancelledError
 from logger import get_logger
 
 logger = get_logger("premise")
@@ -361,6 +369,9 @@ class PremiseArchitect:
                 max_tokens=8192,
             )
             return cls._parse_generation_response(response, text, resolved_mode, num_beats)
+        except (ModelUnavailableError, RateLimitExhaustedError, QuotaExhaustedError, ContentBlockedError, PipelineCancelledError):
+            # Fail fast: do NOT retry without schema if the model is unavailable or rate limited!
+            raise
         except Exception as e:
             logger.warning("[PremiseArchitect] First generation attempt failed (%s). Retrying without strict schema...", e)
             response = llm.generate(

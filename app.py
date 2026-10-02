@@ -26,6 +26,7 @@ from pipeline.orchestrator import PipelineOrchestrator, normalize_project_name
 from pipeline.premise_architect import PremiseArchitect
 from pipeline.gemini_combiner import combine_chapters, analyze_and_polish, generate_whole_story
 from pipeline.errors import PipelineCancelledError
+from models.base import ModelUnavailableError, RateLimitExhaustedError, QuotaExhaustedError
 from models.groq_model import GroqModel, GroqKeyManager
 from models.gemini_model import GeminiModel, GeminiKeyManager
 from models.openrouter_model import OpenRouterModel, OpenRouterKeyManager
@@ -396,6 +397,33 @@ def _get_llm_for_premise(requested_model=None):
     if not os.path.isfile(requested_model_path):
         raise RuntimeError(f"Local model not found at: {requested_model_path}")
     return LlamaCPP(model_path=requested_model_path)
+
+
+def _handle_llm_exception(e: Exception, context_msg: str):
+    if isinstance(e, ModelUnavailableError):
+        logger.error("%s - Model unavailable: %s (status=%d, temporary=%s)", context_msg, e, e.status_code, e.is_temporary)
+        return jsonify({
+            "error": str(e),
+            "error_type": "model_unavailable" if e.is_temporary else "model_not_found",
+            "is_temporary": e.is_temporary,
+            "status_code": e.status_code,
+        }), e.status_code
+    if isinstance(e, RateLimitExhaustedError):
+        logger.error("%s - Rate limit exhausted: %s (wait=%.1fs, daily=%s)", context_msg, e, e.wait_seconds, e.is_daily)
+        return jsonify({
+            "error": str(e),
+            "error_type": "rate_limit",
+            "wait_seconds": e.wait_seconds,
+            "is_daily": e.is_daily,
+        }), 429
+    if isinstance(e, QuotaExhaustedError):
+        logger.error("%s - Quota exhausted: %s", context_msg, e)
+        return jsonify({
+            "error": str(e),
+            "error_type": "quota_exhausted",
+        }), 429
+    logger.exception("%s: %s", context_msg, e)
+    return jsonify({"error": str(e), "error_type": "internal_error"}), 500
 
 
 def _active_generation_mode() -> str:
@@ -1321,8 +1349,7 @@ def create_app():
             )
             return jsonify(result)
         except Exception as e:
-            logger.exception("Error in generate_premise_standalone: %s", e)
-            return jsonify({"error": str(e)}), 500
+            return _handle_llm_exception(e, "Error in generate_premise_standalone")
 
     @app.route("/api/project/<name>/premise/generate", methods=["POST"])
     def generate_premise(name):
@@ -1395,8 +1422,7 @@ def create_app():
 
             return jsonify(result)
         except Exception as e:
-            logger.exception("Error in generate_premise")
-            return jsonify({"error": str(e)}), 500
+            return _handle_llm_exception(e, f"Error in generate_premise [{name}]")
 
     @app.route("/api/project/<name>/premise/refine", methods=["POST"])
     def refine_premise(name):
@@ -1417,8 +1443,7 @@ def create_app():
             )
             return jsonify({"status": "ok", "steps": refined_steps})
         except Exception as e:
-            logger.exception("Error in refine_premise")
-            return jsonify({"error": str(e)}), 500
+            return _handle_llm_exception(e, f"Error in refine_premise [{name}]")
 
     @app.route("/api/project/<name>/premise/expand", methods=["POST"])
     def expand_premise(name):
@@ -1441,8 +1466,7 @@ def create_app():
             )
             return jsonify({"status": "ok", "steps": expanded_steps})
         except Exception as e:
-            logger.exception("Error in expand_premise")
-            return jsonify({"error": str(e)}), 500
+            return _handle_llm_exception(e, f"Error in expand_premise [{name}]")
 
     # ─── API: Chapters ────────────────────────────────────────────
     @app.route("/api/project/<name>/chapters", methods=["GET"])

@@ -95,14 +95,11 @@ GEMINI_TPM_LIMIT = int(os.getenv("GEMINI_TPM_LIMIT", "200000"))
 
 # ─── Gemini Model Catalog ───────────────────────────────────────────
 GEMINI_MODELS = [
-    {"id": "gemini-3.6-flash",        "name": "Gemini 3.6 Flash",       "context": "1M",  "notes": "Latest GA flagship — highest reasoning"},
-    {"id": "gemini-3.5-flash",        "name": "Gemini 3.5 Flash",       "context": "1M",  "notes": "Fast, high intelligence"},
+    {"id": "gemini-3.8-flash",        "name": "Gemini 3.8 Flash",       "context": "1M",  "notes": "Latest recommended flagship — highest speed & reasoning"},
+    {"id": "gemini-3.6-flash",        "name": "Gemini 3.6 Flash",       "context": "1M",  "notes": "Fast, high intelligence"},
     {"id": "gemini-3.5-flash-lite",   "name": "Gemini 3.5 Flash-Lite",  "context": "1M",  "notes": "Ultra high speed & throughput"},
     {"id": "gemini-3.1-flash-lite",   "name": "Gemini 3.1 Flash-Lite",  "context": "1M",  "notes": "Default — reliable and generous limits"},
-    {"id": "gemini-2.5-flash",        "name": "Gemini 2.5 Flash",       "context": "1M",  "notes": "Gemini 2.5 series"},
-    {"id": "gemini-2.5-flash-lite",   "name": "Gemini 2.5 Flash-Lite",  "context": "1M",  "notes": "Lightweight Gemini 2.5"},
-    {"id": "gemma-4-31b-it",          "name": "Gemma 4 31B IT",         "context": "128k","notes": "Google open weights model"},
-    {"id": "gemma-4-26b-a4b-it",      "name": "Gemma 4 26B A4B IT",     "context": "128k","notes": "MoE open weights model"},
+    {"id": "gemini-flash-latest",     "name": "Gemini Flash Latest",    "context": "1M",  "notes": "Always points to latest stable Flash"},
 ]
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
