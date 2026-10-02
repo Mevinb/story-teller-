@@ -159,12 +159,13 @@ class QuotaScheduler:
     def acquire(self, group, model, input_tokens, output_tokens, cancel, sleep, progress=None, max_wait=None):
         ticket = uuid.uuid4().hex
         started = self.clock()
+        effective_max = max_wait if max_wait is not None else 60.0
         try:
             while True:
                 cancel()
                 reservation, wait, reason = self.try_reserve(group, model, input_tokens, output_tokens, ticket)
                 if reservation: return reservation
-                if max_wait is not None and self.clock() - started + wait > max_wait:
+                if wait > effective_max or (self.clock() - started + wait > effective_max):
                     raise QuotaDeferred(reason, wait)
                 if progress:
                     progress('waiting', {'model': model, 'reason': reason, 'wait_seconds': round(wait, 1),

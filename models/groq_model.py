@@ -231,31 +231,46 @@ class GroqModel(ReasoningStreamFilter, LLMInterface):
             self._raise_if_cancelled()
             client = self._client_for(key)
             try:
+                # If multiple keys exist, do not sleep on an exhausted key — swap immediately!
+                max_quota_wait = getattr(self, '_max_quota_wait', None)
+                if max_quota_wait is None and not self._custom_api_key and len(all_keys) > 1:
+                    max_quota_wait = 2.0
                 reservation = self.scheduler.acquire(
                     group, self.model, input_tokens, kwargs['max_tokens'],
                     self._raise_if_cancelled, self._sleep_interruptible, self._progress,
-                    getattr(self, '_max_quota_wait', None))
+                    max_quota_wait)
             except (QuotaDeferred, QuotaExhaustedError) as q_err:
                 wait = getattr(q_err, 'wait_seconds', 15.0)
+                is_daily = 'token' in str(q_err).lower() or wait > 3600
                 if not self._custom_api_key and len(all_keys) > 1:
                     has_alt, min_wait, next_acc = GroqKeyManager.mark_rate_limited(
-                        key=key, retry_after=wait, model=self.model
+                        key=key, retry_after=wait, is_daily=is_daily, model=self.model
                     )
                     if has_alt and next_acc and next_acc.key != key:
+                        masked_old = account.masked_key if account else (key[:8] + "...")
                         logger.warning(
-                            "[Groq] Admission quota/TPM limit on %s (%s). Swapping to %s.",
-                            account.account_id if account else (key[:8] + "..."),
+                            "[Groq] Key %s reached quota limit (%s, wait=%.1fs). Swapping to %s immediately (attempt %d/%d)!",
+                            masked_old,
                             q_err,
-                            next_acc.account_id
+                            wait,
+                            next_acc.account_id,
+                            attempt + 1,
+                            max_attempts,
                         )
+                        self._progress('waiting', {
+                            'model': self.model,
+                            'reason': f"swapping to {next_acc.account_id}",
+                            'wait_seconds': 0,
+                        })
                         account = next_acc
                         key = next_acc.key
                         group = quota_group_for_key(key)
                         attempt += 1
                         continue
                 raise RateLimitExhaustedError(
-                    f"Groq token quota or TPM limit exceeded for model '{self.model}'. {q_err}",
+                    f"Groq token quota or rate limit exceeded for model '{self.model}'. {q_err}",
                     wait_seconds=wait,
+                    is_daily=is_daily,
                 ) from q_err
 
             dispatched = False

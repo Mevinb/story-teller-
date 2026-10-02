@@ -141,3 +141,43 @@ def test_api_error_handler_status_codes():
         data = resp.get_json()
         assert data["error_type"] == "rate_limit"
         assert data["wait_seconds"] == 60.0
+
+
+def test_groq_quota_deferred_swaps_immediately_without_waiting():
+    test_keys = ["gsk_key11111111111111111111111111111111111111111111111111", "gsk_key22222222222222222222222222222222222222222222222222"]
+    with patch.object(GroqKeyManager, "get_keys", return_value=test_keys):
+        GroqKeyManager.rotator.set_keys(test_keys)
+
+        mock_scheduler = MagicMock()
+        calls = []
+        def mock_acquire(group, model, input_tokens, max_tokens, cancel, sleep, progress, max_wait):
+            calls.append(group)
+            if len(calls) == 1:
+                # First key has 13901s wait (like account 3 in production!)
+                from models.base import QuotaDeferred
+                raise QuotaDeferred("provider tokens", 13901.9)
+            # Second key acquires reservation successfully!
+            reservation = MagicMock()
+            reservation.id = "res-2"
+            reservation.group = group
+            reservation.model = model
+            return reservation
+
+        mock_scheduler.acquire.side_effect = mock_acquire
+
+        model = GroqModel(model="qwen/qwen3.8-27b", scheduler=mock_scheduler)
+        with patch.object(model, "_client_for") as mock_client_factory:
+            client_inst = MagicMock()
+            mock_client_factory.return_value = client_inst
+            raw_mock = MagicMock()
+            raw_mock.headers = {}
+            resp_mock = MagicMock()
+            resp_mock.choices = [MagicMock(finish_reason="stop", message=MagicMock(content="Hello world"))]
+            raw_mock.parse.return_value = resp_mock
+            client_inst.chat.completions.with_raw_response.create.return_value = raw_mock
+
+            res = model.generate("test prompt")
+            assert res.content == "Hello world"
+            # Verify it failed over from key 1 to key 2 immediately!
+            assert len(calls) == 2
+
